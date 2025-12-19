@@ -10,7 +10,8 @@ import ollama
 
 # --- 파일 저장/로드 함수 ---
 PORTFOLIO_FILE = "my_portfolio.json" 
-
+MODEL = 'gemma3:12b-it-qat'     # 사용할 모델
+KST = timezone(timedelta(hours=9))
 
 def load_tickers():
     if os.path.exists(PORTFOLIO_FILE):
@@ -30,6 +31,7 @@ def save_tickers(tickers_list):
 # --- AI 감성 분석 함수 ---
 @st.cache_data
 def analyze_news_sentiment(title, summary):
+    global MODEL
     prompt = f"""
     Analyze the following stock news and provide a response in JSON format.
     The response must include:
@@ -42,7 +44,7 @@ def analyze_news_sentiment(title, summary):
     """
     try:
         # 모델명이 정확한지 확인 (예: gemma2, llama3.1 등)
-        response = ollama.chat(model='gemma3:4b-it-qat', messages=[
+        response = ollama.chat(model=MODEL, messages=[
             {'role': 'system', 'content': 'You are a financial analyst expert. Respond only in valid JSON.'},
             {'role': 'user', 'content': prompt},
         ])
@@ -159,16 +161,15 @@ def display_ai_news(item):
         publisher = provider_data.get('displayName') or item.get('publisher') or '출처 없음'
         link = content.get('canonicalUrl', {}).get('url') or item.get('link') or '#'
         
-        # 2. 날짜 추출 및 10일 필터링
+        # 2. 날짜 추출 및 5일 필터링
         pub_date_str = content.get('pubDate') or item.get('pubDate')
         if not pub_date_str: return False
 
-        pub_date = pd.to_datetime(pub_date_str).to_pydatetime()
-        if pub_date.tzinfo is None:
-            pub_date = pub_date.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
+        pub_date = pd.to_datetime(pub_date_str).astimezone(KST)
+
+        now = datetime.now(KST)
         
-        if now - pub_date > timedelta(days=10):
+        if now - pub_date > timedelta(days=3):
             return False
 
         # 3. AI 분석 실행
@@ -185,9 +186,8 @@ def display_ai_news(item):
         # 점수를 소수점 둘째 자리까지 표시하고 부호를 강제함 (+0.85, -0.40 등)
         badge = f":{color}[{sentiment} ({score:+.2f})]"
 
-        display_date = pub_date.strftime('%Y-%m-%d %H:%M')
-
         # 6. 화면 출력
+        display_date = pub_date.strftime('%Y-%m-%d %H:%M')
         st.markdown(f"### {badge} {title}")
         st.caption(f"**출처:** {publisher} | **날짜:** {display_date} | [뉴스 읽기]({link})")
         
@@ -209,14 +209,14 @@ def display_ai_news(item):
 # (NEW) 실제로 뉴스를 화면에 출력하는 실행 루프
 if st.session_state.selected_ticker:
     ticker = st.session_state.selected_ticker
-    st.subheader(f"'{ticker}' 최신 AI 분석 (최근 10일)")
+    st.subheader(f"'{ticker}' 최신 AI 분석")
     _, _, news, _ = get_stock_data(ticker)
     count = 0
     if news:
         for item in news:
             if display_ai_news(item): count += 1
             if count >= 5: break # 최대 5개까지만
-    if count == 0: st.write("최근 10일 이내의 뉴스가 없습니다.")
+    if count == 0: st.write("최근의 뉴스가 없습니다.")
 else:
     st.subheader("전체 종목 최신 뉴스 (종목당 1개)")
     for ticker in st.session_state.tickers:
@@ -228,7 +228,7 @@ else:
                     if display_ai_news(item):
                         found = True
                         break
-                if not found: st.write("최근 10일 이내의 뉴스가 없습니다.")
+                if not found: st.write("최근의 뉴스가 없습니다.")
 
 
 # --- 4. 메인 페이지: 주가 차트 ---
