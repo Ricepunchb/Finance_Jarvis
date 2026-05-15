@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 .python-version
+
+# 환경 변수 파일
+.env
