@@ -1,0 +1,3 @@
+[submodule "Hantu-api/open-trading-api"]
+	path = Hantu-api/open-trading-api
+	url = https://github.com/koreainvestment/open-trading-api.git
