@@ -1,0 +1,13 @@
+[project]
+name = "finance-jarvis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.5",
+    "fastapi>=0.136.1",
+    "pydantic>=2.13.4",
+    "redis>=7.4.0",
+    "tenacity>=9.1.4",
+]
