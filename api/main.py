@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from core import db
 from core.config import settings
-from core.engine import TradingEngine
+from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
 from core.lock import EngineAlreadyRunningError
 from core.risk import RiskManager
 
@@ -96,6 +96,26 @@ async def engine_status():
         }
     finally:
         await conn.close()
+
+
+@app.get("/engine/config")
+async def get_config():
+    """UI가 리스크/LLM 설정값을 보여주기 위한 읽기전용 엔드포인트. 비밀값(API 키 원문)은 노출하지 않는다."""
+    return {
+        "is_mock": settings.IS_MOCK,
+        "cycle_interval_sec": CYCLE_INTERVAL_SEC,
+        "rebalance_band_pct": settings.REBALANCE_BAND_PCT,
+        "max_position_pct": settings.MAX_POSITION_PCT,
+        "max_order_notional_krw": settings.MAX_ORDER_NOTIONAL_KRW,
+        "max_daily_loss_pct": settings.MAX_DAILY_LOSS_PCT,
+        "order_cooldown_sec": settings.ORDER_COOLDOWN_SEC,
+        "ws_staleness_threshold_sec": settings.WS_STALENESS_THRESHOLD_SEC,
+        "llm_provider": settings.LLM_PROVIDER,
+        "gemini_model": settings.GEMINI_MODEL,
+        "gemini_configured": bool(settings.GEMINI_API_KEY),
+        "news_lookback_hours": settings.NEWS_LOOKBACK_HOURS,
+        "news_max_articles_per_symbol": settings.NEWS_MAX_ARTICLES_PER_SYMBOL,
+    }
 
 
 @app.post("/portfolio/symbols")
