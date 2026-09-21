@@ -31,7 +31,7 @@ from core.websocket_client import KISWebSocketClient
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
-CYCLE_INTERVAL_SEC = 60
+CYCLE_INTERVAL_SEC = 1800  # 종목당 모니터링/매매 윈도우: 30분
 CHART_LOOKBACK_DAYS = 90
 
 # 미국 거래소(NASD/NYSE/AMEX) 정규장. 정확한 DST 전환일은 아직 반영하지 않고

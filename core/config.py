@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     MAX_POSITION_PCT: float = 0.30         # 종목당 총자산 대비 최대 비중 하드캡
     MAX_ORDER_NOTIONAL_KRW: int = 1_000_000  # 1회 주문 최대 금액
     MAX_DAILY_LOSS_PCT: float = 0.03       # 일일 손실 한도 (총자산 대비)
-    ORDER_COOLDOWN_SEC: int = 300          # 동일 종목 재주문 최소 간격
+    ORDER_COOLDOWN_SEC: int = 1800         # 동일 종목 재주문 최소 간격 (모니터링 사이클과 동일한 30분 윈도우)
     WS_STALENESS_THRESHOLD_SEC: int = 120  # 체결통보 웹소켓 무응답 허용 시간
 
     DB_PATH: str = "data/jarvis.db"
