@@ -76,10 +76,17 @@ if st.session_state.get("confirm_kill"):
 st.divider()
 st.header("📋 포트폴리오 종목 등록")
 with st.form("add_symbol_form"):
-    new_symbol = st.text_input("종목코드 (예: 005930)")
+    new_market = st.radio("구분", ["국내", "해외(미국만 실증됨)"], horizontal=True)
+    new_symbol = st.text_input("종목코드 (예: 005930 또는 AAPL)")
+    new_exchange = None
+    if new_market.startswith("해외"):
+        new_exchange = st.selectbox("거래소", ["NASD", "NYSE", "AMEX"])
     submitted = st.form_submit_button("등록")
     if submitted and new_symbol:
-        api_post("/portfolio/symbols", {"symbol": new_symbol.strip(), "market": "domestic"})
+        payload = {"symbol": new_symbol.strip(), "market": "domestic" if new_market == "국내" else "overseas"}
+        if new_exchange:
+            payload["exchange"] = new_exchange
+        api_post("/portfolio/symbols", payload)
         st.rerun()
 
 symbols = api_get("/portfolio/symbols")

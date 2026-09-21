@@ -40,6 +40,24 @@ def chart_rows_to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
+def chart_rows_to_dataframe_overseas(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    """KIS 해외주식 dailyprice의 output2 리스트를 OHLCV DataFrame으로 변환.
+
+    국내(inquire-daily-itemchartprice)와 필드명이 다르다(xymd/open/high/low/clos/tvol).
+    """
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.rename(
+        columns={"xymd": "date", "open": "open", "high": "high", "low": "low", "clos": "close", "tvol": "volume"}
+    )
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
 def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     """RSI/MACD/볼린저밴드를 종합해 -1.0(강한 매도)~+1.0(강한 매수) 점수를 낸다.
 

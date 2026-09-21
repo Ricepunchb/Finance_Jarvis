@@ -11,28 +11,11 @@ from typing import Any, Dict, List, Literal, Optional
 from core import tr_ids
 from core.config import settings
 from core.kis_client import AsyncKISClient
+from core.kis_common import KisApiError, ensure_ok as _ensure_ok
 
 Side = Literal["buy", "sell"]
 
-
-class KisApiError(Exception):
-    """KIS API가 rt_cd != '0'(실패)를 반환했을 때 발생."""
-
-    def __init__(self, msg_cd: str, msg1: str, raw: Dict[str, Any]):
-        self.msg_cd = msg_cd
-        self.msg1 = msg1
-        self.raw = raw
-        super().__init__(f"KIS API 오류 [{msg_cd}]: {msg1}")
-
-
-def _ensure_ok(response: Dict[str, Any]) -> Dict[str, Any]:
-    if response.get("rt_cd") != "0":
-        raise KisApiError(
-            msg_cd=response.get("msg_cd", ""),
-            msg1=response.get("msg1", "unknown error"),
-            raw=response,
-        )
-    return response
+__all__ = ["KisApiError", "Side"]  # kis_overseas.py 등 다른 모듈이 그대로 재사용
 
 
 async def get_price(client: AsyncKISClient, symbol: str) -> Dict[str, Any]:

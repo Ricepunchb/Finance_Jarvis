@@ -7,6 +7,7 @@ symbol/side/qty/price/시간창으로 fuzzy-match 하는 방법밖에 없다. �
 하나면 그 주문으로 확정하고, 0개면 "도달 안 함"으로 안전하게 결론 내리지만,
 2개 이상이면 절대 추측하지 않고 UNKNOWN으로 멈춰 사람이 확인하게 한다.
 """
+import logging
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -14,8 +15,10 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, kis_domestic
+from core import db, kis_domestic, kis_overseas
 from core.kis_client import AsyncKISClient
+
+logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -23,6 +26,13 @@ KST = ZoneInfo("Asia/Seoul")
 MATCH_WINDOW_SEC = 180
 
 _SIDE_TO_SLL_BUY_CD = {"sell": "01", "buy": "02"}
+
+# 국내/해외 체결내역 조회 응답의 필드명이 달라서(ord_qty vs ft_ord_qty 등)
+# market별로 어떤 필드를 볼지만 표로 관리하고, 매칭/상태판정 로직 자체는 공유한다.
+_MARKET_FIELDS = {
+    "domestic": {"qty": "ord_qty", "price": "ord_unpr", "ccld_qty": "tot_ccld_qty"},
+    "overseas": {"qty": "ft_ord_qty", "price": "ft_ord_unpr3", "ccld_qty": "ft_ccld_qty"},
+}
 
 
 def _ord_tmd_to_epoch(ord_tmd: str, reference_epoch: float) -> Optional[float]:
@@ -38,19 +48,31 @@ def _ord_tmd_to_epoch(ord_tmd: str, reference_epoch: float) -> Optional[float]:
     return combined.timestamp()
 
 
-def _resolve_status(row: Dict[str, Any]) -> str:
-    tot_ccld_qty = float(row.get("tot_ccld_qty") or 0)
-    ord_qty = float(row.get("ord_qty") or 0)
-    rjct_qty = float(row.get("rjct_qty") or 0)
-    cncl_yn = row.get("cncl_yn") == "Y"
+def _resolve_status(row: Dict[str, Any], market: str = "domestic") -> str:
+    fields = _MARKET_FIELDS[market]
+    ccld_qty = float(row.get(fields["ccld_qty"]) or 0)
+    ord_qty = float(row.get(fields["qty"]) or 0)
 
-    if tot_ccld_qty >= ord_qty and ord_qty > 0:
+    if ccld_qty >= ord_qty and ord_qty > 0:
         return "FILLED"
-    if cncl_yn and tot_ccld_qty == 0:
-        return "CANCELLED"
-    if rjct_qty > 0 and tot_ccld_qty == 0:
-        return "REJECTED"
-    if tot_ccld_qty > 0:
+
+    if market == "domestic":
+        rjct_qty = float(row.get("rjct_qty") or 0)
+        cncl_yn = row.get("cncl_yn") == "Y"
+        if cncl_yn and ccld_qty == 0:
+            return "CANCELLED"
+        if rjct_qty > 0 and ccld_qty == 0:
+            return "REJECTED"
+    else:
+        # 해외 체결내역(inquire-ccnl)은 거부사유(rjct_rson)만 확인한다 — 정정취소구분(rvse_cncl_dvsn)의
+        # 정확한 코드값 의미가 공식 문서에 명확히 나오지 않아 취소 자동판정은 v1에서 보류한다
+        # (안전한 방향: 취소된 주문도 그냥 SUBMITTED로 남아 다음 재기동 때 다시 검토됨 - 중복주문으로는
+        # 이어지지 않음).
+        rjct_rson = (row.get("rjct_rson") or "").strip()
+        if rjct_rson and rjct_rson != "0" and ccld_qty == 0:
+            return "REJECTED"
+
+    if ccld_qty > 0:
         return "PARTIALLY_FILLED"
     return "SUBMITTED"
 
@@ -58,6 +80,8 @@ def _resolve_status(row: Dict[str, Any]) -> str:
 async def _find_candidates(
     ccld_rows: List[Dict[str, Any]], intent: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
+    market = intent.get("market", "domestic")
+    fields = _MARKET_FIELDS[market]
     side_cd = _SIDE_TO_SLL_BUY_CD.get(intent["side"])
     candidates = []
     for row in ccld_rows:
@@ -65,10 +89,10 @@ async def _find_candidates(
             continue
         if row.get("sll_buy_dvsn_cd") != side_cd:
             continue
-        if float(row.get("ord_qty") or -1) != float(intent["qty"]):
+        if float(row.get(fields["qty"]) or -1) != float(intent["qty"]):
             continue
         if intent["order_type"] == "limit":
-            if float(row.get("ord_unpr") or -1) != float(intent["price"] or -1):
+            if float(row.get(fields["price"]) or -1) != float(intent["price"] or -1):
                 continue
         ord_epoch = _ord_tmd_to_epoch(row.get("ord_tmd", ""), intent["created_at"])
         if ord_epoch is None:
@@ -80,7 +104,7 @@ async def _find_candidates(
 
 
 async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
-    """KIS 잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다."""
+    """KIS 잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다 (국내+해외)."""
     balance = await kis_domestic.get_balance(client)
     for holding in balance["holdings"]:
         symbol = holding.get("pdno")
@@ -88,6 +112,20 @@ async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection
         avg_price = float(holding.get("pchs_avg_pric") or 0)
         if symbol:
             await db.upsert_position(conn, symbol, qty, avg_price)
+
+    try:
+        present = await kis_overseas.get_present_balance_krw(client)
+    except Exception:
+        # 해외 잔고 조회가 실패해도(예: 보유 종목이 없어 계좌 자체가 해외 서비스 미이용) 국내
+        # positions 재동기화는 이미 끝났으니 여기서 조용히 넘어간다 - 다음 재기동 때 다시 시도.
+        return
+    for holding in present["holdings"]:
+        symbol = holding.get("pdno")
+        qty = float(holding.get("cblc_qty13") or 0)
+        avg_price = float(holding.get("avg_unpr3") or 0)
+        currency = holding.get("crcy_cd") or "USD"
+        if symbol:
+            await db.upsert_position(conn, symbol, qty, avg_price, currency=currency)
 
 
 async def reconcile_unresolved_intents(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
@@ -100,16 +138,22 @@ async def reconcile_unresolved_intents(client: AsyncKISClient, conn: aiosqlite.C
         return
 
     today = datetime.now(tz=KST).strftime("%Y%m%d")
-    ccld_rows = await kis_domestic.get_daily_ccld(client, start_date=today, end_date=today)
+    domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=today, end_date=today)
+    try:
+        overseas_rows = await kis_overseas.get_ccnl(client, start_date=today, end_date=today)
+    except Exception:
+        logger.warning("해외 체결내역 조회 실패 - 국내 intent만 대조하고 해외는 다음 재기동에 재시도")
+        overseas_rows = []
 
     for intent in unresolved:
-        candidates = await _find_candidates(ccld_rows, intent)
+        rows = overseas_rows if intent.get("market") == "overseas" else domestic_rows
+        candidates = await _find_candidates(rows, intent)
         if len(candidates) == 0:
             # KIS 기록에 없음 -> 브로커에 도달하지 못했다고 결론. 재시도는 다음 사이클에 새 intent로.
             await db.update_order_intent(conn, intent["intent_id"], status="NOT_SUBMITTED")
         elif len(candidates) == 1:
             row = candidates[0]
-            status = _resolve_status(row)
+            status = _resolve_status(row, market=intent.get("market", "domestic"))
             await db.update_order_intent(
                 conn, intent["intent_id"], status=status, kis_order_no=row.get("odno")
             )

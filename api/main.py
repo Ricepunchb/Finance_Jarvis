@@ -32,6 +32,7 @@ app = FastAPI(title="Finance Jarvis - KIS 자동매매 제어", lifespan=lifespa
 class AddSymbolRequest(BaseModel):
     symbol: str
     market: str = "domestic"
+    exchange: Optional[str] = None  # market="overseas"일 때만: NASD/NYSE/AMEX 등
 
 
 class SetWeightRequest(BaseModel):
@@ -101,7 +102,7 @@ async def engine_status():
 async def add_symbol(req: AddSymbolRequest):
     conn = await db.get_connection()
     try:
-        await db.add_portfolio_symbol(conn, req.symbol, req.market)
+        await db.add_portfolio_symbol(conn, req.symbol, req.market, req.exchange)
     finally:
         await conn.close()
     return {"status": "added", "symbol": req.symbol}

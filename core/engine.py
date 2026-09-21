@@ -3,8 +3,10 @@
 
 Phase 1: 국내주식만, 목표비중은 승인된 active_target_weights만 사용.
 Phase 2: 뉴스 기반 LLM 감성 시그널 추가 — GEMINI_API_KEY가 없으면 자동으로 비활성화되어
-Phase 1 방식(기술적 지표만)으로 그대로 동작한다. 시장시간 인지는 KRX 정규장
-(09:00~15:30 KST, 평일)만 고려하고 휴장일 캘린더는 Phase 3 이후로 미룬다.
+Phase 1 방식(기술적 지표만)으로 그대로 동작한다.
+Phase 3: 해외주식(미국 NASD/NYSE/AMEX만 실증됨) 추가. 국내/해외는 서로 다른 시장시간을
+가지므로 사이클 게이트는 "둘 중 하나라도 열려있으면 진행"으로 바뀌고, 각 종목은 자신의
+시장이 열려있을 때만 실제로 처리된다. 휴장일 캘린더는 아직 없음(국내/미국 모두).
 """
 import asyncio
 import logging
@@ -16,10 +18,10 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, indicators, kis_domestic, reconciliation, signal_engine
+from core import db, indicators, kis_domestic, kis_overseas, reconciliation, signal_engine
 from core.config import settings
 from core.kis_client import AsyncKISClient
-from core.kis_domestic import KisApiError
+from core.kis_common import KisApiError
 from core.llm.base import LLMProvider
 from core.lock import InstanceLock
 from core.news import sentiment as news_sentiment
@@ -32,6 +34,11 @@ KST = ZoneInfo("Asia/Seoul")
 CYCLE_INTERVAL_SEC = 60
 CHART_LOOKBACK_DAYS = 90
 
+# 미국 거래소(NASD/NYSE/AMEX) 정규장. 정확한 DST 전환일은 아직 반영하지 않고
+# 월(3~11월 서머타임/12~2월 표준시)로만 근사한다 — 국내 KRX 휴장일 캘린더와
+# 마찬가지로 Phase 3에서도 의도적으로 미룬 부분.
+_US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
+
 
 def _is_krx_open_now() -> bool:
     now = datetime.now(tz=KST)
@@ -40,6 +47,26 @@ def _is_krx_open_now() -> bool:
     open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
     close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return open_t <= now <= close_t
+
+
+def _is_us_market_open_now() -> bool:
+    now = datetime.now(tz=KST)
+    is_dst = 3 <= now.month <= 11
+    open_hour, close_hour = (22, 5) if is_dst else (23, 6)
+    # 야간장이라 날짜를 걸치므로(예: 23:30~06:00) 요일 판정은 개장 시각 기준으로 한다.
+    if now.hour >= open_hour:
+        weekday = now.weekday()  # 이날 밤에 열리는 장 (금요일 밤은 열림, 토요일 밤은 안 열림)
+        return weekday <= 4
+    if now.hour < close_hour:
+        weekday = (now.weekday() - 1) % 7  # 전날 밤 장이 아직 진행 중인 새벽 시간
+        return weekday <= 4
+    return False
+
+
+def _is_market_open(market: str, exchange: Optional[str]) -> bool:
+    if market == "overseas" and exchange in _US_EXCHANGES:
+        return _is_us_market_open_now()
+    return _is_krx_open_now()
 
 
 class TradingEngine:
@@ -79,7 +106,8 @@ class TradingEngine:
             logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
 
         self.ws_client = KISWebSocketClient(
-            hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message
+            hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
+            include_overseas=True,
         )
         await self.ws_client.start()
 
@@ -100,7 +128,7 @@ class TradingEngine:
         await self.client.close()
 
     async def kill(self) -> None:
-        """비상정지: kill switch를 트립하고 미체결 주문을 전량취소한 뒤 정상 정지한다."""
+        """비상정지: kill switch를 트립하고 미체결 주문(국내+해외)을 전량취소한 뒤 정상 정지한다."""
         if self.risk is not None:
             await self.risk.trip_kill_switch("사용자 긴급정지 버튼")
         try:
@@ -113,7 +141,21 @@ class TradingEngine:
                     self.client, row.get("pdno"), row.get("ord_gno_brno"), row.get("odno")
                 )
         except Exception:
-            logger.exception("긴급정지 중 미체결주문 취소 실패 — 수동 확인 필요")
+            logger.exception("긴급정지 중 국내 미체결주문 취소 실패 — 수동 확인 필요")
+
+        try:
+            today = datetime.now(tz=KST).strftime("%Y%m%d")
+            ccnl_rows = await kis_overseas.get_ccnl(self.client, start_date=today, end_date=today)
+            for row in ccnl_rows:
+                nccs_qty = float(row.get("nccs_qty") or 0)  # 미체결수량
+                if nccs_qty <= 0:
+                    continue
+                await kis_overseas.cancel_order(
+                    self.client, row.get("ovrs_excg_cd"), row.get("pdno"), row.get("odno"),
+                    int(nccs_qty), float(row.get("ft_ord_unpr3") or 0),
+                )
+        except Exception:
+            logger.exception("긴급정지 중 해외 미체결주문 취소 실패 — 수동 확인 필요")
         await self.stop()
 
     async def _on_any_ws_message(self) -> None:
@@ -170,8 +212,8 @@ class TradingEngine:
 
     async def _run_one_cycle(self) -> None:
         assert self.conn is not None and self.risk is not None
-        if not _is_krx_open_now():
-            return
+        if not (_is_krx_open_now() or _is_us_market_open_now()):
+            return  # 국내/미국 둘 다 닫혀있으면 이번 사이클은 아예 건너뛴다 (불필요한 API 호출 방지)
         if await self.risk.is_kill_switch_active():
             return
 
@@ -179,6 +221,7 @@ class TradingEngine:
         if not active_weights:
             return
 
+        symbol_info = await db.get_portfolio_symbol_info(self.conn)
         cycle_id = await db.new_cycle(self.conn)
         ws_ok = await self.risk.is_ws_healthy()
 
@@ -190,19 +233,52 @@ class TradingEngine:
                 self.conn, symbol, float(holding.get("hldg_qty") or 0), float(holding.get("pchs_avg_pric") or 0)
             )
 
-        halted_count = 0
-        for symbol in active_weights:
+        # 관리 중인 종목 중 해외가 하나라도 있을 때만 해외 잔고를 조회한다 (국내전용 사용자는
+        # Phase 1/2 때와 동일하게 이 호출이 아예 발생하지 않는다).
+        overseas_holdings_by_symbol: dict = {}
+        if any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
             try:
-                halted = await self._process_symbol(
-                    cycle_id, symbol, active_weights[symbol], holdings_by_symbol.get(symbol),
-                    total_equity, ws_ok,
-                )
-                if halted:
-                    halted_count += 1
+                present = await kis_overseas.get_present_balance_krw(self.client)
+                overseas_holdings_by_symbol = {h["pdno"]: h for h in present["holdings"] if h.get("pdno")}
+                total_equity += float((present["totals"] or {}).get("tot_asst_amt") or 0)
+                for symbol, holding in overseas_holdings_by_symbol.items():
+                    await db.upsert_position(
+                        self.conn, symbol, float(holding.get("cblc_qty13") or 0),
+                        float(holding.get("avg_unpr3") or 0), currency=holding.get("crcy_cd") or "USD",
+                    )
+            except Exception:
+                logger.exception("해외 잔고조회 실패 - 이번 사이클은 해외 종목 처리를 건너뜀")
+
+        halted_count = 0
+        domestic_symbol_count = 0
+        for symbol in active_weights:
+            info = symbol_info.get(symbol) or {"market": "domestic", "exchange": None}
+            market = info.get("market") or "domestic"
+            exchange = info.get("exchange")
+
+            if not _is_market_open(market, exchange):
+                continue  # 이 종목이 속한 시장이 지금 닫혀있음 - 매 사이클 로그가 쌓이지 않게 조용히 스킵
+
+            try:
+                if market == "overseas":
+                    await self._process_overseas_symbol(
+                        cycle_id, symbol, exchange, active_weights[symbol],
+                        overseas_holdings_by_symbol.get(symbol), total_equity, ws_ok,
+                    )
+                else:
+                    domestic_symbol_count += 1
+                    halted = await self._process_symbol(
+                        cycle_id, symbol, active_weights[symbol], holdings_by_symbol.get(symbol),
+                        total_equity, ws_ok,
+                    )
+                    if halted:
+                        halted_count += 1
             except Exception:
                 logger.exception(f"'{symbol}' 처리 중 예외 — 이 종목만 건너뛰고 계속")
 
-        await self.risk.check_market_wide_halt_breadth(halted_count, len(active_weights))
+        if domestic_symbol_count > 0:
+            # 해외 종목은 VI 개념이 없어 halted 판정에 안 들어가므로, 분모를 국내 종목 수로만 잡는다.
+            await self.risk.check_market_wide_halt_breadth(halted_count, domestic_symbol_count)
 
     async def _log_no_op(
         self, cycle_id: int, symbol: str, target_weight: float, reason: str,
@@ -352,3 +428,135 @@ class TradingEngine:
             context=context,
         )
         return False
+
+    async def _process_overseas_symbol(
+        self, cycle_id: int, symbol: str, exchange: str, target_weight: float,
+        holding: Optional[dict], total_equity: float, ws_ok: bool,
+    ) -> None:
+        """해외주식 처리 (현재 미국 NASD/NYSE/AMEX만 실증). VI 개념이 없어 국내와 달리
+        halted 반환이 없다 — 시장전체 이상 감지는 국내 종목 수만으로 판단한다."""
+        assert self.conn is not None and self.risk is not None
+
+        context: dict = {"target_weight": target_weight, "total_equity": total_equity, "exchange": exchange}
+
+        if not ws_ok:
+            await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
+            return
+        if await self.risk.is_cooldown_active(symbol):
+            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
+            return
+        if await self.risk.is_daily_loss_limit_hit(total_equity):
+            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
+            return
+
+        price_info = await kis_overseas.get_price(self.client, exchange, symbol)
+        price_foreign = float(price_info.get("last") or 0)
+        context["price_foreign"] = price_foreign
+        if price_foreign <= 0:
+            await self._log_no_op(cycle_id, symbol, target_weight, "현재가 조회 실패", context)
+            return
+
+        # 비중 계산은 KRW 기준으로 통일해야 하므로 기준환율(bass_exrt)이 필요하다 — 이미
+        # 보유 중이면 이번 사이클 시작에 조회한 present_balance 값을 재사용하고, 신규
+        # 종목(보유 없음)이면 매수가능금액조회에서 환율(exrt)만 얻어온다.
+        bass_exrt = float(holding.get("bass_exrt")) if holding and holding.get("bass_exrt") else 0.0
+        if bass_exrt <= 0:
+            exrt_probe = await kis_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
+            bass_exrt = float(exrt_probe.get("exrt") or 0)
+            context["exrt_probe"] = exrt_probe
+        if bass_exrt <= 0:
+            await self._log_no_op(cycle_id, symbol, target_weight, "환율 조회 실패", context)
+            return
+
+        price_krw = price_foreign * bass_exrt
+        qty = float(holding.get("cblc_qty13") or 0) if holding else 0.0
+        position_value = qty * price_krw
+        current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
+        context.update({
+            "bass_exrt": bass_exrt, "price_krw": price_krw, "qty_before": qty,
+            "position_value": position_value, "current_weight": current_weight,
+        })
+
+        chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
+        df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+        tech_signal = indicators.compute_technical_signal(df)
+        context["tech_signal"] = tech_signal
+
+        sentiment_signal = None
+        if self.llm_provider is not None:
+            try:
+                sentiment_signal = await news_sentiment.get_symbol_sentiment(self.conn, self.llm_provider, symbol)
+            except Exception:
+                logger.exception(f"'{symbol}' 뉴스 감성분석 파이프라인 오류 - 기술적 지표만 사용")
+        context["sentiment_signal"] = sentiment_signal
+
+        action = await signal_engine.decide(
+            current_weight=current_weight,
+            target_weight=target_weight,
+            band=settings.REBALANCE_BAND_PCT,
+            tech_signal=tech_signal,
+            sentiment_signal=sentiment_signal,
+            price=price_krw,  # signal_engine의 qty 계산은 KRW 기준 total_equity와 일관되어야 함
+            current_position_qty=qty,
+            current_position_value=position_value,
+            total_equity=total_equity,
+            risk=self.risk,
+        )
+
+        if action is None:
+            await self._log_no_op(
+                cycle_id, symbol, target_weight,
+                f"조건 미충족 (tech={tech_signal}, sentiment={sentiment_signal})", context,
+            )
+            return
+
+        context["action_before_recheck"] = {"side": action.side, "qty": action.qty, "reason": action.reason}
+
+        # 주문 직전 항상 실시간으로 재확인 — 캐시/이전 조회 신뢰 금지.
+        if action.side == "buy":
+            psbl = await kis_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
+            context["buyable_check"] = psbl
+            action.qty = min(action.qty, float(psbl.get("max_ord_psbl_qty") or 0))
+        else:
+            # 해외는 매도가능수량 전용 실시간 재조회 API를 아직 연결하지 않았다 — 이번 사이클
+            # 시작에 조회한 present_balance의 주문가능수량(ord_psbl_qty1)을 상한으로 쓴다.
+            sellable = float(holding.get("ord_psbl_qty1") or 0) if holding else 0.0
+            context["sellable_check"] = {"present_balance_ord_psbl_qty1": sellable}
+            action.qty = min(action.qty, sellable)
+        action.qty = float(int(action.qty))
+        context["qty_after_recheck"] = action.qty
+
+        if action.qty <= 0:
+            await self._log_no_op(cycle_id, symbol, target_weight, "주문가능수량 0", context)
+            return
+
+        try:
+            intent_id = await db.create_order_intent(
+                self.conn, cycle_id, symbol, action.side, action.qty, "limit", price_foreign,
+                action.reason, market="overseas",
+            )
+        except aiosqlite.IntegrityError:
+            logger.warning(f"'{symbol}' 이번 사이클에 이미 intent 존재 — 주문 스킵")
+            return
+
+        try:
+            result = await kis_overseas.order(
+                self.client, exchange, symbol, action.side, int(action.qty), price_foreign,
+            )
+            kis_order_no = result.get("ODNO") or result.get("odno")
+            await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+        except KisApiError as e:
+            await db.update_order_intent(self.conn, intent_id, status="REJECTED")
+            await self.risk.record_order_rejection()
+            await db.log_decision(
+                self.conn, cycle_id, symbol, current_weight, target_weight,
+                current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
+                action.side.upper(), action.qty, f"주문 거부: {e.msg1}", intent_id, context=context,
+            )
+            return
+
+        await db.log_decision(
+            self.conn, cycle_id, symbol, current_weight, target_weight,
+            current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
+            action.side.upper(), action.qty, action.reason, intent_id, context=context,
+        )

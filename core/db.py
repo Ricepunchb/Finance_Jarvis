@@ -19,7 +19,8 @@ from core.config import settings
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS portfolio_symbols (
     symbol TEXT PRIMARY KEY,
-    market TEXT NOT NULL DEFAULT 'domestic',   -- 'domestic' | 'overseas' (Phase 3에서 사용)
+    market TEXT NOT NULL DEFAULT 'domestic',   -- 'domestic' | 'overseas'
+    exchange TEXT,                              -- overseas일 때만: NASD/NYSE/AMEX 등 (OVRS_EXCG_CD)
     added_at REAL NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1
 );
@@ -151,6 +152,11 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
     if "context_json" not in columns:
         await conn.execute("ALTER TABLE decision_log ADD COLUMN context_json TEXT")
 
+    cur = await conn.execute("PRAGMA table_info(portfolio_symbols)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "exchange" not in columns:
+        await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN exchange TEXT")
+
 
 # --- engine_state (singleton key-value) ---
 
@@ -171,11 +177,13 @@ async def get_state(conn: aiosqlite.Connection, key: str) -> Optional[str]:
 
 # --- portfolio_symbols ---
 
-async def add_portfolio_symbol(conn: aiosqlite.Connection, symbol: str, market: str = "domestic") -> None:
+async def add_portfolio_symbol(
+    conn: aiosqlite.Connection, symbol: str, market: str = "domestic", exchange: Optional[str] = None
+) -> None:
     await conn.execute(
-        "INSERT INTO portfolio_symbols(symbol, market, added_at, enabled) VALUES (?, ?, ?, 1) "
-        "ON CONFLICT(symbol) DO UPDATE SET enabled = 1",
-        (symbol, market, time.time()),
+        "INSERT INTO portfolio_symbols(symbol, market, exchange, added_at, enabled) VALUES (?, ?, ?, ?, 1) "
+        "ON CONFLICT(symbol) DO UPDATE SET enabled = 1, market = excluded.market, exchange = excluded.exchange",
+        (symbol, market, exchange, time.time()),
     )
     await conn.commit()
 
@@ -184,6 +192,12 @@ async def list_portfolio_symbols(conn: aiosqlite.Connection) -> List[Dict[str, A
     cur = await conn.execute("SELECT * FROM portfolio_symbols WHERE enabled = 1")
     rows = await cur.fetchall()
     return [dict(row) for row in rows]
+
+
+async def get_portfolio_symbol_info(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:
+    """symbol -> {"market": ..., "exchange": ...}. 사이클에서 국내/해외 처리 경로를 나누는 데 사용."""
+    rows = await list_portfolio_symbols(conn)
+    return {row["symbol"]: {"market": row["market"], "exchange": row["exchange"]} for row in rows}
 
 
 async def get_recent_decisions(conn: aiosqlite.Connection, limit: int = 50) -> List[Dict[str, Any]]:
