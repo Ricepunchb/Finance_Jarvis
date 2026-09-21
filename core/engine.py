@@ -1,8 +1,9 @@
 # core/engine.py
 """자동매매 오케스트레이터. 종목별 처리는 서로 격리되어 하나가 실패해도 나머지는 계속된다.
 
-Phase 1 범위: 국내주식만, 목표비중은 수동으로 승인된 active_target_weights만 사용,
-뉴스/LLM 시그널은 아직 없음(sentiment_signal=None). 시장시간 인지는 KRX 정규장
+Phase 1: 국내주식만, 목표비중은 승인된 active_target_weights만 사용.
+Phase 2: 뉴스 기반 LLM 감성 시그널 추가 — GEMINI_API_KEY가 없으면 자동으로 비활성화되어
+Phase 1 방식(기술적 지표만)으로 그대로 동작한다. 시장시간 인지는 KRX 정규장
 (09:00~15:30 KST, 평일)만 고려하고 휴장일 캘린더는 Phase 3 이후로 미룬다.
 """
 import asyncio
@@ -19,7 +20,9 @@ from core import db, indicators, kis_domestic, reconciliation, signal_engine
 from core.config import settings
 from core.kis_client import AsyncKISClient
 from core.kis_domestic import KisApiError
+from core.llm.base import LLMProvider
 from core.lock import InstanceLock
+from core.news import sentiment as news_sentiment
 from core.risk import RiskManager
 from core.websocket_client import KISWebSocketClient
 
@@ -46,6 +49,7 @@ class TradingEngine:
         self.risk: Optional[RiskManager] = None
         self.lock = InstanceLock(settings.ENGINE_LOCK_PATH)
         self.ws_client: Optional[KISWebSocketClient] = None
+        self.llm_provider: Optional[LLMProvider] = None
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
 
@@ -63,6 +67,16 @@ class TradingEngine:
         await db.set_state(self.conn, "engine_running", "1")
         await db.set_state(self.conn, "pid", str(os.getpid()))
         await db.set_state(self.conn, "lock_acquired_at", str(time.time()))
+
+        if settings.GEMINI_API_KEY:
+            from core.llm.factory import get_llm_provider
+            try:
+                self.llm_provider = get_llm_provider()
+            except Exception:
+                logger.exception("LLM provider 초기화 실패 - 이번 실행은 기술적 지표만으로 동작")
+                self.llm_provider = None
+        else:
+            logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
 
         self.ws_client = KISWebSocketClient(
             hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message
@@ -190,9 +204,13 @@ class TradingEngine:
 
         await self.risk.check_market_wide_halt_breadth(halted_count, len(active_weights))
 
-    async def _log_no_op(self, cycle_id: int, symbol: str, target_weight: float, reason: str) -> None:
+    async def _log_no_op(
+        self, cycle_id: int, symbol: str, target_weight: float, reason: str,
+        context: Optional[dict] = None,
+    ) -> None:
         await db.log_decision(
-            self.conn, cycle_id, symbol, None, target_weight, None, "N/A", "N/A", "NO_OP", None, reason
+            self.conn, cycle_id, symbol, None, target_weight, None, "N/A", "N/A", "NO_OP", None,
+            reason, context=context,
         )
 
     async def _process_symbol(
@@ -202,30 +220,37 @@ class TradingEngine:
         """반환값: 이 종목이 VI/거래정지 상태였는지 (시장전체 이상 감지용)."""
         assert self.conn is not None and self.risk is not None
 
+        # 사후 재현/디버깅용 원시 스냅샷 — 계산해가는 값들을 그때그때 채워 어느 지점에서
+        # 멈췄든 log_decision에 그대로 넘긴다 (지금 안 남기면 그 사이클의 판단 근거는 영구 소실됨).
+        context: dict = {"target_weight": target_weight, "total_equity": total_equity}
+
         if not ws_ok:
-            await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단")
+            await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
             return False
         if await self.risk.is_cooldown_active(symbol):
-            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중")
+            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
             return False
         if await self.risk.is_daily_loss_limit_hit(total_equity):
-            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달")
+            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
             return False
 
         vi_rows = await kis_domestic.get_vi_status(self.client, symbol)
         if vi_rows:
-            await self._log_no_op(cycle_id, symbol, target_weight, "VI 발동 중 - 매매 보류")
+            context["vi_rows"] = vi_rows
+            await self._log_no_op(cycle_id, symbol, target_weight, "VI 발동 중 - 매매 보류", context)
             return True
 
         price_info = await kis_domestic.get_price(self.client, symbol)
         price = float(price_info.get("stck_prpr") or 0)
+        context["price"] = price
         if price <= 0:
-            await self._log_no_op(cycle_id, symbol, target_weight, "현재가 조회 실패")
+            await self._log_no_op(cycle_id, symbol, target_weight, "현재가 조회 실패", context)
             return False
 
         qty = float(holding.get("hldg_qty") or 0) if holding else 0.0
         position_value = qty * price
         current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
+        context.update({"qty_before": qty, "position_value": position_value, "current_weight": current_weight})
 
         today = datetime.now(tz=KST)
         start_date = (today - timedelta(days=CHART_LOOKBACK_DAYS)).strftime("%Y%m%d")
@@ -233,13 +258,25 @@ class TradingEngine:
         chart_rows = await kis_domestic.get_daily_chart(self.client, symbol, start_date, end_date)
         df = indicators.chart_rows_to_dataframe(chart_rows)
         tech_signal = indicators.compute_technical_signal(df)
+        context["tech_signal"] = tech_signal
+
+        sentiment_signal = None
+        if self.llm_provider is not None:
+            try:
+                sentiment_signal = await news_sentiment.get_symbol_sentiment(
+                    self.conn, self.llm_provider, symbol
+                )
+            except Exception:
+                # 뉴스/LLM 파이프라인 장애가 매매 로직 전체를 막으면 안 된다 - 기술적 지표만으로 계속.
+                logger.exception(f"'{symbol}' 뉴스 감성분석 파이프라인 오류 - 기술적 지표만 사용")
+        context["sentiment_signal"] = sentiment_signal
 
         action = await signal_engine.decide(
             current_weight=current_weight,
             target_weight=target_weight,
             band=settings.REBALANCE_BAND_PCT,
             tech_signal=tech_signal,
-            sentiment_signal=None,  # Phase 2에서 LLM 뉴스 시그널 연결
+            sentiment_signal=sentiment_signal,
             price=price,
             current_position_qty=qty,
             current_position_value=position_value,
@@ -248,12 +285,19 @@ class TradingEngine:
         )
 
         if action is None:
-            await self._log_no_op(cycle_id, symbol, target_weight, f"조건 미충족 (tech={tech_signal})")
+            await self._log_no_op(
+                cycle_id, symbol, target_weight,
+                f"조건 미충족 (tech={tech_signal}, sentiment={sentiment_signal})",
+                context,
+            )
             return False
+
+        context["action_before_recheck"] = {"side": action.side, "qty": action.qty, "reason": action.reason}
 
         # 주문 직전 항상 실시간으로 재확인 — 캐시/이전 조회 신뢰 금지.
         if action.side == "buy":
             psbl = await kis_domestic.get_buyable_cash(self.client, symbol, int(price))
+            context["buyable_check"] = psbl
             action.qty = min(action.qty, float(psbl.get("max_buy_qty") or 0))
         else:
             # 매도가능수량조회(inquire-psbl-sell)는 모의투자에서 "EGW02006 모의투자 TR이
@@ -261,13 +305,16 @@ class TradingEngine:
             # 조회한 보유수량을 안전한(과대추정 없는) 상한으로 대신 사용한다.
             if settings.IS_MOCK:
                 action.qty = min(action.qty, qty)
+                context["sellable_check"] = {"mock_fallback_to_held_qty": qty}
             else:
                 psbl = await kis_domestic.get_sellable_qty(self.client, symbol)
+                context["sellable_check"] = psbl
                 action.qty = min(action.qty, float(psbl.get("ord_psbl_qty") or 0))
         action.qty = float(int(action.qty))
+        context["qty_after_recheck"] = action.qty
 
         if action.qty <= 0:
-            await self._log_no_op(cycle_id, symbol, target_weight, "주문가능수량 0")
+            await self._log_no_op(cycle_id, symbol, target_weight, "주문가능수량 0", context)
             return False
 
         try:
@@ -292,14 +339,16 @@ class TradingEngine:
             await self.risk.record_order_rejection()
             await db.log_decision(
                 self.conn, cycle_id, symbol, current_weight, target_weight,
-                current_weight - target_weight, tech_signal["direction"], "N/A",
+                current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
                 action.side.upper(), action.qty, f"주문 거부: {e.msg1}", intent_id,
+                context=context,
             )
             return False
 
         await db.log_decision(
             self.conn, cycle_id, symbol, current_weight, target_weight,
-            current_weight - target_weight, tech_signal["direction"], "N/A",
+            current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
             action.side.upper(), action.qty, action.reason, intent_id,
+            context=context,
         )
         return False

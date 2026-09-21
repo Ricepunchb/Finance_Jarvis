@@ -39,6 +39,10 @@ class SetWeightRequest(BaseModel):
     weight: float
 
 
+class DecideProposalRequest(BaseModel):
+    approve: bool
+
+
 @app.post("/engine/start")
 async def start_engine():
     try:
@@ -131,6 +135,58 @@ async def get_weights():
         return await db.get_active_target_weights(conn)
     finally:
         await conn.close()
+
+
+@app.post("/portfolio/weights/propose")
+async def propose_weights_via_llm():
+    """LLM(Gemini)에게 현재 등록된 전체 종목의 목표비중 초안을 실제로 요청한다.
+
+    응답은 PROPOSED 상태로만 저장되고, 사람이 /portfolio/weights/proposals/{id}/decide로
+    승인해야만 active_target_weights에 반영되어 실제 매매에 쓰인다.
+    """
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY가 설정되지 않았습니다.")
+
+    from core.llm.factory import get_llm_provider
+
+    conn = await db.get_connection()
+    try:
+        symbols_rows = await db.list_portfolio_symbols(conn)
+        symbols = [row["symbol"] for row in symbols_rows]
+        if not symbols:
+            raise HTTPException(status_code=400, detail="등록된 종목이 없습니다.")
+
+        provider = get_llm_provider()
+        result = await provider.propose_weights(symbols)
+
+        proposal_ids = []
+        for symbol, weight in result["weights"].items():
+            proposal_id = await db.propose_target_weight(
+                conn, symbol, weight, proposed_by="llm", rationale=result.get("rationale", "")
+            )
+            proposal_ids.append(proposal_id)
+        return {"status": "proposed", "proposal_ids": proposal_ids, "rationale": result.get("rationale", "")}
+    finally:
+        await conn.close()
+
+
+@app.get("/portfolio/weights/proposals")
+async def list_weight_proposals():
+    conn = await db.get_connection()
+    try:
+        return await db.get_pending_weight_proposals(conn)
+    finally:
+        await conn.close()
+
+
+@app.post("/portfolio/weights/proposals/{proposal_id}/decide")
+async def decide_weight_proposal(proposal_id: int, req: DecideProposalRequest):
+    conn = await db.get_connection()
+    try:
+        await db.decide_target_weight(conn, proposal_id, req.approve)
+    finally:
+        await conn.close()
+    return {"status": "approved" if req.approve else "rejected", "proposal_id": proposal_id}
 
 
 @app.get("/portfolio/positions")

@@ -75,10 +75,16 @@ async def decide(
         else:
             reason = "band_correction"
     else:
-        # 밴드 안: 시그널이 방향까지 정할 수 있는 유일한 경우.
-        if combined["direction"] == "HOLD" or combined["strength"] < TACTICAL_SIGNAL_THRESHOLD:
+        # 밴드 안: 시그널이 방향까지 정할 수 있는 유일한 경우 — 단, 반드시 기술 시그널이
+        # 먼저 방향을 제시해야 한다(Plan A: 코드/지표가 후보를 내고 감성은 사이징만).
+        # 기술 시그널이 HOLD면 감성 시그널이 아무리 강해도 단독으로 매매를 개시하지 않는다.
+        if tech_signal["direction"] == "HOLD":
             return None
-        side = combined["direction"].lower()
+        if combined["direction"] != tech_signal["direction"]:
+            return None  # 감성이 기술 방향을 뒤집은 경우도 개시하지 않음
+        if combined["strength"] < TACTICAL_SIGNAL_THRESHOLD:
+            return None
+        side = tech_signal["direction"].lower()
         tactical_value = combined["strength"] * TACTICAL_TRADE_MAX_EQUITY_FRACTION * total_equity
         # 반대편 밴드 경계를 뚫지 않는 크기로만 제한한다.
         band_edge = target_weight + band if side == "buy" else target_weight - band

@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     DB_PATH: str = "data/jarvis.db"
     ENGINE_LOCK_PATH: str = "data/engine.lock"
 
+    # --- LLM (뉴스 감성분석 / 목표비중 제안) ---
+    # provider-agnostic 설계: 이 값만 바꾸면 코드 변경 없이 다른 제공자로 교체 가능해야 한다.
+    LLM_PROVIDER: str = "gemini"
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    NEWS_LOOKBACK_HOURS: int = 24
+    NEWS_MAX_ARTICLES_PER_SYMBOL: int = 5
+
     @property
     def kis_domain(self) -> str:
         # 모의투자 및 실전투자 도메인 분리

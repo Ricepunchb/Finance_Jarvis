@@ -6,6 +6,7 @@ Redis 대신 SQLite를 쓰는 이유: 개인 단일 프로세스 시스템에서
 재기동 시 order_intents/positions 상태를 신뢰할 수 있어야 하므로, 모든 쓰기는 커밋을
 명시적으로 기다린다 (버퍼링된 채로 죽으면 reconciliation의 전제가 깨진다).
 """
+import json
 import time
 import uuid
 from pathlib import Path
@@ -105,7 +106,8 @@ CREATE TABLE IF NOT EXISTS decision_log (
     action TEXT NOT NULL,           -- NO_OP | BUY | SELL
     qty REAL,
     reason TEXT,
-    intent_id TEXT REFERENCES order_intents(intent_id)
+    intent_id TEXT REFERENCES order_intents(intent_id),
+    context_json TEXT               -- 원시 입력 스냅샷(JSON, 재현/디버깅용) - 사후 복구 불가하므로 항상 채울 것
 );
 
 CREATE TABLE IF NOT EXISTS news_cache (
@@ -135,9 +137,19 @@ async def init_db() -> None:
     conn = await get_connection()
     try:
         await conn.executescript(SCHEMA)
+        await _migrate_add_missing_columns(conn)
         await conn.commit()
     finally:
         await conn.close()
+
+
+async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS는 이미 존재하는 테이블의 컬럼을 추가해주지 않으므로,
+    기존 DB 파일에 새로 추가된 컬럼을 놓치지 않도록 가벼운 마이그레이션을 직접 처리한다."""
+    cur = await conn.execute("PRAGMA table_info(decision_log)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "context_json" not in columns:
+        await conn.execute("ALTER TABLE decision_log ADD COLUMN context_json TEXT")
 
 
 # --- engine_state (singleton key-value) ---
@@ -180,6 +192,32 @@ async def get_recent_decisions(conn: aiosqlite.Connection, limit: int = 50) -> L
     return [dict(row) for row in rows]
 
 
+# --- news_cache ---
+
+async def get_cached_news_sentiment(conn: aiosqlite.Connection, url: str) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT sentiment_score, sentiment_reasoning FROM news_cache WHERE url = ? "
+        "AND sentiment_score IS NOT NULL",
+        (url,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def cache_news_sentiment(
+    conn: aiosqlite.Connection, symbol: str, source: str, url: str, published_at: Optional[float],
+    raw_text: str, sentiment_score: float, sentiment_reasoning: str,
+) -> None:
+    await conn.execute(
+        "INSERT INTO news_cache(symbol, source, url, published_at, raw_text, fetched_at, "
+        "sentiment_score, sentiment_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET sentiment_score=excluded.sentiment_score, "
+        "sentiment_reasoning=excluded.sentiment_reasoning",
+        (symbol, source, url, published_at, raw_text, time.time(), sentiment_score, sentiment_reasoning),
+    )
+    await conn.commit()
+
+
 # --- active_target_weights (엔진의 유일한 읽기 경로) ---
 
 async def get_active_target_weights(conn: aiosqlite.Connection) -> Dict[str, float]:
@@ -198,6 +236,14 @@ async def propose_target_weight(
     )
     await conn.commit()
     return cur.lastrowid
+
+
+async def get_pending_weight_proposals(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT * FROM target_weights WHERE status = 'PROPOSED' ORDER BY proposed_at DESC"
+    )
+    rows = await cur.fetchall()
+    return [dict(row) for row in rows]
 
 
 async def decide_target_weight(conn: aiosqlite.Connection, proposal_id: int, approve: bool) -> None:
@@ -325,12 +371,16 @@ async def log_decision(
     qty: Optional[float],
     reason: str,
     intent_id: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """context: 재현/디버깅용 원시 스냅샷(원시 tech/sentiment 시그널, 고려한 기사, 가격,
+    클램프 전/후 수량 등). 사후에 복구할 수 없는 정보이므로 호출부는 항상 넘겨줄 것."""
     await conn.execute(
         "INSERT INTO decision_log(cycle_id, symbol, ts, current_weight, target_weight, drift, "
-        "tech_signal, sentiment_signal, action, qty, reason, intent_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "tech_signal, sentiment_signal, action, qty, reason, intent_id, context_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (cycle_id, symbol, time.time(), current_weight, target_weight, drift,
-         tech_signal, sentiment_signal, action, qty, reason, intent_id),
+         tech_signal, sentiment_signal, action, qty, reason, intent_id,
+         json.dumps(context, ensure_ascii=False, default=str) if context is not None else None),
     )
     await conn.commit()

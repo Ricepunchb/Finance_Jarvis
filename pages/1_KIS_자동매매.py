@@ -101,6 +101,30 @@ if weights:
     st.table(weights)
 
 st.divider()
+st.header("🤖 LLM 비중 제안 (Gemini) — 승인 전까지 매매에 반영 안 됨")
+if st.button("LLM에게 목표비중 제안 요청"):
+    result = api_post("/portfolio/weights/propose")
+    if result is not None:
+        st.success(result.get("rationale", "제안 완료"))
+        st.rerun()
+
+proposals = api_get("/portfolio/weights/proposals")
+if proposals:
+    for p in proposals:
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        c1.write(f"**{p['symbol']}**")
+        c2.write(f"제안비중: {p['weight']:.2%}")
+        if c3.button("승인", key=f"approve_{p['id']}"):
+            api_post(f"/portfolio/weights/proposals/{p['id']}/decide", {"approve": True})
+            st.rerun()
+        if c4.button("거부", key=f"reject_{p['id']}"):
+            api_post(f"/portfolio/weights/proposals/{p['id']}/decide", {"approve": False})
+            st.rerun()
+        st.caption(p.get("rationale", ""))
+else:
+    st.write("대기 중인 제안이 없습니다.")
+
+st.divider()
 st.header("💼 현재 포지션")
 positions = api_get("/portfolio/positions")
 if positions:
