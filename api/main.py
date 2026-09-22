@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from core import db
+from core import db, signal_engine
 from core.config import settings
 from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
 from core.lock import EngineAlreadyRunningError
@@ -115,6 +115,14 @@ async def get_config():
         "gemini_configured": bool(settings.GEMINI_API_KEY),
         "news_lookback_hours": settings.NEWS_LOOKBACK_HOURS,
         "news_max_articles_per_symbol": settings.NEWS_MAX_ARTICLES_PER_SYMBOL,
+        "stop_loss_pct": settings.STOP_LOSS_PCT,
+        "trailing_take_profit_pct": settings.TRAILING_TAKE_PROFIT_PCT,
+        "swing_signal_threshold": signal_engine.SWING_SIGNAL_THRESHOLD,
+        "swing_trade_max_equity_fraction": signal_engine.SWING_TRADE_MAX_EQUITY_FRACTION,
+        "band_ceiling_buffer_pct": signal_engine.BAND_CEILING_BUFFER_PCT,
+        "intraday_bar_minutes": settings.INTRADAY_BAR_MINUTES,
+        "intraday_lookback_calendar_days": settings.INTRADAY_LOOKBACK_CALENDAR_DAYS,
+        "enable_fundamental_valuation": settings.ENABLE_FUNDAMENTAL_VALUATION,
     }
 
 

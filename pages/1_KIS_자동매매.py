@@ -205,15 +205,35 @@ with tab_settings:
     r8.metric("체결통보 WS 무응답 허용", f"{config['ws_staleness_threshold_sec']}초")
 
     st.divider()
-    st.markdown("#### 🧠 LLM (뉴스 감성분석 · 비중제안)")
+    st.markdown("#### 🩹 손절 · 트레일링익절 (밴드/쿨다운과 무관하게 항상 우선 평가)")
+    e1, e2 = st.columns(2)
+    e1.metric("손절", f"평단가 대비 -{fmt_pct(config['stop_loss_pct'])}")
+    e2.metric("트레일링 익절", f"고점 대비 -{fmt_pct(config['trailing_take_profit_pct'])}")
+
+    st.divider()
+    st.markdown("#### 🌀 스윙 시그널 (밴드는 보조 상한으로만 작동)")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("스윙 진입 임계강도", config["swing_signal_threshold"])
+    s2.metric("스윙 1회 최대비중", fmt_pct(config["swing_trade_max_equity_fraction"]))
+    s3.metric("밴드 상한 버퍼", fmt_pct(config["band_ceiling_buffer_pct"]))
+    s4, s5 = st.columns(2)
+    s4.metric("분봉 캔들 단위", f"{config['intraday_bar_minutes']}분")
+    s5.metric("분봉 백필 기간", f"{config['intraday_lookback_calendar_days']}일")
+
+    st.divider()
+    st.markdown("#### 🧠 LLM (뉴스 감성분석 · 비중제안) · 밸류에이션")
     l1, l2, l3 = st.columns(3)
     l1.metric("Provider", config["llm_provider"])
     l2.metric("모델", config["gemini_model"])
     l3.metric("API Key", "✅ 설정됨" if config["gemini_configured"] else "❌ 미설정 (감성분석 비활성)")
 
-    l4, l5 = st.columns(2)
+    l4, l5, l6 = st.columns(3)
     l4.metric("뉴스 lookback", f"{config['news_lookback_hours']}시간")
     l5.metric("종목당 최대 기사 수", config["news_max_articles_per_symbol"])
+    l6.metric(
+        "펀더멘털 밸류에이션",
+        "✅ 활성" if config["enable_fundamental_valuation"] else "⏸️ 비활성 (국내 종목만 지원)",
+    )
 
 # =========================================================================
 # 포트폴리오 · 비중
@@ -338,6 +358,13 @@ with tab_log:
             if action_filter and d["action"] not in action_filter:
                 continue
             badge = {"BUY": "🟢 BUY", "SELL": "🔴 SELL", "NO_OP": "⚪ NO_OP"}.get(d["action"], d["action"])
+            reason = d.get("reason") or "-"
+            reason_badge = {
+                "STOP_LOSS": "🚨 손절(STOP_LOSS)",
+                "TRAILING_TAKE_PROFIT": "💰 트레일링익절",
+                "swing_signal": "🌀 스윙시그널",
+                "band_ceiling_forced_trim": "📉 밴드상한 강제축소",
+            }.get(reason, reason)
             sentiment = parse_sentiment(d.get("sentiment_signal"))
             sentiment_txt = (
                 f'{sentiment.get("direction", "?")} ({sentiment.get("strength", 0):.2f})'
@@ -355,7 +382,7 @@ with tab_log:
                     "드리프트": fmt_pct(d.get("drift")),
                     "기술시그널": d.get("tech_signal") or "-",
                     "감성시그널": sentiment_txt,
-                    "사유": d.get("reason") or "-",
+                    "사유": reason_badge,
                     "_id": d["id"],
                 }
             )

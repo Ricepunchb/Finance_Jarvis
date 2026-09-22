@@ -111,6 +111,28 @@ CREATE TABLE IF NOT EXISTS decision_log (
     context_json TEXT               -- 원시 입력 스냅샷(JSON, 재현/디버깅용) - 사후 복구 불가하므로 항상 채울 것
 );
 
+-- 30분봉 캐시(국내는 1분봉을 리샘플링, 해외는 KIS가 30분봉을 직접 반환) — 매 사이클
+-- KIS를 다시 때리지 않도록 재사용한다.
+CREATE TABLE IF NOT EXISTS intraday_bars (
+    symbol TEXT NOT NULL,
+    market TEXT NOT NULL,        -- 'domestic' | 'overseas'
+    bar_start REAL NOT NULL,     -- epoch seconds, 30분 버킷 시작 시각 (KST 09:00 앵커)
+    open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+    volume REAL NOT NULL,
+    PRIMARY KEY (symbol, market, bar_start)
+);
+
+-- 펀더멘털 밸류에이션 입력값 캐시. 분기 단위로만 바뀌는 데이터라 사이클마다 재조회하지 않는다.
+CREATE TABLE IF NOT EXISTS fundamentals_cache (
+    symbol TEXT PRIMARY KEY,
+    per REAL, pbr REAL, per_percentile REAL, pbr_percentile REAL,
+    target_price_mean REAL, target_gap_pct REAL, recomm_mean REAL,
+    w52_position_pct REAL,
+    roe REAL, debt_ratio REAL,
+    raw_json TEXT,
+    fetched_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS news_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
@@ -156,6 +178,15 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
     columns = {row["name"] for row in await cur.fetchall()}
     if "exchange" not in columns:
         await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN exchange TEXT")
+
+    cur = await conn.execute("PRAGMA table_info(positions)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "entry_avg_price" not in columns:
+        await conn.execute("ALTER TABLE positions ADD COLUMN entry_avg_price REAL")
+    if "peak_price_since_entry" not in columns:
+        await conn.execute("ALTER TABLE positions ADD COLUMN peak_price_since_entry REAL")
+    if "entry_opened_at" not in columns:
+        await conn.execute("ALTER TABLE positions ADD COLUMN entry_opened_at REAL")
 
 
 # --- engine_state (singleton key-value) ---
@@ -204,6 +235,61 @@ async def get_recent_decisions(conn: aiosqlite.Connection, limit: int = 50) -> L
     cur = await conn.execute("SELECT * FROM decision_log ORDER BY id DESC LIMIT ?", (limit,))
     rows = await cur.fetchall()
     return [dict(row) for row in rows]
+
+
+# --- intraday_bars ---
+
+async def get_cached_intraday_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, since_ts: float
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT * FROM intraday_bars WHERE symbol = ? AND market = ? AND bar_start >= ? "
+        "ORDER BY bar_start ASC",
+        (symbol, market, since_ts),
+    )
+    rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def save_intraday_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, bars: List[Dict[str, Any]]
+) -> None:
+    for bar in bars:
+        await conn.execute(
+            "INSERT INTO intraday_bars(symbol, market, bar_start, open, high, low, close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol, market, bar_start) DO UPDATE SET open=excluded.open, "
+            "high=excluded.high, low=excluded.low, close=excluded.close, volume=excluded.volume",
+            (symbol, market, bar["bar_start"], bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]),
+        )
+    await conn.commit()
+
+
+# --- fundamentals_cache ---
+
+async def get_cached_valuation(
+    conn: aiosqlite.Connection, symbol: str, max_age_hours: float
+) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM fundamentals_cache WHERE symbol = ?", (symbol,))
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    if (time.time() - row["fetched_at"]) > max_age_hours * 3600:
+        return None
+    return dict(row)
+
+
+async def cache_valuation(conn: aiosqlite.Connection, symbol: str, **fields: Any) -> None:
+    cols = list(fields.keys()) + ["fetched_at"]
+    values = list(fields.values()) + [time.time()]
+    placeholders = ", ".join("?" for _ in cols)
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    await conn.execute(
+        f"INSERT INTO fundamentals_cache(symbol, {', '.join(cols)}) VALUES (?, {placeholders}) "
+        f"ON CONFLICT(symbol) DO UPDATE SET {update_clause}",
+        (symbol, *values),
+    )
+    await conn.commit()
 
 
 # --- news_cache ---
@@ -286,13 +372,54 @@ async def decide_target_weight(conn: aiosqlite.Connection, proposal_id: int, app
 async def upsert_position(
     conn: aiosqlite.Connection, symbol: str, qty: float, avg_price: float, currency: str = "KRW"
 ) -> None:
+    """KIS 잔고조회로 포지션을 덮어쓰는 유일한 지점. 트레일링 익절의 "진입 후 고점" 상태를
+    여기서 관리한다 — 0->양수 전환은 새 진입(초기화), 양수->0 전환은 완전청산(초기화), 그
+    사이(추가매수/부분매도)는 절대 건드리지 않는다(추가매수 한다고 고점이 리셋되면 트레일링
+    보호가 무의미해진다)."""
+    cur = await conn.execute("SELECT qty FROM positions WHERE symbol = ?", (symbol,))
+    row = await cur.fetchone()
+    prev_qty = float(row["qty"]) if row else 0.0
+
+    if prev_qty <= 0 and qty > 0:
+        entry_avg_price, peak_price, entry_opened_at = avg_price, avg_price, time.time()
+    elif qty <= 0:
+        entry_avg_price = peak_price = entry_opened_at = None
+    else:
+        cur = await conn.execute(
+            "SELECT entry_avg_price, peak_price_since_entry, entry_opened_at FROM positions WHERE symbol = ?",
+            (symbol,),
+        )
+        existing = await cur.fetchone()
+        entry_avg_price = existing["entry_avg_price"] if existing else avg_price
+        peak_price = existing["peak_price_since_entry"] if existing else avg_price
+        entry_opened_at = existing["entry_opened_at"] if existing else time.time()
+
     await conn.execute(
-        "INSERT INTO positions(symbol, qty, avg_price, currency, last_synced_at) VALUES (?, ?, ?, ?, ?) "
+        "INSERT INTO positions(symbol, qty, avg_price, currency, last_synced_at, "
+        "entry_avg_price, peak_price_since_entry, entry_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(symbol) DO UPDATE SET qty=excluded.qty, avg_price=excluded.avg_price, "
-        "currency=excluded.currency, last_synced_at=excluded.last_synced_at",
-        (symbol, qty, avg_price, currency, time.time()),
+        "currency=excluded.currency, last_synced_at=excluded.last_synced_at, "
+        "entry_avg_price=excluded.entry_avg_price, peak_price_since_entry=excluded.peak_price_since_entry, "
+        "entry_opened_at=excluded.entry_opened_at",
+        (symbol, qty, avg_price, currency, time.time(), entry_avg_price, peak_price, entry_opened_at),
     )
     await conn.commit()
+
+
+async def update_position_peak(conn: aiosqlite.Connection, symbol: str, current_price: float) -> None:
+    """실시간가는 잔고 동기화 시점이 아니라 종목별 가격조회 시점에만 있으므로 별도 호출."""
+    await conn.execute(
+        "UPDATE positions SET peak_price_since_entry = MAX(COALESCE(peak_price_since_entry, 0), ?) "
+        "WHERE symbol = ? AND qty > 0",
+        (current_price, symbol),
+    )
+    await conn.commit()
+
+
+async def get_position(conn: aiosqlite.Connection, symbol: str) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM positions WHERE symbol = ?", (symbol,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def get_positions(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:

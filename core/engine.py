@@ -18,8 +18,9 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, indicators, kis_domestic, kis_overseas, reconciliation, signal_engine
+from core import db, exit_guard, indicators, intraday, kis_domestic, kis_overseas, reconciliation, signal_engine
 from core.config import settings
+from core.fundamentals import valuation as fundamental_valuation
 from core.kis_client import AsyncKISClient
 from core.kis_common import KisApiError
 from core.llm.base import LLMProvider
@@ -79,6 +80,7 @@ class TradingEngine:
         self.llm_provider: Optional[LLMProvider] = None
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
+        self._intraday_backfill_budget = 0  # 사이클마다 리셋 — 모의투자 1req/sec 제약 때문에 분봉 백필을 종목 몇 개로 제한
 
     async def start(self) -> None:
         settings.assert_trading_allowed()
@@ -224,6 +226,7 @@ class TradingEngine:
         symbol_info = await db.get_portfolio_symbol_info(self.conn)
         cycle_id = await db.new_cycle(self.conn)
         ws_ok = await self.risk.is_ws_healthy()
+        self._intraday_backfill_budget = settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE
 
         balance = await kis_domestic.get_balance(self.client)
         holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
@@ -289,6 +292,42 @@ class TradingEngine:
             reason, context=context,
         )
 
+    async def _submit_exit_order(
+        self, cycle_id: int, symbol: str, target_weight: float, current_weight: float,
+        qty: float, price: float, avg_price: float, exit_reason: str, context: dict,
+    ) -> None:
+        """국내 손절/트레일링익절 강제매도. 체결 확실성이 우선이므로 시장가로 낸다
+        (order_cash는 price=None이면 시장가 — 기존에 실사용 이력이 없던 경로라 모의투자로
+        먼저 검증할 것). 쿨다운/일일손실한도를 의도적으로 우회하지만, (symbol, cycle_id)
+        UNIQUE 제약은 그대로 적용되어 같은 사이클 이중주문은 여전히 불가능하다."""
+        qty = float(int(qty))
+        try:
+            intent_id = await db.create_order_intent(
+                self.conn, cycle_id, symbol, "sell", qty, "market", None, exit_reason,
+            )
+        except aiosqlite.IntegrityError:
+            logger.warning(f"'{symbol}' 이번 사이클에 이미 intent 존재 — 손절/익절 주문 스킵")
+            return
+
+        try:
+            result = await kis_domestic.order_cash(self.client, symbol, "sell", int(qty), None)
+            kis_order_no = result.get("ODNO") or result.get("odno")
+            await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+        except KisApiError as e:
+            await db.update_order_intent(self.conn, intent_id, status="REJECTED")
+            await self.risk.record_order_rejection()
+            await db.log_decision(
+                self.conn, cycle_id, symbol, current_weight, target_weight, current_weight - target_weight,
+                "N/A", "N/A", "SELL", qty, f"{exit_reason} 주문 거부: {e.msg1}", intent_id, context=context,
+            )
+            return
+
+        await self.risk.add_daily_pnl((price - avg_price) * qty)
+        await db.log_decision(
+            self.conn, cycle_id, symbol, current_weight, target_weight, current_weight - target_weight,
+            "N/A", "N/A", "SELL", qty, exit_reason, intent_id, context=context,
+        )
+
     async def _process_symbol(
         self, cycle_id: int, symbol: str, target_weight: float, holding: Optional[dict],
         total_equity: float, ws_ok: bool,
@@ -302,12 +341,6 @@ class TradingEngine:
 
         if not ws_ok:
             await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
-            return False
-        if await self.risk.is_cooldown_active(symbol):
-            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
-            return False
-        if await self.risk.is_daily_loss_limit_hit(total_equity):
-            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
             return False
 
         vi_rows = await kis_domestic.get_vi_status(self.client, symbol)
@@ -328,6 +361,33 @@ class TradingEngine:
         current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
         context.update({"qty_before": qty, "position_value": position_value, "current_weight": current_weight})
 
+        # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그리고 그것들과 무관하게 평가한다.
+        # 이 두 게이트는 "새로운 재량매매"를 막기 위한 것이지 손실을 줄이는 강제청산을 막기
+        # 위한 게 아니다 — 킬스위치와 같은 급의 예외로 취급한다.
+        if qty > 0:
+            avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
+            await db.update_position_peak(self.conn, symbol, price)
+            position_row = await db.get_position(self.conn, symbol)
+            peak_price = position_row["peak_price_since_entry"] if position_row else None
+            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price)
+            context["exit_check"] = {
+                "avg_price": avg_price, "peak_price": peak_price,
+                "fired": exit_decision.reason if exit_decision else None,
+            }
+            if exit_decision is not None:
+                await self._submit_exit_order(
+                    cycle_id, symbol, target_weight, current_weight, qty, price, avg_price,
+                    exit_decision.reason, context,
+                )
+                return False
+
+        if await self.risk.is_cooldown_active(symbol):
+            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
+            return False
+        if await self.risk.is_daily_loss_limit_hit(total_equity):
+            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
+            return False
+
         today = datetime.now(tz=KST)
         start_date = (today - timedelta(days=CHART_LOOKBACK_DAYS)).strftime("%Y%m%d")
         end_date = today.strftime("%Y%m%d")
@@ -335,6 +395,11 @@ class TradingEngine:
         df = indicators.chart_rows_to_dataframe(chart_rows)
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
+
+        allow_backfill = self._intraday_backfill_budget > 0
+        self._intraday_backfill_budget -= 1
+        intraday_signal = await intraday.get_intraday_signal_domestic(self.client, self.conn, symbol, allow_backfill)
+        context["intraday_signal"] = intraday_signal
 
         sentiment_signal = None
         if self.llm_provider is not None:
@@ -347,12 +412,22 @@ class TradingEngine:
                 logger.exception(f"'{symbol}' 뉴스 감성분석 파이프라인 오류 - 기술적 지표만 사용")
         context["sentiment_signal"] = sentiment_signal
 
+        valuation_signal = None
+        if settings.ENABLE_FUNDAMENTAL_VALUATION:
+            try:
+                valuation_signal = await fundamental_valuation.get_valuation_signal(self.conn, self.client, symbol)
+            except Exception:
+                logger.exception(f"'{symbol}' 밸류에이션 시그널 조회 오류 - 밸류에이션 없이 계속")
+        context["valuation_signal"] = valuation_signal
+
         action = await signal_engine.decide(
             current_weight=current_weight,
             target_weight=target_weight,
             band=settings.REBALANCE_BAND_PCT,
             tech_signal=tech_signal,
+            intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
+            valuation_signal=valuation_signal,
             price=price,
             current_position_qty=qty,
             current_position_value=position_value,
@@ -363,7 +438,8 @@ class TradingEngine:
         if action is None:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
-                f"조건 미충족 (tech={tech_signal}, sentiment={sentiment_signal})",
+                f"조건 미충족 (tech={tech_signal}, intraday={intraday_signal}, "
+                f"sentiment={sentiment_signal}, valuation={valuation_signal})",
                 context,
             )
             return False
@@ -429,6 +505,43 @@ class TradingEngine:
         )
         return False
 
+    async def _submit_exit_order_overseas(
+        self, cycle_id: int, symbol: str, exchange: str, target_weight: float, current_weight: float,
+        qty: float, price_foreign: float, price_krw: float, avg_price_krw: float,
+        exit_reason: str, context: dict,
+    ) -> None:
+        """해외 손절/트레일링익절 강제매도. 해외는 시장가를 지원하지 않으므로(FX 리스크로
+        의도적 배제) 직전가 대비 2% 할인된 지정가로 체결확률을 확보한다."""
+        qty = float(int(qty))
+        discounted_price = round(price_foreign * 0.98, 2)
+        try:
+            intent_id = await db.create_order_intent(
+                self.conn, cycle_id, symbol, "sell", qty, "limit", discounted_price, exit_reason,
+                market="overseas",
+            )
+        except aiosqlite.IntegrityError:
+            logger.warning(f"'{symbol}' 이번 사이클에 이미 intent 존재 — 손절/익절 주문 스킵")
+            return
+
+        try:
+            result = await kis_overseas.order(self.client, exchange, symbol, "sell", int(qty), discounted_price)
+            kis_order_no = result.get("ODNO") or result.get("odno")
+            await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+        except KisApiError as e:
+            await db.update_order_intent(self.conn, intent_id, status="REJECTED")
+            await self.risk.record_order_rejection()
+            await db.log_decision(
+                self.conn, cycle_id, symbol, current_weight, target_weight, current_weight - target_weight,
+                "N/A", "N/A", "SELL", qty, f"{exit_reason} 주문 거부: {e.msg1}", intent_id, context=context,
+            )
+            return
+
+        await self.risk.add_daily_pnl((price_krw - avg_price_krw) * qty)
+        await db.log_decision(
+            self.conn, cycle_id, symbol, current_weight, target_weight, current_weight - target_weight,
+            "N/A", "N/A", "SELL", qty, exit_reason, intent_id, context=context,
+        )
+
     async def _process_overseas_symbol(
         self, cycle_id: int, symbol: str, exchange: str, target_weight: float,
         holding: Optional[dict], total_equity: float, ws_ok: bool,
@@ -441,12 +554,6 @@ class TradingEngine:
 
         if not ws_ok:
             await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
-            return
-        if await self.risk.is_cooldown_active(symbol):
-            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
-            return
-        if await self.risk.is_daily_loss_limit_hit(total_equity):
-            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
             return
 
         price_info = await kis_overseas.get_price(self.client, exchange, symbol)
@@ -477,10 +584,45 @@ class TradingEngine:
             "position_value": position_value, "current_weight": current_weight,
         })
 
+        # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그것들과 무관하게 평가한다.
+        # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
+        # 체결확률을 확보한다. 가격/평단가는 원화(KRW) 기준으로 일관되게 비교한다.
+        if qty > 0:
+            avg_price_foreign = float(holding.get("avg_unpr3") or 0) if holding else 0.0
+            avg_price_krw = avg_price_foreign * bass_exrt
+            await db.update_position_peak(self.conn, symbol, price_krw)
+            position_row = await db.get_position(self.conn, symbol)
+            peak_price = position_row["peak_price_since_entry"] if position_row else None
+            exit_decision = exit_guard.evaluate_exit(avg_price_krw, peak_price, price_krw)
+            context["exit_check"] = {
+                "avg_price_krw": avg_price_krw, "peak_price_krw": peak_price,
+                "fired": exit_decision.reason if exit_decision else None,
+            }
+            if exit_decision is not None:
+                await self._submit_exit_order_overseas(
+                    cycle_id, symbol, exchange, target_weight, current_weight, qty,
+                    price_foreign, price_krw, avg_price_krw, exit_decision.reason, context,
+                )
+                return
+
+        if await self.risk.is_cooldown_active(symbol):
+            await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
+            return
+        if await self.risk.is_daily_loss_limit_hit(total_equity):
+            await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
+            return
+
         chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
         df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
+
+        allow_backfill = self._intraday_backfill_budget > 0
+        self._intraday_backfill_budget -= 1
+        intraday_signal = await intraday.get_intraday_signal_overseas(
+            self.client, self.conn, symbol, exchange, allow_backfill
+        )
+        context["intraday_signal"] = intraday_signal
 
         sentiment_signal = None
         if self.llm_provider is not None:
@@ -490,12 +632,17 @@ class TradingEngine:
                 logger.exception(f"'{symbol}' 뉴스 감성분석 파이프라인 오류 - 기술적 지표만 사용")
         context["sentiment_signal"] = sentiment_signal
 
+        # 밸류에이션(PER/PBR/목표주가 컨센서스)은 국내 데이터 소스 기반이라 해외 종목은 미지원.
+        context["valuation_signal"] = None
+
         action = await signal_engine.decide(
             current_weight=current_weight,
             target_weight=target_weight,
             band=settings.REBALANCE_BAND_PCT,
             tech_signal=tech_signal,
+            intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
+            valuation_signal=None,
             price=price_krw,  # signal_engine의 qty 계산은 KRW 기준 total_equity와 일관되어야 함
             current_position_qty=qty,
             current_position_value=position_value,
@@ -506,7 +653,8 @@ class TradingEngine:
         if action is None:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
-                f"조건 미충족 (tech={tech_signal}, sentiment={sentiment_signal})", context,
+                f"조건 미충족 (tech={tech_signal}, intraday={intraday_signal}, sentiment={sentiment_signal})",
+                context,
             )
             return
 

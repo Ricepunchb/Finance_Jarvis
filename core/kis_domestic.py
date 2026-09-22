@@ -73,6 +73,83 @@ async def get_vi_status(client: AsyncKISClient, symbol: str) -> List[Dict[str, A
     return _ensure_ok(response).get("output", [])
 
 
+async def get_minute_chart_today(
+    client: AsyncKISClient, symbol: str, hour_1: str, include_past: str = "Y",
+) -> List[Dict[str, Any]]:
+    """당일 분봉조회. 당일 데이터만 최대 30건/회, 최신순으로 반환된다.
+
+    hour_1(HHMMSS)을 과거로 옮겨가며 호출하면 더 이전 구간을 페이지네이션할 수 있다.
+    """
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+        tr_id=tr_ids.INQUIRE_TIME_ITEMCHARTPRICE_TR_ID,
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_HOUR_1": hour_1,
+            "FID_PW_DATA_INCU_YN": include_past,
+            "FID_ETC_CLS_CODE": "",
+        },
+    )
+    return _ensure_ok(response).get("output2", [])
+
+
+async def get_minute_chart_historical(
+    client: AsyncKISClient, symbol: str, date_1: str, hour_1: str = "153000",
+) -> List[Dict[str, Any]]:
+    """과거 분봉조회(최대 120건/회, 최신순). date_1(YYYYMMDD)일자 기준 hour_1(HHMMSS)
+    이전 구간을 반환한다 — 여러 날짜로 반복 호출해 백필한다."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+        tr_id=tr_ids.INQUIRE_TIME_DAILYCHARTPRICE_TR_ID,
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_HOUR_1": hour_1,
+            "FID_INPUT_DATE_1": date_1,
+            "FID_PW_DATA_INCU_YN": "N",
+            "FID_FAKE_TICK_INCU_YN": "",
+        },
+    )
+    return _ensure_ok(response).get("output2", [])
+
+
+async def get_invest_opinion(
+    client: AsyncKISClient, symbol: str, date_from: str, date_to: str,
+) -> List[Dict[str, Any]]:
+    """증권사별 투자의견(목표주가 포함) 조회. 집계값이 아니라 개별 리포트 리스트."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/invest-opinion",
+        tr_id=tr_ids.INVEST_OPINION_TR_ID,
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "16633",
+            "FID_INPUT_ISCD": symbol,
+            "FID_INPUT_DATE_1": date_from,
+            "FID_INPUT_DATE_2": date_to,
+        },
+    )
+    return _ensure_ok(response).get("output", [])
+
+
+async def get_financial_ratio(client: AsyncKISClient, symbol: str, div_cls: str = "0") -> List[Dict[str, Any]]:
+    """분기/연간 재무비율(ROE/부채비율/성장률 등) 조회. 최신 순으로 여러 기(期) 반환."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/finance/financial-ratio",
+        tr_id=tr_ids.FINANCE_FINANCIAL_RATIO_TR_ID,
+        params={
+            "FID_DIV_CLS_CODE": div_cls,
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": symbol,
+        },
+    )
+    return _ensure_ok(response).get("output", [])
+
+
 async def get_balance(client: AsyncKISClient) -> Dict[str, Any]:
     """계좌 잔고조회. {"holdings": [...], "summary": {...}} 형태로 반환한다."""
     response = await client.request(

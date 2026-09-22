@@ -47,6 +47,26 @@ async def get_daily_chart(
     return _ensure_ok(response).get("output2", [])
 
 
+async def get_minute_chart(
+    client: AsyncKISClient, ovrs_excg_cd: str, symbol: str, n_min: str = "30",
+    include_prev_day: bool = True, next_page: str = "", keyb: str = "",
+) -> List[Dict[str, Any]]:
+    """해외주식 분봉조회. NMIN으로 원하는 분단위를 직접 요청할 수 있어(예: "30")
+    국내와 달리 클라이언트 쪽 리샘플링이 필요 없다. 최대 120건/회, 최신순."""
+    excd = tr_ids.OVRS_EXCG_TO_QUOTE_EXCD[ovrs_excg_cd]
+    response = await client.request(
+        method="GET",
+        path="/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+        tr_id=tr_ids.INQUIRE_TIME_ITEMCHARTPRICE_OVERSEAS_TR_ID,
+        params={
+            "AUTH": "", "EXCD": excd, "SYMB": symbol, "NMIN": n_min,
+            "PINC": "1" if include_prev_day else "0",
+            "NEXT": next_page, "NREC": "120", "FILL": "", "KEYB": keyb,
+        },
+    )
+    return _ensure_ok(response).get("output2", [])
+
+
 async def get_balance(client: AsyncKISClient, ovrs_excg_cd: str, tr_crcy_cd: str) -> Dict[str, Any]:
     """해외주식 잔고조회 (외화 기준 — 정밀한 개별 포지션 수량/평단가용)."""
     response = await client.request(

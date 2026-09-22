@@ -61,6 +61,14 @@ INQUIRE_PRICE_TR_ID = "FHKST01010100"
 INQUIRE_DAILY_ITEMCHARTPRICE_TR_ID = "FHKST03010100"
 INQUIRE_VI_STATUS_TR_ID = "FHPST01390000"
 
+# --- 국내주식 분봉조회 (당일/과거) — 조회 전용, 모의투자에서도 동일 tr_id로 확인됨 ---
+INQUIRE_TIME_ITEMCHARTPRICE_TR_ID = "FHKST03010200"       # 당일 분봉만, 최대 30건/회
+INQUIRE_TIME_DAILYCHARTPRICE_TR_ID = "FHKST03010230"      # 과거 분봉, 최대 120건/회
+
+# --- 국내주식 투자의견/재무비율 — 조회 전용, 모의투자에서도 동일 tr_id로 확인됨 ---
+INVEST_OPINION_TR_ID = "FHKST663300C0"
+FINANCE_FINANCIAL_RATIO_TR_ID = "FHKST66430300"
+
 
 # =====================================================================
 # 해외주식 (Phase 3 — 현재는 미국(NASD/NYSE/AMEX)만 실증됨. 나머지 거래소는
@@ -138,3 +146,4 @@ def ccnl_notice_overseas_tr_id() -> str:
 # --- 해외주식 현재가/차트조회는 조회(quotation) 전용 API로 실전/모의 구분이 없다 ---
 INQUIRE_PRICE_OVERSEAS_TR_ID = "HHDFS00000300"
 INQUIRE_DAILYPRICE_OVERSEAS_TR_ID = "HHDFS76240000"
+INQUIRE_TIME_ITEMCHARTPRICE_OVERSEAS_TR_ID = "HHDFS76950200"  # NMIN으로 분단위 직접 지정, 모의투자에서 확인됨

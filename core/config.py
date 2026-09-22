@@ -21,6 +21,20 @@ class Settings(BaseSettings):
     ORDER_COOLDOWN_SEC: int = 1800         # 동일 종목 재주문 최소 간격 (모니터링 사이클과 동일한 30분 윈도우)
     WS_STALENESS_THRESHOLD_SEC: int = 120  # 체결통보 웹소켓 무응답 허용 시간
 
+    # --- 손절/트레일링익절 ---
+    STOP_LOSS_PCT: float = 0.07             # 평단가 대비 -7% 시 전량 강제매도 (쿨다운/일일손실한도 우회)
+    TRAILING_TAKE_PROFIT_PCT: float = 0.05  # 진입 후 고점 대비 -5% 하락 시 전량매도
+
+    # --- 스윙 시그널 (밴드는 보조 리스크 상한으로 전환) ---
+    INTRADAY_BAR_MINUTES: int = 30                  # CYCLE_INTERVAL_SEC(엔진 사이클)와 반드시 일치
+    INTRADAY_LOOKBACK_CALENDAR_DAYS: int = 20        # 30분봉 백필 기간 (약 14거래일치)
+    INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE: int = 3     # 모의투자 1req/sec 제약 때문에 백필을 사이클에 분산
+
+    # --- 펀더멘털 밸류에이션 (기본 꺼짐 — 스모크테스트 후 켜는 것을 권장) ---
+    ENABLE_FUNDAMENTAL_VALUATION: bool = False
+    VALUATION_CACHE_TTL_HOURS: int = 24
+    DART_API_KEY: str = ""  # opendart.fss.or.kr 무료 가입 후 발급 (Phase 2, 현재 미사용)
+
     DB_PATH: str = "data/jarvis.db"
     ENGINE_LOCK_PATH: str = "data/engine.lock"
 
