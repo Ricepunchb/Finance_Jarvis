@@ -71,7 +71,15 @@ def _aes_cbc_base64_dec(key: str, iv: str, cipher_text: str) -> str:
 
 
 class KISWebSocketClient:
-    """실시간 체결통보(국내 H0STCNI0/9 + 해외 H0GSCNI0/9) 구독. 종료 시 stop()을 명시적으로 호출."""
+    """실시간 체결통보(국내 H0STCNI0/9 + 해외 H0GSCNI0/9) 구독. 종료 시 stop()을 명시적으로 호출.
+
+    연결이 끊기면 지수 백오프로 자동 재연결한다 — 이 연결이 죽으면 risk.is_ws_healthy()가
+    staleness 게이트를 걸어 신규주문뿐 아니라 손절/트레일링익절 평가까지 멈추므로, 사람이
+    엔진을 수동 재시작하기 전까지 방치되면 안 된다.
+    """
+
+    _RECONNECT_BASE_DELAY_SEC = 2
+    _RECONNECT_MAX_DELAY_SEC = 60
 
     def __init__(self, hts_id: str, on_fill: OnFill, on_any_message: OnAnyMessage, include_overseas: bool = False):
         self.hts_id = hts_id
@@ -82,10 +90,16 @@ class KISWebSocketClient:
         self._task: Optional[asyncio.Task] = None
         self._columns_by_tr_id: Dict[str, List[str]] = {}
         self._enc_state: Dict[str, Tuple[str, str]] = {}  # tr_id -> (key, iv)
+        self._stopping = False
 
     async def start(self) -> None:
+        await self._connect_and_subscribe()
+        self._task = asyncio.create_task(self._run())
+
+    async def _connect_and_subscribe(self) -> None:
         approval_key = await issue_approval_key()
         self._ws = await websockets.connect(WS_URL)
+        self._enc_state = {}  # 이전 세션의 key/iv는 무효 — 구독 응답으로 새로 받는다
 
         subscriptions = [(ccnl_notice_tr_id(), _DOMESTIC_CCNL_COLUMNS)]
         if self.include_overseas:
@@ -104,18 +118,39 @@ class KISWebSocketClient:
             }
             await self._ws.send(json.dumps(subscribe_msg))
 
-        self._task = asyncio.create_task(self._run())
-
     async def _run(self) -> None:
-        assert self._ws is not None
-        try:
-            async for raw in self._ws:
-                await self.on_any_message()  # 데이터든 PINGPONG이든 "살아있다"의 근거
-                await self._handle_message(raw)
-        except (websockets.ConnectionClosed, asyncio.CancelledError):
-            logger.warning("KIS 웹소켓 연결이 종료되었습니다.")
-        except Exception:
-            logger.exception("KIS 웹소켓 처리 중 예외 발생")
+        delay = self._RECONNECT_BASE_DELAY_SEC
+        while not self._stopping:
+            if self._ws is not None:
+                try:
+                    async for raw in self._ws:
+                        await self.on_any_message()  # 데이터든 PINGPONG이든 "살아있다"의 근거
+                        await self._handle_message(raw)
+                        delay = self._RECONNECT_BASE_DELAY_SEC  # 정상 수신 중엔 백오프 초기화
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    logger.exception("KIS 웹소켓 연결이 끊겼습니다")
+                self._ws = None
+
+            if self._stopping:
+                return
+
+            logger.warning(f"{delay}초 후 KIS 웹소켓 재연결을 시도합니다")
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            delay = min(delay * 2, self._RECONNECT_MAX_DELAY_SEC)
+
+            try:
+                await self._connect_and_subscribe()
+                logger.info("KIS 웹소켓 재연결 성공")
+                delay = self._RECONNECT_BASE_DELAY_SEC
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("KIS 웹소켓 재연결 실패")
 
     async def _handle_message(self, raw: str) -> None:
         if raw[0] in ("0", "1"):
@@ -151,7 +186,12 @@ class KISWebSocketClient:
             self._enc_state[header.get("tr_id")] = (output["key"], output["iv"])
 
     async def stop(self) -> None:
+        self._stopping = True  # 진행 중이던 재연결 시도가 close() 이후에 새 연결을 여는 것을 막는다
         if self._task is not None:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         if self._ws is not None:
             await self._ws.close()
