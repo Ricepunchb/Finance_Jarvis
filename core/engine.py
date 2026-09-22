@@ -117,22 +117,46 @@ class TradingEngine:
         self._loop_task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
-        """정상 정지: 신규 사이클을 멈추지만 이미 체결된 포지션/미체결 주문은 그대로 둔다."""
+        """정상 정지: 신규 사이클을 멈추지만 이미 체결된 포지션/미체결 주문은 그대로 둔다.
+
+        engine_running=0 기록은 self.conn 존재 여부와 무관하게 항상 실행한다 —
+        이 프로세스에서 start()가 한 번도 호출되지 않았어도(예: 이전 프로세스가
+        engine_running=1을 남긴 채 재시작 없이 죽고, 이번 프로세스는 아직 시작 전인
+        상태) DB에 남은 stale한 "실행 중" 표시를 정지 버튼으로 확실히 지울 수 있어야
+        한다. 그렇지 않으면 /engine/status가 죽은 프로세스의 낡은 상태를 영원히
+        보여주고, 정지를 눌러도 반영되지 않는 것처럼 보인다.
+        """
         self._stop_event.set()
         if self._loop_task is not None:
             await self._loop_task
         if self.ws_client is not None:
             await self.ws_client.stop()
-        if self.conn is not None:
-            await db.set_state(self.conn, "engine_running", "0")
-            await self.conn.close()
+
+        conn = self.conn if self.conn is not None else await db.get_connection()
+        try:
+            await db.set_state(conn, "engine_running", "0")
+        finally:
+            await conn.close()
+        self.conn = None
+
         self.lock.release()
         await self.client.close()
 
     async def kill(self) -> None:
-        """비상정지: kill switch를 트립하고 미체결 주문(국내+해외)을 전량취소한 뒤 정상 정지한다."""
-        if self.risk is not None:
-            await self.risk.trip_kill_switch("사용자 긴급정지 버튼")
+        """비상정지: kill switch를 트립하고 미체결 주문(국내+해외)을 전량취소한 뒤 정상 정지한다.
+
+        kill switch 트립도 stop()의 engine_running=0과 같은 이유로 self.risk
+        존재 여부와 무관하게 항상 실행한다 — 그렇지 않으면 이 프로세스에서 start()가
+        호출된 적 없을 때(위 stop() 설명 참고) 긴급정지 버튼이 미체결 주문은
+        취소하면서도 kill switch는 실제로 트립하지 않는, 훨씬 위험한 조용한 실패가
+        된다.
+        """
+        conn = self.conn if self.conn is not None else await db.get_connection()
+        try:
+            await RiskManager(conn).trip_kill_switch("사용자 긴급정지 버튼")
+        finally:
+            if conn is not self.conn:
+                await conn.close()
         try:
             cancelable = await kis_domestic.get_cancelable_orders(self.client)
             for row in cancelable:
