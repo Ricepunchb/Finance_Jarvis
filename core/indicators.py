@@ -2,6 +2,7 @@
 """기술적 지표 기반 매매 시그널. pandas-ta로 계산하며 수식을 직접 구현하지 않는다
 (단, CCI는 예외 - pandas_ta 3.0.6의 cci() 자체에 버그가 있어 직접 계산한다. 아래
 _compute_cci 참고)."""
+import math
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -76,6 +77,12 @@ def chart_rows_to_dataframe_overseas(rows: List[Dict[str, Any]]) -> pd.DataFrame
 def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     """RSI/MACD/볼린저밴드를 종합해 -1.0(강한 매도)~+1.0(강한 매수) 점수를 낸다.
 
+    세 지표 모두 이분법 투표가 아니라 연속값으로 -1.0~+1.0 사이를 매끄럽게 움직이는
+    "부분 투표"를 반환한다 (과거 30/70·밴드터치 임계값은 그대로 "완전 투표(±1.0)"
+    지점으로 유지하고, 그 안쪽 구간을 선형/비선형으로 보간한다). 그렇지 않으면
+    RSI·BB가 평상시(중립 구간) 거의 항상 정확히 0.0표를 던지고 MACD만 항상 ±1.0표를
+    던져 score가 {0, ±1/3, ±2/3, ±1}로만 양자화되고, strength가 0.333에 쏠린다.
+
     LLM 결과와 동일한 형태({"direction", "strength", "detail"})로 반환해
     signal_engine이 두 신호를 같은 방식으로 합칠 수 있게 한다.
     """
@@ -88,32 +95,37 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     work.ta.bbands(length=20, std=2, append=True)
     last = work.iloc[-1]
 
-    votes = []
+    votes: List[float] = []
 
     rsi = last[_first_matching_column(work, "RSI_")]
     if pd.notna(rsi):
-        if rsi < 30:
-            votes.append(1.0)
-        elif rsi > 70:
-            votes.append(-1.0)
-        else:
-            votes.append(0.0)
+        # 50=중립, 30/70에서 과거와 동일하게 ±1.0로 포화되는 선형 보간
+        vote_rsi = (50.0 - rsi) / 20.0
+        votes.append(max(-1.0, min(1.0, vote_rsi)))
 
     macd = last[_first_matching_column(work, "MACD_")]
     macd_signal = last[_first_matching_column(work, "MACDs_")]
     if pd.notna(macd) and pd.notna(macd_signal):
-        votes.append(1.0 if macd > macd_signal else -1.0)
+        hist_col = _first_matching_column(work, "MACDh_")
+        last_hist = last[hist_col]
+        hist_std = work[hist_col].tail(20).std()
+        if pd.notna(hist_std) and hist_std > 1e-9 and pd.notna(last_hist):
+            # 히스토그램을 최근 20봉 변동성으로 정규화한 z-score를 tanh로
+            # [-1, 1]에 매끄럽게 매핑 (크로스 방향뿐 아니라 강도까지 반영)
+            vote_macd = math.tanh(last_hist / hist_std)
+        else:
+            # 변동성을 추정할 데이터가 부족하면 기존처럼 부호만 사용
+            vote_macd = 1.0 if macd > macd_signal else -1.0
+        votes.append(vote_macd)
 
     bb_lower = last[_first_matching_column(work, "BBL_")]
     bb_upper = last[_first_matching_column(work, "BBU_")]
     close = last["close"]
-    if pd.notna(bb_lower) and pd.notna(bb_upper):
-        if close <= bb_lower:
-            votes.append(1.0)
-        elif close >= bb_upper:
-            votes.append(-1.0)
-        else:
-            votes.append(0.0)
+    if pd.notna(bb_lower) and pd.notna(bb_upper) and bb_upper > bb_lower:
+        # %B: 0=하단밴드, 0.5=중심선, 1=상단밴드. 하단 터치 +1.0, 상단 터치 -1.0로 선형 매핑
+        percent_b = (close - bb_lower) / (bb_upper - bb_lower)
+        vote_bb = 1.0 - 2.0 * percent_b
+        votes.append(max(-1.0, min(1.0, vote_bb)))
 
     score = sum(votes) / len(votes) if votes else 0.0
     direction = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"
