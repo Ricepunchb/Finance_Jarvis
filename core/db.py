@@ -144,6 +144,50 @@ CREATE TABLE IF NOT EXISTS news_cache (
     sentiment_score REAL,
     sentiment_reasoning TEXT
 );
+
+-- AI 포트폴리오 에이전트: 리밸런싱 제안 1건 = 비중변경(+추후 종목추가/제외)을 묶은 이벤트.
+-- target_weights 행들이 이 이벤트를 rebalance_event_id로 역참조해 어느 제안에서 나왔는지 추적한다.
+CREATE TABLE IF NOT EXISTS rebalance_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type TEXT NOT NULL,        -- 'MANUAL' | 'SCHEDULED' | 'DRIFT' | 'NEWS_EVENT' | 'ROLLBACK'
+    trigger_detail TEXT,
+    autonomy_mode TEXT NOT NULL,       -- 'approval_gated' | 'full_auto' (실행 시점 스냅샷)
+    status TEXT NOT NULL,              -- RUNNING | PROPOSED | APPROVED | REJECTED | AUTO_APPLIED | BLOCKED | FAILED | SKIPPED
+    rationale TEXT,
+    symbols_added TEXT,                -- JSON [{symbol, name, rationale}]
+    symbols_removed TEXT,              -- JSON [{symbol, rationale}]
+    prior_snapshot_json TEXT NOT NULL, -- 실행 직전 {symbol: weight} + 종목 세트
+    proposed_snapshot_json TEXT,       -- 제안된 사후 상태 (검증 실패 시 NULL)
+    context_json TEXT,                 -- LLM 입출력 전체 스냅샷 (decision_log와 동일하게 항상 채울 것)
+    error TEXT,
+    created_at REAL NOT NULL,
+    decided_at REAL,
+    decided_by TEXT                    -- 'human' | 'circuit_breaker' | 'auto'
+);
+
+-- 종목 발굴 후보 풀. LLM은 이 안에서만 신규 편입을 제안할 수 있다 (환각 티커 방지) —
+-- 여기 들어오는 시점에 이미 KIS 실재성 검증을 통과한 것만 담긴다.
+CREATE TABLE IF NOT EXISTS candidate_universe (
+    symbol TEXT PRIMARY KEY,
+    market TEXT NOT NULL DEFAULT 'domestic',
+    exchange TEXT,
+    name TEXT,
+    universe_tag TEXT NOT NULL,        -- 'KOSPI_LARGE_CAP' | 'MANUAL_WATCHLIST' 등
+    validated_at REAL,
+    added_at REAL NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+
+-- 종목별 편입 논거. 나중에 "왜 이 종목을 뺐는지" 판단할 근거로 재사용한다.
+CREATE TABLE IF NOT EXISTS symbol_thesis (
+    symbol TEXT PRIMARY KEY,
+    added_reason TEXT,
+    added_by TEXT NOT NULL,            -- 'manual' | 'llm'
+    thesis_json TEXT,
+    source_event_id INTEGER,           -- rebalance_events.id, 수동 추가는 NULL
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -187,6 +231,18 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE positions ADD COLUMN peak_price_since_entry REAL")
     if "entry_opened_at" not in columns:
         await conn.execute("ALTER TABLE positions ADD COLUMN entry_opened_at REAL")
+
+    cur = await conn.execute("PRAGMA table_info(target_weights)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "rebalance_event_id" not in columns:
+        await conn.execute("ALTER TABLE target_weights ADD COLUMN rebalance_event_id INTEGER")
+
+    cur = await conn.execute("PRAGMA table_info(portfolio_symbols)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "disabled_at" not in columns:
+        await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_at REAL")
+    if "disabled_by_event_id" not in columns:
+        await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_by_event_id INTEGER")
 
 
 # --- engine_state (singleton key-value) ---
@@ -327,12 +383,17 @@ async def get_active_target_weights(conn: aiosqlite.Connection) -> Dict[str, flo
 
 
 async def propose_target_weight(
-    conn: aiosqlite.Connection, symbol: str, weight: float, proposed_by: str, rationale: str = ""
+    conn: aiosqlite.Connection,
+    symbol: str,
+    weight: float,
+    proposed_by: str,
+    rationale: str = "",
+    rebalance_event_id: Optional[int] = None,
 ) -> int:
     cur = await conn.execute(
-        "INSERT INTO target_weights(symbol, weight, status, proposed_by, rationale, proposed_at) "
-        "VALUES (?, ?, 'PROPOSED', ?, ?, ?)",
-        (symbol, weight, proposed_by, rationale, time.time()),
+        "INSERT INTO target_weights(symbol, weight, status, proposed_by, rationale, proposed_at, "
+        "rebalance_event_id) VALUES (?, ?, 'PROPOSED', ?, ?, ?, ?)",
+        (symbol, weight, proposed_by, rationale, time.time(), rebalance_event_id),
     )
     await conn.commit()
     return cur.lastrowid
@@ -365,6 +426,143 @@ async def decide_target_weight(conn: aiosqlite.Connection, proposal_id: int, app
             (row["symbol"], row["weight"], now, proposal_id),
         )
     await conn.commit()
+
+
+# --- rebalance_events (AI 포트폴리오 에이전트 감사로그) ---
+
+async def create_rebalance_event(
+    conn: aiosqlite.Connection,
+    trigger_type: str,
+    autonomy_mode: str,
+    prior_snapshot_json: str,
+    trigger_detail: str = "",
+) -> int:
+    cur = await conn.execute(
+        "INSERT INTO rebalance_events(trigger_type, trigger_detail, autonomy_mode, status, "
+        "prior_snapshot_json, created_at) VALUES (?, ?, ?, 'RUNNING', ?, ?)",
+        (trigger_type, trigger_detail, autonomy_mode, prior_snapshot_json, time.time()),
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def finish_rebalance_event(
+    conn: aiosqlite.Connection,
+    event_id: int,
+    status: str,
+    proposed_snapshot_json: Optional[str] = None,
+    rationale: Optional[str] = None,
+    context_json: Optional[str] = None,
+    error: Optional[str] = None,
+    symbols_added_json: Optional[str] = None,
+    symbols_removed_json: Optional[str] = None,
+) -> None:
+    await conn.execute(
+        "UPDATE rebalance_events SET status = ?, proposed_snapshot_json = COALESCE(?, proposed_snapshot_json), "
+        "rationale = COALESCE(?, rationale), context_json = COALESCE(?, context_json), "
+        "error = COALESCE(?, error), symbols_added = COALESCE(?, symbols_added), "
+        "symbols_removed = COALESCE(?, symbols_removed) WHERE id = ?",
+        (status, proposed_snapshot_json, rationale, context_json, error,
+         symbols_added_json, symbols_removed_json, event_id),
+    )
+    await conn.commit()
+
+
+async def get_rebalance_event(conn: aiosqlite.Connection, event_id: int) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM rebalance_events WHERE id = ?", (event_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_rebalance_events(conn: aiosqlite.Connection, limit: int = 50) -> List[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM rebalance_events ORDER BY id DESC LIMIT ?", (limit,))
+    rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def apply_rebalance_event(
+    conn: aiosqlite.Connection, event_id: int, approve: bool, decided_by: str
+) -> None:
+    """이벤트에 묶인 모든 target_weights 행을 한 트랜잭션 개념으로 일괄 승인/거부한다.
+
+    승인 시에만 symbols_added를 portfolio_symbols(+thesis)에 반영한다 - 사람이 거부하면
+    아무것도 실제 포트폴리오에 닿지 않는다. symbols_removed는 별도 처리가 필요 없다 —
+    "제외"는 항상 target_weight=0 제안으로 표현되고(core/portfolio_agent.py), 그 비중이
+    decide_target_weight를 통해 active_target_weights에 그대로 반영되면 기존
+    signal_engine의 ceiling 로직이 초과분을 밴드 경계까지 강제 축소한다. portfolio_symbols
+    자체를 여기서 비활성화하지 않는 이유: 해외종목의 market/exchange 메타데이터가
+    get_portfolio_symbol_info()에서 사라지면 엔진이 국내로 잘못 취급할 위험이 있다 —
+    잔여 포지션이 있는 한 계속 정확한 메타데이터로 관리되어야 한다.
+    """
+    event = await get_rebalance_event(conn, event_id)
+    if event is None:
+        raise ValueError(f"rebalance_event {event_id}를 찾을 수 없음")
+
+    cur = await conn.execute(
+        "SELECT id FROM target_weights WHERE rebalance_event_id = ? AND status = 'PROPOSED'", (event_id,)
+    )
+    weight_ids = [row["id"] for row in await cur.fetchall()]
+
+    if approve and event["symbols_added"]:
+        for add in json.loads(event["symbols_added"]):
+            await add_portfolio_symbol(conn, add["symbol"], market="domestic")
+            await upsert_symbol_thesis(
+                conn, add["symbol"], added_reason=add.get("rationale", ""), added_by="llm",
+                source_event_id=event_id,
+            )
+
+    for wid in weight_ids:
+        await decide_target_weight(conn, wid, approve)
+
+    now = time.time()
+    await conn.execute(
+        "UPDATE rebalance_events SET status = ?, decided_at = ?, decided_by = ? WHERE id = ?",
+        ("APPROVED" if approve else "REJECTED", now, decided_by, event_id),
+    )
+    await conn.commit()
+
+
+# --- candidate_universe / symbol_thesis (AI 포트폴리오 에이전트 종목 발굴) ---
+
+async def add_candidate_symbol(
+    conn: aiosqlite.Connection, symbol: str, name: str, universe_tag: str,
+    market: str = "domestic", exchange: Optional[str] = None,
+) -> None:
+    now = time.time()
+    await conn.execute(
+        "INSERT INTO candidate_universe(symbol, market, exchange, name, universe_tag, validated_at, "
+        "added_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+        "ON CONFLICT(symbol) DO UPDATE SET name=excluded.name, validated_at=excluded.validated_at, enabled=1",
+        (symbol, market, exchange, name, universe_tag, now, now),
+    )
+    await conn.commit()
+
+
+async def list_candidate_universe(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM candidate_universe WHERE enabled = 1")
+    rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def upsert_symbol_thesis(
+    conn: aiosqlite.Connection, symbol: str, added_reason: str, added_by: str,
+    thesis_json: Optional[str] = None, source_event_id: Optional[int] = None,
+) -> None:
+    now = time.time()
+    await conn.execute(
+        "INSERT INTO symbol_thesis(symbol, added_reason, added_by, thesis_json, source_event_id, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(symbol) DO UPDATE SET added_reason=excluded.added_reason, added_by=excluded.added_by, "
+        "thesis_json=excluded.thesis_json, source_event_id=excluded.source_event_id, updated_at=excluded.updated_at",
+        (symbol, added_reason, added_by, thesis_json, source_event_id, now, now),
+    )
+    await conn.commit()
+
+
+async def get_symbol_thesis(conn: aiosqlite.Connection, symbol: str) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM symbol_thesis WHERE symbol = ?", (symbol,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 # --- positions ---

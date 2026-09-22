@@ -1,0 +1,22 @@
+[
+  {"symbol": "005930", "name": "삼성전자", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "000660", "name": "SK하이닉스", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "035420", "name": "NAVER", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "035720", "name": "카카오", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "005380", "name": "현대차", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "000270", "name": "기아", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "005490", "name": "POSCO홀딩스", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "051910", "name": "LG화학", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "006400", "name": "삼성SDI", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "105560", "name": "KB금융", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "055550", "name": "신한지주", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "032830", "name": "삼성생명", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "033780", "name": "KT&G", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "012330", "name": "현대모비스", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "017670", "name": "SK텔레콤", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "066570", "name": "LG전자", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "096770", "name": "SK이노베이션", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "086790", "name": "하나금융지주", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "207940", "name": "삼성바이오로직스", "universe_tag": "KOSPI_LARGE_CAP"},
+  {"symbol": "068270", "name": "셀트리온", "universe_tag": "KOSPI_LARGE_CAP"}
+]

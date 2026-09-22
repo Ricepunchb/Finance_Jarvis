@@ -1,11 +1,14 @@
 # core/indicators.py
-"""기술적 지표 기반 매매 시그널. pandas-ta로 계산하며 수식을 직접 구현하지 않는다."""
+"""기술적 지표 기반 매매 시그널. pandas-ta로 계산하며 수식을 직접 구현하지 않는다
+(단, CCI는 예외 - pandas_ta 3.0.6의 cci() 자체에 버그가 있어 직접 계산한다. 아래
+_compute_cci 참고)."""
 from typing import Any, Dict, List
 
 import pandas as pd
 import pandas_ta as ta
 
 MIN_BARS_REQUIRED = 30
+CCI_COLUMN = "CCI_20"
 
 
 def _first_matching_column(df: pd.DataFrame, prefix: str) -> str:
@@ -13,6 +16,18 @@ def _first_matching_column(df: pd.DataFrame, prefix: str) -> str:
         if col.startswith(prefix):
             return col
     raise KeyError(f"'{prefix}'로 시작하는 컬럼을 찾을 수 없습니다: {list(df.columns)}")
+
+
+def _compute_cci(df: pd.DataFrame, length: int = 20, c: float = 0.015) -> pd.Series:
+    """CCI = (전형가 - 전형가의 이동평균) / (c * 전형가의 평균절대편차).
+
+    pandas_ta 3.0.6의 cci()는 괄호 누락으로 이 식이 아니라
+    "전형가 - 이동평균/(c*평균절대편차)"를 계산해 터무니없는 값을 낸다(실측 검증됨,
+    수동 계산 대비 수백~수천 배 차이) - 그래서 여기서만 표준 공식대로 직접 계산한다."""
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    sma_tp = typical_price.rolling(length).mean()
+    mean_deviation = (typical_price - sma_tp).abs().rolling(length).mean()
+    return (typical_price - sma_tp) / (c * mean_deviation)
 
 
 def chart_rows_to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -103,3 +118,63 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     score = sum(votes) / len(votes) if votes else 0.0
     direction = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"
     return {"direction": direction, "strength": min(1.0, abs(score)), "detail": f"score={score:.2f}"}
+
+
+def compute_technical_detail(df: pd.DataFrame) -> Dict[str, Any]:
+    """RSI/MACD/CCI/볼린저밴드의 원시 수치를 그대로 반환한다.
+
+    compute_technical_signal과는 완전히 독립된 함수다 — 일부러 계산을 공유하지 않는다.
+    이 함수는 signal_engine의 실거래 판단(compute_technical_signal)에는 전혀 쓰이지
+    않고, AI 포트폴리오 에이전트가 참고할 원시 컨텍스트로만 쓰인다. 공유 헬퍼로 묶으면
+    리팩터링 실수 하나가 실거래 경로까지 건드릴 위험이 생기므로, 약간의 중복 계산을
+    감수하고 분리를 유지한다(90개 안팎의 행이라 계산 비용 자체는 무시할 수준).
+    """
+    if len(df) < MIN_BARS_REQUIRED:
+        return {}
+
+    work = df.copy()
+    work.ta.rsi(length=14, append=True)
+    work.ta.macd(fast=12, slow=26, signal=9, append=True)
+    work.ta.bbands(length=20, std=2, append=True)
+    # pandas_ta 3.0.6의 cci()는 소스 코드에 괄호가 빠져 있다: 올바른 식은
+    # (typical_price - sma(typical_price)) / (c * mad(typical_price))인데 실제 코드는
+    # typical_price - sma(typical_price) / (c * mad(typical_price))로 계산돼 터무니없이
+    # 큰 값이 나온다 (실측 검증됨). RSI/MACD/BB는 수동 계산과 정확히 일치함을 확인했으니
+    # 이 세 개는 그대로 쓰고, CCI만 직접 계산한다.
+    work[CCI_COLUMN] = _compute_cci(work, length=20)
+    last = work.iloc[-1]
+
+    detail: Dict[str, Any] = {}
+
+    try:
+        rsi = last[_first_matching_column(work, "RSI_")]
+        if pd.notna(rsi):
+            detail["rsi"] = round(float(rsi), 1)  # <30 과매도(매수관점), >70 과매수
+    except KeyError:
+        pass
+
+    try:
+        macd = last[_first_matching_column(work, "MACD_")]
+        macd_signal = last[_first_matching_column(work, "MACDs_")]
+        if pd.notna(macd) and pd.notna(macd_signal):
+            detail["macd"] = round(float(macd), 2)
+            detail["macd_signal"] = round(float(macd_signal), 2)
+            detail["macd_cross"] = "golden" if macd > macd_signal else "dead"
+    except KeyError:
+        pass
+
+    cci = last[CCI_COLUMN]
+    if pd.notna(cci):
+        detail["cci"] = round(float(cci), 1)  # >100 과매수/강한상승, <-100 과매도/강한하락
+
+    try:
+        bb_lower = last[_first_matching_column(work, "BBL_")]
+        bb_upper = last[_first_matching_column(work, "BBU_")]
+        close = last["close"]
+        if pd.notna(bb_lower) and pd.notna(bb_upper) and bb_upper > bb_lower:
+            # %B: 0=하단 밴드, 0.5=중단(이동평균), 1=상단 밴드
+            detail["bb_percent_b"] = round(float((close - bb_lower) / (bb_upper - bb_lower)), 2)
+    except KeyError:
+        pass
+
+    return detail

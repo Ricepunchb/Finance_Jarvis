@@ -54,8 +54,16 @@ st.markdown(
 )
 
 
-def api_get(path: str, **params):
-    return requests.get(f"{API_BASE}{path}", params=params, timeout=10).json()
+def api_get(path: str, timeout: int = 20, **params):
+    """실패(타임아웃/연결끊김/4xx·5xx)는 예외를 올리지 않고 None을 반환한다.
+    호출부는 기존 `if x:` 패턴으로 자연스럽게 폴백 처리하도록 통일."""
+    try:
+        resp = requests.get(f"{API_BASE}{path}", params=params, timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code >= 400:
+        return None
+    return resp.json()
 
 
 def api_post(path: str, json_body: dict | None = None):
@@ -108,12 +116,24 @@ with st.sidebar:
     if st.button("🔄 지금 새로고침", width='stretch'):
         st.rerun()
 
-try:
-    status = api_get("/engine/status")
-    config = api_get("/engine/config")
-except requests.exceptions.ConnectionError:
-    st.error("제어 플레인(FastAPI)에 연결할 수 없습니다. `uvicorn api.main:app --port 8800`을 먼저 실행하세요.")
+status = api_get("/engine/status")
+config = api_get("/engine/config")
+if status is None or config is None:
+    st.error(
+        "제어 플레인(FastAPI)에 연결할 수 없습니다 (타임아웃 포함). "
+        "`uvicorn api.main:app --port 8800`을 먼저 실행하세요."
+    )
     st.stop()
+
+# 국내 종목이 많으면 KIS 조회가 순차적으로 이뤄져 기본 타임아웃보다 오래 걸릴 수 있어 넉넉히 잡는다.
+symbol_names = api_get("/portfolio/symbol-names", timeout=45) or {}
+
+
+def label(symbol: str) -> str:
+    """국내종목은 'AAPL' 대신 '삼성전자(005930)'처럼 한글명을 붙여 보여준다.
+    조회 실패/해외종목은 코드 그대로 폴백."""
+    name = symbol_names.get(symbol)
+    return f"{name}({symbol})" if name else symbol
 
 with st.sidebar:
     mode_class = "badge-mock" if status["is_mock"] else "badge-live"
@@ -185,7 +205,7 @@ with tab_overview:
             for sym, p in positions.items() if p["qty"]
         ]
         if rows:
-            fig = go.Figure(data=[go.Pie(labels=[r["symbol"] for r in rows], values=[r["book_value"] for r in rows], hole=0.45)])
+            fig = go.Figure(data=[go.Pie(labels=[label(r["symbol"]) for r in rows], values=[r["book_value"] for r in rows], hole=0.45)])
             fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=320)
             st.plotly_chart(fig, width='stretch')
         else:
@@ -236,6 +256,7 @@ with tab_settings:
     l1.metric("Provider", config["llm_provider"])
     l2.metric("모델", config["gemini_model"])
     l3.metric("API Key", "✅ 설정됨" if config["gemini_configured"] else "❌ 미설정 (감성분석 비활성)")
+    st.caption(f"백업 모델(5xx 발생시): {config['gemini_fallback_model'] or '미설정 (폴백 없음)'}")
 
     l4, l5, l6 = st.columns(3)
     l4.metric("뉴스 lookback", f"{config['news_lookback_hours']}시간")
@@ -267,7 +288,9 @@ with tab_portfolio:
 
     symbols = api_get("/portfolio/symbols")
     if symbols:
-        st.dataframe(pd.DataFrame(symbols), width='stretch', hide_index=True)
+        symbols_df = pd.DataFrame(symbols)
+        symbols_df.insert(1, "종목명", symbols_df["symbol"].map(lambda s: symbol_names.get(s, "-")))
+        st.dataframe(symbols_df, width='stretch', hide_index=True)
 
     st.divider()
     st.markdown("#### 🎯 목표 비중")
@@ -284,7 +307,11 @@ with tab_portfolio:
 
     weights = api_get("/portfolio/weights")
     if weights:
-        wdf = pd.DataFrame({"symbol": list(weights.keys()), "target_weight_pct": [w * 100 for w in weights.values()]})
+        wdf = pd.DataFrame({
+            "symbol": list(weights.keys()),
+            "종목명": [symbol_names.get(sym, "-") for sym in weights.keys()],
+            "target_weight_pct": [w * 100 for w in weights.values()],
+        })
         wc_table, wc_chart = st.columns([1, 1])
         wc_table.dataframe(
             wdf,
@@ -292,37 +319,72 @@ with tab_portfolio:
             hide_index=True,
             column_config={"target_weight_pct": st.column_config.NumberColumn("목표비중", format="%.2f%%")},
         )
-        fig = go.Figure(data=[go.Bar(x=wdf["symbol"], y=wdf["target_weight_pct"])])
+        fig = go.Figure(data=[go.Bar(x=[label(sym) for sym in weights.keys()], y=wdf["target_weight_pct"])])
         fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280, yaxis_title="%")
         wc_chart.plotly_chart(fig, width='stretch')
     else:
         st.caption("승인된 목표 비중이 없습니다.")
 
     st.divider()
-    st.markdown("#### 🤖 LLM 비중 제안 (Gemini) — 승인 전까지 매매에 반영 안 됨")
-    if st.button("LLM에게 목표비중 제안 요청"):
+    st.markdown("#### 🤖 AI 포트폴리오 에이전트 — 승인 전까지 매매에 반영 안 됨")
+    if st.button("리밸런싱 제안 요청 (재비중 + 종목 발굴)"):
         result = api_post("/portfolio/weights/propose")
         if result is not None:
-            st.success(result.get("rationale", "제안 완료"))
+            msg = result.get("rationale", "제안 완료")
+            if result.get("adds"):
+                msg += f"\n\n신규 편입 제안: {', '.join(label(s) for s in result['adds'])}"
+            if result.get("removes"):
+                msg += f"\n제외 제안: {', '.join(label(s) for s in result['removes'])}"
+            st.success(msg)
             st.rerun()
 
-    proposals = api_get("/portfolio/weights/proposals")
-    if proposals:
-        for p in proposals:
+    # target_weights는 종목 단위지만, 종목 추가/제외가 걸린 제안은 rebalance_event 단위로
+    # 원자적으로 승인해야 portfolio_symbols/논거까지 함께 반영된다 - 이벤트별로 묶어서 보여준다.
+    proposals = api_get("/portfolio/weights/proposals") or []
+    events_by_id = {e["id"]: e for e in (api_get("/portfolio/rebalance-events", limit=50) or [])}
+    grouped: dict = {}
+    for p in proposals:
+        grouped.setdefault(p.get("rebalance_event_id"), []).append(p)
+
+    if grouped:
+        for event_id, rows in grouped.items():
+            event = events_by_id.get(event_id) if event_id is not None else None
+            adds = json.loads(event["symbols_added"]) if event and event.get("symbols_added") else []
+            removes = json.loads(event["symbols_removed"]) if event and event.get("symbols_removed") else []
             with st.container():
+                weight_lines = "".join(
+                    f"<div>{label(r['symbol'])} → {fmt_pct(r['weight'])}"
+                    + (" <span class='jarvis-muted'>(제외)</span>" if r["weight"] == 0 else "")
+                    + "</div>"
+                    for r in sorted(rows, key=lambda r: -r["weight"])
+                )
+                extra = ""
+                if adds:
+                    extra += f"<div class='jarvis-muted'>➕ 신규 편입: {', '.join(label(a['symbol']) for a in adds)}</div>"
+                if removes:
+                    extra += f"<div class='jarvis-muted'>➖ 제외: {', '.join(label(r['symbol']) for r in removes)}</div>"
+                rationale = rows[0].get("rationale", "")
                 st.markdown(
-                    f'<div class="jarvis-card"><h4>{p["symbol"]} · {fmt_pct(p["weight"])}'
-                    f' <span class="jarvis-muted">({p["proposed_by"]})</span></h4>'
-                    f'<div class="jarvis-muted">{p.get("rationale", "")}</div></div>',
+                    f'<div class="jarvis-card"><h4>제안 #{event_id if event_id is not None else "-"} '
+                    f'<span class="jarvis-muted">({rows[0]["proposed_by"]})</span></h4>'
+                    f'{weight_lines}{extra}'
+                    f'<div class="jarvis-muted" style="margin-top:6px">{rationale}</div></div>',
                     unsafe_allow_html=True,
                 )
                 pc1, pc2, _ = st.columns([1, 1, 4])
-                if pc1.button("✅ 승인", key=f"approve_{p['id']}"):
-                    api_post(f"/portfolio/weights/proposals/{p['id']}/decide", {"approve": True})
-                    st.rerun()
-                if pc2.button("❌ 거부", key=f"reject_{p['id']}"):
-                    api_post(f"/portfolio/weights/proposals/{p['id']}/decide", {"approve": False})
-                    st.rerun()
+                if event_id is not None:
+                    if pc1.button("✅ 전체 승인", key=f"approve_event_{event_id}"):
+                        api_post(f"/portfolio/rebalance-events/{event_id}/decide", {"approve": True})
+                        st.rerun()
+                    if pc2.button("❌ 전체 거부", key=f"reject_event_{event_id}"):
+                        api_post(f"/portfolio/rebalance-events/{event_id}/decide", {"approve": False})
+                        st.rerun()
+                else:
+                    # rebalance_event_id가 없는 옛 형식 제안 (마이그레이션 이전 잔여분) - 종목 단위로 폴백
+                    for r in rows:
+                        if st.button(f"✅ {label(r['symbol'])} 승인", key=f"approve_{r['id']}"):
+                            api_post(f"/portfolio/weights/proposals/{r['id']}/decide", {"approve": True})
+                            st.rerun()
     else:
         st.caption("대기 중인 제안이 없습니다.")
 
@@ -333,6 +395,7 @@ with tab_portfolio:
             [
                 {
                     "symbol": sym,
+                    "종목명": symbol_names.get(sym, "-"),
                     "수량": p["qty"],
                     "평균단가": p["avg_price"],
                     "장부가치": p["qty"] * p["avg_price"],
@@ -358,7 +421,7 @@ with tab_log:
     else:
         all_symbols = sorted({d["symbol"] for d in decisions})
         fc1, fc2 = st.columns([2, 2])
-        symbol_filter = fc1.multiselect("종목 필터", all_symbols)
+        symbol_filter = fc1.multiselect("종목 필터", all_symbols, format_func=label)
         action_filter = fc2.multiselect("액션 필터", ["BUY", "SELL", "NO_OP"])
 
         rows = []
@@ -384,7 +447,7 @@ with tab_log:
             rows.append(
                 {
                     "시각": fmt_kst(d["ts"]),
-                    "종목": d["symbol"],
+                    "종목": label(d["symbol"]),
                     "액션": badge,
                     "수량": d.get("qty") or "-",
                     "현재비중": fmt_pct(d.get("current_weight")),

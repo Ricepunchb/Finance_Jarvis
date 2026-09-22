@@ -43,8 +43,32 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "gemini"
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.6-flash"
+    # 주 모델이 5xx(예: 503 UNAVAILABLE - 수요 폭주)를 반환하면 이 모델로 한 번 더 시도한다.
+    # 빈 문자열이면 폴백 없이 주 모델 결과만 사용.
+    GEMINI_FALLBACK_MODEL: str = "gemini-2.5-flash"
     NEWS_LOOKBACK_HOURS: int = 24
     NEWS_MAX_ARTICLES_PER_SYMBOL: int = 5
+
+    # --- AI 포트폴리오 에이전트 (Phase 5.0: 재비중 제안 검증 한도) ---
+    # 종목당 상한은 기존 MAX_POSITION_PCT를 그대로 재사용한다 (중복 상수 금지).
+    AI_REBALANCE_MAX_TURNOVER_PCT: float = 0.20        # 1회 제안의 총 회전율 상한 (sum|Δweight|/2)
+    AI_REBALANCE_MAX_WEIGHT_DELTA_PCT: float = 0.10    # 종목당 1회 최대 비중 변화
+    AI_REBALANCE_MAX_SYMBOLS_ADDED: int = 2
+    AI_REBALANCE_MAX_SYMBOLS_REMOVED: int = 2
+    AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT: float = 0.03
+    AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS: int = 8
+
+    # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
+    DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지
+
+    # --- 성과/리스크 지표 (샤프/소티노 계산용) ---
+    RISK_FREE_RATE_ANNUAL: float = 0.035  # 한국 무위험수익률 근사치 (연 기준, 필요시 조정)
+
+    # --- AI 포트폴리오 에이전트 (Phase 5.2: 스케줄러 트리거) ---
+    AI_REBALANCE_MIN_INTERVAL_SEC: int = 86400            # 에이전트 자체 의사결정 쿨다운 (주문 쿨다운과 별개)
+    AI_REBALANCE_PERIODIC_INTERVAL_DAYS: int = 30         # 정기 재검토 주기
+    AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT: float = 0.05   # REBALANCE_BAND_PCT를 넘어 이만큼 더 벗어나야 트리거
+    AI_REBALANCE_NEWS_TRIGGER_STRENGTH: float = 0.7       # 보유종목 뉴스감성 강도가 이 이상이면 트리거
 
     @property
     def kis_domain(self) -> str:
