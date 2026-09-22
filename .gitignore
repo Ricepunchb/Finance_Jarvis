@@ -9,3 +9,6 @@ __pycache__/
 
 # 엔진 상태 DB / 락 파일 (개인 실행 상태, 공유하면 안 됨)
 data/
+
+# 엔진 실행 로그 (uvicorn stdout을 tee/리다이렉트로 남긴 것, 개인 실행 기록)
+logs_*.log

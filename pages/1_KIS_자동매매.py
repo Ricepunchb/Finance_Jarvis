@@ -59,7 +59,17 @@ def api_get(path: str, **params):
 
 
 def api_post(path: str, json_body: dict | None = None):
-    resp = requests.post(f"{API_BASE}{path}", json=json_body, timeout=10)
+    # /engine/start·/engine/kill은 reconciliation·웹소켓 연결·주문취소처럼 수 초~수십 초
+    # 걸리는 작업을 응답 전에 끝마치므로 기본 10초보다 넉넉한 타임아웃이 필요하다.
+    timeout = 60 if path in ("/engine/start", "/engine/kill") else 10
+    try:
+        resp = requests.post(f"{API_BASE}{path}", json=json_body, timeout=timeout)
+    except requests.exceptions.Timeout:
+        st.warning(
+            f"{timeout}초 안에 응답이 없습니다 — 서버 쪽에서는 계속 처리 중일 수 있으니 "
+            "새로고침으로 실제 상태(engine_running)를 먼저 확인하세요."
+        )
+        return None
     if resp.status_code >= 400:
         st.error(resp.json().get("detail", resp.text))
         return None
