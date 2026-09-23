@@ -144,6 +144,18 @@ async def get_config():
         "intraday_bar_minutes": settings.INTRADAY_BAR_MINUTES,
         "intraday_lookback_calendar_days": settings.INTRADAY_LOOKBACK_CALENDAR_DAYS,
         "enable_fundamental_valuation": settings.ENABLE_FUNDAMENTAL_VALUATION,
+        "ai_rebalance_max_turnover_pct": settings.AI_REBALANCE_MAX_TURNOVER_PCT,
+        "ai_rebalance_max_weight_delta_pct": settings.AI_REBALANCE_MAX_WEIGHT_DELTA_PCT,
+        "ai_rebalance_max_symbols_added": settings.AI_REBALANCE_MAX_SYMBOLS_ADDED,
+        "ai_rebalance_max_symbols_removed": settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED,
+        "ai_rebalance_min_symbol_weight_pct": settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
+        "ai_rebalance_max_portfolio_symbols": settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
+        "discovery_top_n": settings.DISCOVERY_TOP_N,
+        "ai_rebalance_min_interval_sec": settings.AI_REBALANCE_MIN_INTERVAL_SEC,
+        "ai_rebalance_periodic_interval_days": settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS,
+        "ai_rebalance_drift_trigger_buffer_pct": settings.AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT,
+        "ai_rebalance_news_trigger_strength": settings.AI_REBALANCE_NEWS_TRIGGER_STRENGTH,
+        "risk_free_rate_annual": settings.RISK_FREE_RATE_ANNUAL,
     }
 
 
@@ -292,6 +304,19 @@ async def get_positions():
     conn = await db.get_connection()
     try:
         return await db.get_positions(conn)
+    finally:
+        await conn.close()
+
+
+@app.get("/portfolio/performance")
+async def get_portfolio_performance():
+    """보유종목의 성과/리스크/기술 지표(ROI/CAGR/MDD/변동성/샤프/소티노/베타 + RSI/MACD/CCI/BB%B).
+    AI 리밸런싱 제안이 LLM에 넘기는 것과 같은 지표를 대시보드 표시용으로 재사용한다
+    (매매 판단(signal_engine.decide)에는 전혀 관여하지 않음). 종목마다 일봉 조회가 있어
+    보유종목이 많으면 시간이 걸릴 수 있다."""
+    conn = await db.get_connection()
+    try:
+        return await portfolio_agent.get_portfolio_performance(conn, client=engine.client)
     finally:
         await conn.close()
 

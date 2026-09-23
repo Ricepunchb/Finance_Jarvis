@@ -158,8 +158,8 @@ if status["kill_switch_active"]:
         api_post("/engine/clear-kill-switch")
         st.rerun()
 
-tab_overview, tab_settings, tab_portfolio, tab_log = st.tabs(
-    ["📊 개요", "⚙️ 설정 · 리스크", "💼 포트폴리오 · 비중", "🧾 매매 로그"]
+tab_overview, tab_settings, tab_portfolio, tab_ai, tab_log = st.tabs(
+    ["📊 개요", "⚙️ 설정 · 리스크", "💼 포트폴리오 · 비중", "🤖 AI 에이전트", "🧾 매매 로그"]
 )
 
 # =========================================================================
@@ -266,6 +266,26 @@ with tab_settings:
         "✅ 활성" if config["enable_fundamental_valuation"] else "⏸️ 비활성 (국내 종목만 지원)",
     )
 
+    st.divider()
+    st.markdown("#### 🤖 AI 포트폴리오 에이전트 (제안 검증 한도 · 트리거)")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("1회 제안 최대 회전율", fmt_pct(config["ai_rebalance_max_turnover_pct"]))
+    a2.metric("종목당 최대 비중변화", fmt_pct(config["ai_rebalance_max_weight_delta_pct"]))
+    a3.metric("포트폴리오 최대 종목수", config["ai_rebalance_max_portfolio_symbols"])
+    a4, a5, a6 = st.columns(3)
+    a4.metric("1회 최대 신규편입", config["ai_rebalance_max_symbols_added"])
+    a5.metric("1회 최대 제외", config["ai_rebalance_max_symbols_removed"])
+    a6.metric("종목당 최소 비중", fmt_pct(config["ai_rebalance_min_symbol_weight_pct"]))
+    st.caption(f"발굴 스크리닝 상위 노출 종목수: {config['discovery_top_n']}개")
+
+    a7, a8 = st.columns(2)
+    a7.metric("에이전트 자체 결정 쿨다운", f"{config['ai_rebalance_min_interval_sec'] // 3600}시간")
+    a8.metric("정기 재검토 주기", f"{config['ai_rebalance_periodic_interval_days']}일")
+    a9, a10 = st.columns(2)
+    a9.metric("드리프트 트리거 버퍼", fmt_pct(config["ai_rebalance_drift_trigger_buffer_pct"]))
+    a10.metric("뉴스 트리거 강도 임계치", config["ai_rebalance_news_trigger_strength"])
+    st.caption(f"무위험수익률(연, 샤프/소티노 계산용): {fmt_pct(config['risk_free_rate_annual'])}")
+
 # =========================================================================
 # 포트폴리오 · 비중
 # =========================================================================
@@ -326,7 +346,31 @@ with tab_portfolio:
         st.caption("승인된 목표 비중이 없습니다.")
 
     st.divider()
-    st.markdown("#### 🤖 AI 포트폴리오 에이전트 — 승인 전까지 매매에 반영 안 됨")
+    st.markdown("#### 💼 현재 포지션")
+    if positions:
+        pdf = pd.DataFrame(
+            [
+                {
+                    "symbol": sym,
+                    "종목명": symbol_names.get(sym, "-"),
+                    "수량": p["qty"],
+                    "평균단가": p["avg_price"],
+                    "장부가치": p["qty"] * p["avg_price"],
+                    "통화": p["currency"],
+                    "동기화": fmt_kst(p["last_synced_at"]),
+                }
+                for sym, p in positions.items()
+            ]
+        )
+        st.dataframe(pdf, width='stretch', hide_index=True)
+    else:
+        st.caption("보유 포지션이 없습니다.")
+
+# =========================================================================
+# AI 에이전트
+# =========================================================================
+with tab_ai:
+    st.markdown("#### 🧭 리밸런싱 제안 — 승인 전까지 매매에 반영 안 됨")
     if st.button("리밸런싱 제안 요청 (재비중 + 종목 발굴)"):
         result = api_post("/portfolio/weights/propose")
         if result is not None:
@@ -388,26 +432,125 @@ with tab_portfolio:
     else:
         st.caption("대기 중인 제안이 없습니다.")
 
+    with st.expander("🕓 리밸런싱 이벤트 이력 (감사로그 - 승인/거부와 무관하게 전부 기록됨)"):
+        events = api_get("/portfolio/rebalance-events", limit=50) or []
+        if events:
+            edf = pd.DataFrame(
+                [
+                    {
+                        "시각": fmt_kst(e["created_at"]),
+                        "트리거": e["trigger_type"],
+                        "상태": e["status"],
+                        "사유/오류": e.get("error") or "-",
+                        "결정시각": fmt_kst(e.get("decided_at")),
+                        "결정자": e.get("decided_by") or "-",
+                    }
+                    for e in events
+                ]
+            )
+            st.dataframe(edf, width='stretch', hide_index=True, height=280)
+        else:
+            st.caption("이력이 없습니다.")
+
     st.divider()
-    st.markdown("#### 💼 현재 포지션")
-    if positions:
-        pdf = pd.DataFrame(
+    st.markdown("#### ⏱️ 자동 트리거 스케줄러")
+    st.caption(
+        "꺼져 있어도(기본값) 위의 수동 제안 버튼은 그대로 동작한다 — 이 토글은 정기/드리프트/"
+        "뉴스이벤트를 감지해 '자동으로' 제안을 생성할지만 결정하며, 최종 승인은 항상 사람 몫이다."
+    )
+    scheduler_status = api_get("/ai-rebalance/scheduler")
+    if scheduler_status is not None:
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("스케줄러", "🟢 켜짐" if scheduler_status["enabled"] else "⚪ 꺼짐")
+        sc2.metric("마지막 자동 결정", fmt_kst(scheduler_status["last_decision_at"]))
+        sc3.metric("마지막 정기실행", fmt_kst(scheduler_status["last_scheduled_run_at"]))
+        st.caption(
+            f"정기 재검토 주기: {scheduler_status['periodic_interval_days']}일 · "
+            f"에이전트 자체 결정 쿨다운: {scheduler_status['min_interval_sec'] // 3600}시간"
+        )
+        sb1, sb2 = st.columns(2)
+        if sb1.button("🟢 켜기", disabled=scheduler_status["enabled"], width='stretch'):
+            api_post("/ai-rebalance/scheduler", {"enabled": True})
+            st.rerun()
+        if sb2.button("⚪ 끄기", disabled=not scheduler_status["enabled"], width='stretch'):
+            api_post("/ai-rebalance/scheduler", {"enabled": False})
+            st.rerun()
+
+    st.divider()
+    st.markdown("#### 🔭 종목 발굴 후보 (candidate_universe)")
+    st.caption("LLM은 이 목록 안에서만 신규 편입을 제안할 수 있다 — 목록 밖 종목코드는 환각으로 간주해 차단된다.")
+    dc1, dc2 = st.columns([1, 3])
+    if dc1.button("시드 파일 적재 (data/candidate_universe_seed.json)"):
+        seed_result = api_post("/discovery/seed")
+        if seed_result is not None:
+            st.success(f"추가 {seed_result['added']} · 반려 {seed_result['rejected']} · 이미 있음 {seed_result['skipped']}")
+            st.rerun()
+
+    with st.form("add_candidate_form"):
+        cf1, cf2, cf3 = st.columns([2, 2, 1])
+        cand_symbol = cf1.text_input("종목코드 (국내만 지원)")
+        cand_name = cf2.text_input("종목명 (선택 - KIS 실제명과 대조 검증)")
+        cf3.write("")
+        cf3.write("")
+        cand_submitted = cf3.form_submit_button("후보 추가")
+        if cand_submitted and cand_symbol:
+            add_result = api_post("/discovery/candidates", {"symbol": cand_symbol.strip(), "name": cand_name.strip() or None})
+            if add_result is not None:
+                st.success(f"{add_result['name']}({add_result['symbol']}) 후보 추가됨")
+                st.rerun()
+
+    candidates = api_get("/discovery/candidates") or []
+    if candidates:
+        cdf = pd.DataFrame(
             [
                 {
-                    "symbol": sym,
-                    "종목명": symbol_names.get(sym, "-"),
-                    "수량": p["qty"],
-                    "평균단가": p["avg_price"],
-                    "장부가치": p["qty"] * p["avg_price"],
-                    "통화": p["currency"],
-                    "동기화": fmt_kst(p["last_synced_at"]),
+                    "종목명": c.get("name") or "-",
+                    "symbol": c["symbol"],
+                    "태그": c["universe_tag"],
+                    "검증시각": fmt_kst(c.get("validated_at")),
+                    "추가시각": fmt_kst(c.get("added_at")),
                 }
-                for sym, p in positions.items()
+                for c in candidates
             ]
         )
-        st.dataframe(pdf, width='stretch', hide_index=True)
+        st.dataframe(cdf, width='stretch', hide_index=True)
     else:
-        st.caption("보유 포지션이 없습니다.")
+        st.caption("발굴 후보가 없습니다 - 위 시드 적재 버튼으로 초기 유니버스를 채워보세요.")
+
+    st.divider()
+    st.markdown("#### 📈 보유종목 성과 · 리스크 지표")
+    st.caption(
+        "AI 리밸런싱 제안이 LLM에 넘기는 것과 같은 지표(종목당 일봉 재조회 필요 - KIS 호출량 때문에 "
+        "버튼을 눌러야 조회됨). 매매 판단(손절/스윙시그널)에는 관여하지 않는 참고용 지표다."
+    )
+    if st.button("성과지표 조회/새로고침"):
+        st.session_state["performance_data"] = api_get("/portfolio/performance", timeout=60)
+
+    perf = st.session_state.get("performance_data")
+    if perf:
+        perf_df = pd.DataFrame(
+            [
+                {
+                    "종목": label(p["symbol"]),
+                    "비중": fmt_pct(p.get("weight")),
+                    "평단가": p.get("avg_price"),
+                    "보유일": p.get("days_held", "-"),
+                    "ROI": fmt_pct((p["roi_pct"] / 100) if "roi_pct" in p else None),
+                    "CAGR": fmt_pct((p["cagr_pct"] / 100) if "cagr_pct" in p else None),
+                    "기간수익률(90일)": fmt_pct((p["period_return_pct"] / 100) if "period_return_pct" in p else None),
+                    "MDD": fmt_pct((p["mdd_pct"] / 100) if "mdd_pct" in p else None),
+                    "변동성(연)": fmt_pct((p["volatility_pct"] / 100) if "volatility_pct" in p else None),
+                    "샤프": round(p["sharpe"], 2) if "sharpe" in p else "-",
+                    "소티노": round(p["sortino"], 2) if "sortino" in p else "-",
+                    "베타(KODEX200)": round(p["beta"], 2) if "beta" in p else "-",
+                    "RSI": round(p["rsi"], 1) if "rsi" in p else "-",
+                }
+                for p in perf
+            ]
+        )
+        st.dataframe(perf_df, width='stretch', hide_index=True)
+    elif perf is not None:
+        st.caption("보유종목(승인된 목표비중 대상)이 없습니다.")
 
 # =========================================================================
 # 매매 로그

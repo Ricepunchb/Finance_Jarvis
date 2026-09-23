@@ -65,6 +65,17 @@ async def _build_current_positions(
     return result
 
 
+async def get_portfolio_performance(
+    conn: aiosqlite.Connection, client: Optional[AsyncKISClient] = None,
+) -> List[Dict[str, Any]]:
+    """대시보드 성과지표 탭용 - propose_rebalance와 같은 지표 계산 경로를 재사용하되
+    LLM 호출/rebalance_event 생성 없이 현재 보유종목의 성과/리스크/기술 지표만 반환한다."""
+    active_weights = await db.get_active_target_weights(conn)
+    positions = await db.get_positions(conn)
+    benchmark_returns = await quant_metrics.fetch_benchmark_return_series(client) if client is not None else None
+    return await _build_current_positions(client, active_weights, positions, benchmark_returns)
+
+
 async def _validate_adds(
     client: AsyncKISClient, adds: List[Dict[str, Any]], candidate_pool: List[Dict[str, Any]]
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
