@@ -356,14 +356,15 @@ async def add_discovery_candidate(req: AddCandidateRequest):
     outcome = await discovery.validate_candidate_symbol(engine.client, req.symbol, claimed_name=req.name)
     if not outcome.ok:
         raise HTTPException(status_code=400, detail=outcome.reason)
+    resolved_name = outcome.kis_name or req.name or req.symbol
     conn = await db.get_connection()
     try:
         await db.add_candidate_symbol(
-            conn, req.symbol, name=outcome.kis_name or req.symbol, universe_tag="MANUAL_WATCHLIST",
+            conn, req.symbol, name=resolved_name, universe_tag="MANUAL_WATCHLIST",
         )
     finally:
         await conn.close()
-    return {"status": "added", "symbol": req.symbol, "name": outcome.kis_name}
+    return {"status": "added", "symbol": req.symbol, "name": resolved_name}
 
 
 @app.get("/ai-rebalance/scheduler")

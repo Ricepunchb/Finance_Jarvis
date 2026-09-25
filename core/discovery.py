@@ -42,10 +42,12 @@ async def validate_candidate_symbol(
 ) -> ValidationOutcome:
     """후보가 candidate_universe에 들어가거나 ADD로 실제 채택되기 전 반드시 통과해야 한다.
 
-    1) KIS 실재성 확인 (존재하지 않는/오타 종목코드 차단)
+    1) KIS 실재성 확인 (존재하지 않는/오타 종목코드 차단) - 가격이 정상 조회되면 실재로 간주
     2) VI(거래정지) 상태 확인
     3) LLM이 주장한 종목명과 KIS 실제 종목명 대조 (코드가 우연히 존재해도 이름이 다르면
-       환각 의심으로 반려)
+       환각 의심으로 반려) - 단, 모의투자 시세조회는 종목명(hts_kor_isnm)을 아예 비워서
+       주는 경우가 있어 그럴 땐 이름 대조를 건너뛰고 가격 조회 성공만으로 통과시킨다
+       (그렇지 않으면 실전 종목코드가 모의투자에서 전부 반려되는 사고가 남).
     """
     if market != "domestic":
         return ValidationOutcome(False, "해외 후보종목은 아직 지원하지 않음 (Phase 5.1 범위 밖)")
@@ -55,10 +57,13 @@ async def validate_candidate_symbol(
     except Exception:
         return ValidationOutcome(False, "KIS 시세조회 실패 (존재하지 않는 종목코드일 가능성)")
 
-    kis_name = price_info.get("hts_kor_isnm")
     price = float(price_info.get("stck_prpr") or 0)
-    if price <= 0 or not kis_name:
-        return ValidationOutcome(False, "현재가/종목명 조회 실패")
+    if price <= 0:
+        return ValidationOutcome(False, "현재가 조회 실패 (존재하지 않는 종목코드일 가능성)")
+
+    kis_name = price_info.get("hts_kor_isnm")
+    if not kis_name:
+        logger.warning(f"'{symbol}' KIS 응답에 종목명 없음(모의투자 API 제약으로 추정) - 이름 대조 없이 가격만으로 실재성 인정")
 
     try:
         vi_rows = await kis_domestic.get_vi_status(client, symbol)
@@ -67,7 +72,7 @@ async def validate_candidate_symbol(
     except Exception:
         logger.exception(f"'{symbol}' VI 상태 조회 실패 - 검증은 계속 진행")
 
-    if claimed_name and claimed_name.strip():
+    if kis_name and claimed_name and claimed_name.strip():
         claimed = claimed_name.strip()
         if claimed not in kis_name and kis_name not in claimed:
             return ValidationOutcome(

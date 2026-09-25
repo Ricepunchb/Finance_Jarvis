@@ -80,7 +80,10 @@ class TradingEngine:
         self.llm_provider: Optional[LLMProvider] = None
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
-        self._intraday_backfill_budget = 0  # 사이클마다 리셋 — 모의투자 1req/sec 제약 때문에 분봉 백필을 종목 몇 개로 제한
+        # 사이클마다 리셋 — 모의투자 1req/sec 제약 때문에 분봉 백필을 종목 몇 개로 제한.
+        # 실제로 백필이 필요한 종목만 소비하도록 intraday.BackfillBudget이 알아서 차감한다
+        # (예전엔 처리한 종목 수만큼 무조건 차감해서 뒤 순서 종목이 영원히 못 받는 버그가 있었음).
+        self._intraday_backfill_budget = intraday.BackfillBudget(0)
 
     async def start(self) -> None:
         settings.assert_trading_allowed()
@@ -250,7 +253,7 @@ class TradingEngine:
         symbol_info = await db.get_portfolio_symbol_info(self.conn)
         cycle_id = await db.new_cycle(self.conn)
         ws_ok = await self.risk.is_ws_healthy()
-        self._intraday_backfill_budget = settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE
+        self._intraday_backfill_budget = intraday.BackfillBudget(settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE)
 
         balance = await kis_domestic.get_balance(self.client)
         holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
@@ -420,9 +423,9 @@ class TradingEngine:
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
-        allow_backfill = self._intraday_backfill_budget > 0
-        self._intraday_backfill_budget -= 1
-        intraday_signal = await intraday.get_intraday_signal_domestic(self.client, self.conn, symbol, allow_backfill)
+        intraday_signal = await intraday.get_intraday_signal_domestic(
+            self.client, self.conn, symbol, self._intraday_backfill_budget
+        )
         context["intraday_signal"] = intraday_signal
 
         sentiment_signal = None
@@ -641,10 +644,8 @@ class TradingEngine:
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
-        allow_backfill = self._intraday_backfill_budget > 0
-        self._intraday_backfill_budget -= 1
         intraday_signal = await intraday.get_intraday_signal_overseas(
-            self.client, self.conn, symbol, exchange, allow_backfill
+            self.client, self.conn, symbol, exchange, self._intraday_backfill_budget
         )
         context["intraday_signal"] = intraday_signal
 

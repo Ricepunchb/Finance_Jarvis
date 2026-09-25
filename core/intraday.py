@@ -35,6 +35,24 @@ _KRX_CLOSE_HOUR_1 = "153000"
 _MAX_PAGES_PER_DAY = 6  # 390분/거래일 ÷ 120건/회 ≈ 4회 + 여유
 
 
+class BackfillBudget:
+    """사이클당 백필 허용 종목 수 공유 카운터.
+
+    엔진이 처리한 종목 수만큼 무조건 차감하면(예전 방식) 이미 충분히 캐시된 종목이
+    앞 순서에 있다는 이유만으로 예산을 낭비해 뒤 순서 종목이 영원히 백필을 못 받을 수
+    있다 (실제로 발생했던 버그). 대신 '진짜로 백필이 필요한' 시점에만 try_consume()으로
+    소비해야 종목 처리 순서와 무관하게 예산이 공평하게 돌아간다."""
+
+    def __init__(self, n: int):
+        self.remaining = n
+
+    def try_consume(self) -> bool:
+        if self.remaining > 0:
+            self.remaining -= 1
+            return True
+        return False
+
+
 def _domestic_rows_to_1min_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
@@ -159,12 +177,12 @@ async def _backfill_overseas(client: AsyncKISClient, conn, symbol: str, exchange
 
 
 async def get_intraday_signal_domestic(
-    client: AsyncKISClient, conn, symbol: str, allow_backfill: bool,
+    client: AsyncKISClient, conn, symbol: str, budget: BackfillBudget,
 ) -> Signal:
     since_ts = (datetime.now(tz=KST) - timedelta(days=settings.INTRADAY_LOOKBACK_CALENDAR_DAYS)).timestamp()
     cached = await db.get_cached_intraday_bars(conn, symbol, "domestic", since_ts)
     if len(cached) < indicators.MIN_BARS_REQUIRED:
-        if not allow_backfill:
+        if not budget.try_consume():
             return {"direction": "HOLD", "strength": 0.0, "detail": "분봉 백필 대기 중"}
         try:
             await _backfill_domestic(client, conn, symbol)
@@ -189,12 +207,12 @@ async def get_intraday_signal_domestic(
 
 
 async def get_intraday_signal_overseas(
-    client: AsyncKISClient, conn, symbol: str, exchange: str, allow_backfill: bool,
+    client: AsyncKISClient, conn, symbol: str, exchange: str, budget: BackfillBudget,
 ) -> Signal:
     since_ts = (datetime.now(tz=KST) - timedelta(days=settings.INTRADAY_LOOKBACK_CALENDAR_DAYS)).timestamp()
     cached = await db.get_cached_intraday_bars(conn, symbol, "overseas", since_ts)
     if len(cached) < indicators.MIN_BARS_REQUIRED:
-        if not allow_backfill:
+        if not budget.try_consume():
             return {"direction": "HOLD", "strength": 0.0, "detail": "분봉 백필 대기 중"}
         try:
             await _backfill_overseas(client, conn, symbol, exchange)

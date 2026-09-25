@@ -67,9 +67,12 @@ def api_get(path: str, timeout: int = 20, **params):
 
 
 def api_post(path: str, json_body: dict | None = None):
-    # /engine/start·/engine/kill은 reconciliation·웹소켓 연결·주문취소처럼 수 초~수십 초
-    # 걸리는 작업을 응답 전에 끝마치므로 기본 10초보다 넉넉한 타임아웃이 필요하다.
-    timeout = 60 if path in ("/engine/start", "/engine/kill") else 10
+    # /engine/start·/engine/kill은 reconciliation·웹소켓 연결·주문취소처럼, /discovery/seed는
+    # 후보 종목마다 모의투자 1req/sec 제한으로 순차 KIS 조회를(최대 20종목 * 최대 2건),
+    # /portfolio/weights/propose는 후보 스크리닝 + LLM 호출을 응답 전에 끝마치므로 기본
+    # 10초보다 넉넉한 타임아웃이 필요하다.
+    _LONG_TIMEOUT_PATHS = ("/engine/start", "/engine/kill", "/discovery/seed", "/portfolio/weights/propose")
+    timeout = 60 if path in _LONG_TIMEOUT_PATHS else 10
     try:
         resp = requests.post(f"{API_BASE}{path}", json=json_body, timeout=timeout)
     except requests.exceptions.Timeout:
