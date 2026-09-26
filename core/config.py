@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # --- 성과/리스크 지표 (샤프/소티노 계산용) ---
     RISK_FREE_RATE_ANNUAL: float = 0.035  # 한국 무위험수익률 근사치 (연 기준, 필요시 조정)
 
+    # --- 시장 심리 지표 (CNN Fear & Greed Index - AI 리밸런싱 LLM의 참고 맥락으로만 사용) ---
+    FEAR_GREED_CACHE_TTL_HOURS: int = 3
+
     # --- AI 포트폴리오 에이전트 (Phase 5.2: 스케줄러 트리거) ---
     AI_REBALANCE_MIN_INTERVAL_SEC: int = 86400            # 에이전트 자체 의사결정 쿨다운 (주문 쿨다운과 별개)
     AI_REBALANCE_PERIODIC_INTERVAL_DAYS: int = 30         # 정기 재검토 주기

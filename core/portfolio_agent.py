@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import pandas as pd
 
-from core import db, discovery, indicators, kis_domestic, quant_metrics
+from core import db, discovery, indicators, kis_domestic, macro, quant_metrics
 from core.ai_rebalance_guard import validate_proposal
 from core.config import settings
 from core.kis_client import AsyncKISClient
@@ -138,12 +138,14 @@ async def propose_rebalance(
         except Exception:
             logger.exception("후보종목 스크리닝 실패 - 발굴 없이 재비중만 제안")
 
+    macro_context = await macro.get_fear_greed_context(conn)
+
     provider = get_llm_provider()
     result = await provider.propose_portfolio_changes(
         current_positions=current_positions,
         current_signals=current_signals,
         candidate_pool=candidate_pool,
-        macro_context=None,
+        macro_context=macro_context,
         max_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
     )
 
