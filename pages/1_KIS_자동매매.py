@@ -330,10 +330,11 @@ with tab_portfolio:
 
     weights = api_get("/portfolio/weights")
     if weights:
+        sorted_items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
         wdf = pd.DataFrame({
-            "symbol": list(weights.keys()),
-            "종목명": [symbol_names.get(sym, "-") for sym in weights.keys()],
-            "target_weight_pct": [w * 100 for w in weights.values()],
+            "symbol": [sym for sym, _ in sorted_items],
+            "종목명": [symbol_names.get(sym, "-") for sym, _ in sorted_items],
+            "target_weight_pct": [w * 100 for _, w in sorted_items],
         })
         wc_table, wc_chart = st.columns([1, 1])
         wc_table.dataframe(
@@ -342,8 +343,18 @@ with tab_portfolio:
             hide_index=True,
             column_config={"target_weight_pct": st.column_config.NumberColumn("목표비중", format="%.2f%%")},
         )
-        fig = go.Figure(data=[go.Bar(x=[label(sym) for sym in weights.keys()], y=wdf["target_weight_pct"])])
-        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280, yaxis_title="%")
+        # 고정 순서 8색 카테고리 팔레트 (portfolio 상한 8종목과 맞춤 - 인접쌍 CVD 검증됨)
+        pie_colors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+        fig = go.Figure(data=[go.Pie(
+            labels=[label(sym) for sym, _ in sorted_items],
+            values=wdf["target_weight_pct"],
+            hole=0.45,
+            sort=False,
+            marker=dict(colors=pie_colors[: len(sorted_items)], line=dict(color="#fcfcfb", width=2)),
+            textinfo="percent",
+            hovertemplate="%{label}<br>%{value:.2f}%<extra></extra>",
+        )])
+        fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280, showlegend=True)
         wc_chart.plotly_chart(fig, width='stretch')
     else:
         st.caption("승인된 목표 비중이 없습니다.")
