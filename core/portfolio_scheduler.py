@@ -15,13 +15,16 @@ import ast
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from core import db, kis_domestic, portfolio_agent, rebalancer
+from core import db, discovery_sources, kis_domestic, portfolio_agent, rebalancer
 from core.config import settings
 from core.kis_client import AsyncKISClient
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
 
 CHECK_INTERVAL_SEC = 3600  # 거친 폴링 주기 - 실제 트리거는 날짜/임계값 기반이라 자주 볼 필요 없음
 
@@ -59,6 +62,7 @@ class PortfolioScheduler:
     async def _tick(self) -> None:
         conn = await db.get_connection()
         try:
+            await self._maybe_refresh_discovery(conn)
             if await db.get_state(conn, "ai_rebalance_scheduler_enabled") != "1":
                 return
             if await self._cooldown_active(conn):
@@ -91,6 +95,22 @@ class PortfolioScheduler:
                 await self._mark_decision(conn)
         finally:
             await conn.close()
+
+    async def _maybe_refresh_discovery(self, conn) -> None:
+        """AI 리밸런스 토글과 무관하게 돈다 - 발굴 결과는 대시보드에서 사람이 보는 용도이기도 하다.
+        장 마감 후 하루 1회: 당일 순위/뉴스가 확정된 뒤에 모아야 의미가 있다."""
+        if not settings.DISCOVERY_DYNAMIC_ENABLED:
+            return
+        now_kst = datetime.now(tz=KST)
+        if now_kst.weekday() >= 5 or now_kst.hour < settings.DISCOVERY_REFRESH_HOUR_KST:
+            return
+        raw = await db.get_state(conn, discovery_sources.STATE_REFRESHED_AT)
+        if raw is not None and datetime.fromtimestamp(float(raw), tz=KST).date() == now_kst.date():
+            return
+        try:
+            await discovery_sources.refresh_dynamic_universe(conn, self.client)
+        except Exception:
+            logger.exception("동적 종목 발굴 갱신 실패 - 다음 tick에 재시도")
 
     async def _cooldown_active(self, conn) -> bool:
         raw = await db.get_state(conn, "ai_rebalance_last_decision_at")

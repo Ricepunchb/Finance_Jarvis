@@ -61,6 +61,21 @@ class Settings(BaseSettings):
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지
 
+    # --- 동적 종목 발굴 (전종목 마스터 + 모멘텀/증권사/뉴스/저평가/테마후발 소스) ---
+    DISCOVERY_DYNAMIC_ENABLED: bool = True
+    DISCOVERY_REFRESH_HOUR_KST: int = 16          # 장 마감 후 이 시각 이후 하루 1회 갱신
+    DISCOVERY_DYNAMIC_TTL_DAYS: int = 5           # 소스에서 다시 안 잡히면 이 기간 뒤 후보에서 만료
+    DISCOVERY_MAX_DYNAMIC: int = 60               # 동적 후보 최대 수 (모의투자 1req/sec에서 점수계산 시간 제한용)
+    DISCOVERY_MIN_MARKET_CAP_EOK: int = 1000      # 시가총액 하한(억원) - 초소형 잡주 배제
+    DISCOVERY_BROKER_LOOKBACK_DAYS: int = 14
+    DISCOVERY_VALUE_POOL_SIZE: int = 300          # 저평가 소스가 네이버 컨센서스를 조회할 시총 상위 풀 크기
+    DISCOVERY_VALUE_MIN_TARGET_GAP: float = 0.20  # 컨센서스 목표가 대비 최소 상승여력
+    DISCOVERY_SHORTLIST_TTL_HOURS: int = 24
+    # 복합점수 가중치 (tech=기술적 BUY 강도, value=밸류에이션 BUY 강도, early=하입 조기신호, broker=증권사 매수 추천)
+    DISCOVERY_WEIGHTS: dict[str, float] = {"tech": 0.30, "value": 0.30, "early": 0.25, "broker": 0.15}
+    # 관점별 최소 할당 - 한 관점이 숏리스트를 독식하지 않게 먼저 채운 뒤 나머지는 점수순
+    DISCOVERY_ANGLE_QUOTA: dict[str, int] = {"value": 3, "early": 3, "momentum": 3, "broker": 2}
+
     # --- 성과/리스크 지표 (샤프/소티노 계산용) ---
     RISK_FREE_RATE_ANNUAL: float = 0.035  # 한국 무위험수익률 근사치 (연 기준, 필요시 조정)
 

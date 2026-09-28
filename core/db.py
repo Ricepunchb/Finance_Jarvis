@@ -172,11 +172,35 @@ CREATE TABLE IF NOT EXISTS candidate_universe (
     market TEXT NOT NULL DEFAULT 'domestic',
     exchange TEXT,
     name TEXT,
-    universe_tag TEXT NOT NULL,        -- 'KOSPI_LARGE_CAP' | 'MANUAL_WATCHLIST' 등
+    universe_tag TEXT NOT NULL,        -- 'KOSPI_LARGE_CAP' | 'MANUAL_WATCHLIST' | 'DYNAMIC' 등
     validated_at REAL,
     added_at REAL NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sources_json TEXT,                 -- 동적 후보: {source: evidence} (어느 발굴 소스가 왜 잡았는지)
+    last_seen_at REAL,
+    expires_at REAL                    -- NULL이면 만료 없음 (시드/수동 후보)
 );
+
+-- KIS 종목 마스터 파일(kospi/kosdaq_code.mst)의 필요한 컬럼만. 하루 1회 전체 교체.
+CREATE TABLE IF NOT EXISTS stock_master (
+    symbol TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    market TEXT NOT NULL,              -- 'KOSPI' | 'KOSDAQ'
+    sector_code TEXT,                  -- 지수업종 대분류
+    market_cap_eok REAL,               -- 전일기준 시가총액(억원)
+    roe REAL,
+    is_excluded INTEGER NOT NULL,      -- 보통주 외/거래정지/정리매매/관리/시장경고/SPAC/ETP 중 하나라도 해당
+    refreshed_at REAL NOT NULL
+);
+
+-- KIS 테마 마스터 파일(theme_code.mst). 종목 하나가 여러 테마에 속한다.
+CREATE TABLE IF NOT EXISTS stock_theme (
+    theme_code TEXT NOT NULL,
+    theme_name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    PRIMARY KEY (theme_code, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_theme_symbol ON stock_theme(symbol);
 
 -- 종목별 편입 논거. 나중에 "왜 이 종목을 뺐는지" 판단할 근거로 재사용한다.
 CREATE TABLE IF NOT EXISTS symbol_thesis (
@@ -243,6 +267,12 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_at REAL")
     if "disabled_by_event_id" not in columns:
         await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_by_event_id INTEGER")
+
+    cur = await conn.execute("PRAGMA table_info(candidate_universe)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    for col, col_type in (("sources_json", "TEXT"), ("last_seen_at", "REAL"), ("expires_at", "REAL")):
+        if col not in columns:
+            await conn.execute(f"ALTER TABLE candidate_universe ADD COLUMN {col} {col_type}")
 
 
 # --- engine_state (singleton key-value) ---
@@ -528,20 +558,110 @@ async def add_candidate_symbol(
     conn: aiosqlite.Connection, symbol: str, name: str, universe_tag: str,
     market: str = "domestic", exchange: Optional[str] = None,
 ) -> None:
+    """시드/수동 후보. 이미 동적 후보로 들어와 있던 종목이면 만료 없는 영구 후보로 승격한다."""
     now = time.time()
     await conn.execute(
         "INSERT INTO candidate_universe(symbol, market, exchange, name, universe_tag, validated_at, "
         "added_at, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
-        "ON CONFLICT(symbol) DO UPDATE SET name=excluded.name, validated_at=excluded.validated_at, enabled=1",
+        "ON CONFLICT(symbol) DO UPDATE SET name=excluded.name, validated_at=excluded.validated_at, enabled=1, "
+        "universe_tag=CASE WHEN candidate_universe.universe_tag = 'DYNAMIC' THEN excluded.universe_tag "
+        "ELSE candidate_universe.universe_tag END, expires_at=NULL",
         (symbol, market, exchange, name, universe_tag, now, now),
     )
     await conn.commit()
+
+
+async def upsert_dynamic_candidate(
+    conn: aiosqlite.Connection, symbol: str, name: str, sources_json: str, expires_at: float,
+) -> None:
+    """동적 발굴 후보. 시드/수동 후보(expires_at IS NULL)와 겹치면 태그/만료는 건드리지 않고
+    발굴 근거(sources_json)만 갱신한다 — 영구 후보가 동적 후보로 강등되어 만료되면 안 된다."""
+    now = time.time()
+    await conn.execute(
+        "INSERT INTO candidate_universe(symbol, market, name, universe_tag, validated_at, added_at, enabled, "
+        "sources_json, last_seen_at, expires_at) VALUES (?, 'domestic', ?, 'DYNAMIC', ?, ?, 1, ?, ?, ?) "
+        "ON CONFLICT(symbol) DO UPDATE SET sources_json=excluded.sources_json, last_seen_at=excluded.last_seen_at, "
+        "enabled=CASE WHEN candidate_universe.expires_at IS NULL THEN candidate_universe.enabled ELSE 1 END, "
+        "expires_at=CASE WHEN candidate_universe.expires_at IS NULL THEN NULL ELSE excluded.expires_at END",
+        (symbol, name, now, now, sources_json, now, expires_at),
+    )
+    await conn.commit()
+
+
+async def disable_expired_candidates(conn: aiosqlite.Connection, now: float) -> int:
+    cur = await conn.execute(
+        "UPDATE candidate_universe SET enabled = 0 WHERE enabled = 1 AND expires_at IS NOT NULL AND expires_at < ?",
+        (now,),
+    )
+    await conn.commit()
+    return cur.rowcount
+
+
+async def trim_dynamic_candidates(conn: aiosqlite.Connection, keep: int) -> int:
+    """활성 동적 후보를 최근에 다시 잡힌 순으로 keep개만 남긴다 — 점수 계산 비용(종목당 KIS 여러 번)이
+    TTL 기간 동안 누적되는 후보 수에 비례해 끝없이 늘지 않게 하기 위함."""
+    cur = await conn.execute(
+        "UPDATE candidate_universe SET enabled = 0 WHERE symbol IN ("
+        "  SELECT symbol FROM candidate_universe WHERE enabled = 1 AND expires_at IS NOT NULL "
+        "  ORDER BY last_seen_at DESC LIMIT -1 OFFSET ?)",
+        (keep,),
+    )
+    await conn.commit()
+    return cur.rowcount
+
+
+async def disable_candidate_symbol(conn: aiosqlite.Connection, symbol: str) -> bool:
+    """사람이 직접 뺀 후보. expires_at을 NULL로 만들어 다음 동적 갱신이 다시 켜지 않게 한다
+    (다시 넣으려면 수동 추가)."""
+    cur = await conn.execute(
+        "UPDATE candidate_universe SET enabled = 0, expires_at = NULL WHERE symbol = ? AND enabled = 1", (symbol,)
+    )
+    await conn.commit()
+    return cur.rowcount > 0
 
 
 async def list_candidate_universe(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
     cur = await conn.execute("SELECT * FROM candidate_universe WHERE enabled = 1")
     rows = await cur.fetchall()
     return [dict(row) for row in rows]
+
+
+# --- stock_master / stock_theme (KIS 마스터 파일) ---
+
+async def replace_stock_master(
+    conn: aiosqlite.Connection, stocks: List[Dict[str, Any]], themes: List[Dict[str, str]],
+) -> None:
+    now = time.time()
+    await conn.execute("DELETE FROM stock_master")
+    await conn.executemany(
+        "INSERT OR REPLACE INTO stock_master(symbol, name, market, sector_code, market_cap_eok, roe, "
+        "is_excluded, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(s["symbol"], s["name"], s["market"], s["sector_code"], s["market_cap_eok"], s["roe"],
+          1 if s["is_excluded"] else 0, now) for s in stocks],
+    )
+    if themes:
+        await conn.execute("DELETE FROM stock_theme")
+        await conn.executemany(
+            "INSERT OR IGNORE INTO stock_theme(theme_code, theme_name, symbol) VALUES (?, ?, ?)",
+            [(t["theme_code"], t["theme_name"], t["symbol"]) for t in themes],
+        )
+    await conn.commit()
+
+
+async def get_stock_master_refreshed_at(conn: aiosqlite.Connection) -> Optional[float]:
+    cur = await conn.execute("SELECT MAX(refreshed_at) AS ts FROM stock_master")
+    row = await cur.fetchone()
+    return row["ts"] if row else None
+
+
+async def get_stock_master(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM stock_master")
+    return {row["symbol"]: dict(row) for row in await cur.fetchall()}
+
+
+async def get_theme_memberships(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    cur = await conn.execute("SELECT theme_code, theme_name, symbol FROM stock_theme")
+    return [dict(row) for row in await cur.fetchall()]
 
 
 async def upsert_symbol_thesis(

@@ -150,6 +150,87 @@ async def get_financial_ratio(client: AsyncKISClient, symbol: str, div_cls: str 
     return _ensure_ok(response).get("output", [])
 
 
+# 제외 마스크 10자리: 투자위험/경고/주의, 관리종목, 정리매매, 불성실공시, 우선주, 거래정지, ETF, ETN, 신용주문불가, SPAC
+_RANK_EXCLUDE_MASK = "1111111101"
+
+
+async def get_fluctuation_rank(
+    client: AsyncKISClient, period_days: int = 0, min_volume: int = 100_000, min_rise_pct: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """등락률 상승 순위 (KRX 전체, 최대 30행). 행의 종목코드는 stck_shrn_iscd, 등락률은 prdy_ctrt.
+    fid_input_cnt_1은 '조회 건수'가 아니라 누적일수다 (0=당일) - 모의투자에서 확인됨."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/ranking/fluctuation",
+        tr_id=tr_ids.RANKING_FLUCTUATION_TR_ID,
+        params={
+            "fid_cond_mrkt_div_code": "J",
+            "fid_cond_scr_div_code": "20170",
+            "fid_input_iscd": "0000",
+            "fid_rank_sort_cls_code": "0",
+            "fid_input_cnt_1": str(period_days),
+            "fid_prc_cls_code": "0",
+            "fid_input_price_1": "",
+            "fid_input_price_2": "",
+            "fid_vol_cnt": str(min_volume),
+            "fid_trgt_cls_code": "0",
+            "fid_trgt_exls_cls_code": _RANK_EXCLUDE_MASK,
+            "fid_div_cls_code": "0",
+            "fid_rsfl_rate1": str(min_rise_pct),
+            "fid_rsfl_rate2": "",
+        },
+    )
+    return _ensure_ok(response).get("output", [])
+
+
+async def get_volume_rank(client: AsyncKISClient, blng_cls: str = "1") -> List[Dict[str, Any]]:
+    """거래량 순위 (KRX 전체, 보통주). blng_cls: 0=평균거래량 1=거래증가율 3=거래금액순.
+    행의 종목코드는 mksc_shrn_iscd."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/volume-rank",
+        tr_id=tr_ids.RANKING_VOLUME_TR_ID,
+        params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": "0000",
+            "FID_DIV_CLS_CODE": "1",
+            "FID_BLNG_CLS_CODE": blng_cls,
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": _RANK_EXCLUDE_MASK,
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        },
+    )
+    return _ensure_ok(response).get("output", [])
+
+
+async def get_news_titles(
+    client: AsyncKISClient, date: str = "", hour: str = "", serial_no: str = "",
+) -> List[Dict[str, Any]]:
+    """시장 전체 시황/공시 뉴스 제목 (종목 미지정). date(YYYYMMDD)/hour(HHMMSS) 이전 40건을
+    최신순으로 반환한다. 행: hts_pbnt_titl_cntt(제목), iscd1~iscd5(관련 종목코드, 주로 공시에만
+    채워짐), data_dt, data_tm."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/news-title",
+        tr_id=tr_ids.NEWS_TITLE_TR_ID,
+        params={
+            "FID_NEWS_OFER_ENTP_CODE": "",
+            "FID_COND_MRKT_CLS_CODE": "",
+            "FID_INPUT_ISCD": "",
+            "FID_TITL_CNTT": "",
+            "FID_INPUT_DATE_1": date,
+            "FID_INPUT_HOUR_1": hour,
+            "FID_RANK_SORT_CLS_CODE": "",
+            "FID_INPUT_SRNO": serial_no,
+        },
+    )
+    return _ensure_ok(response).get("output", [])
+
+
 async def get_balance(client: AsyncKISClient) -> Dict[str, Any]:
     """계좌 잔고조회. {"holdings": [...], "summary": {...}} 형태로 반환한다."""
     response = await client.request(

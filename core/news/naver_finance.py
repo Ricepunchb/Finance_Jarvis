@@ -42,7 +42,9 @@ def fetch_recent_news(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
         )
         response.raise_for_status()
         data = response.json()
-        items = data[0].get("items", []) if data else []
+        # 응답은 유사 기사 묶음(group)의 리스트이고 각 group에 대표 기사 1건이 들어있다 -
+        # 첫 group만 읽으면 max_items와 무관하게 항상 1건만 남는다.
+        items = [item for group in (data or []) for item in (group.get("items") or [])]
     except Exception:
         logger.warning(f"'{symbol}' 뉴스 조회 실패 - 이번 사이클은 뉴스 없이 진행", exc_info=True)
         return []

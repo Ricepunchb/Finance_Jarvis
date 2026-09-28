@@ -69,6 +69,11 @@ INQUIRE_TIME_DAILYCHARTPRICE_TR_ID = "FHKST03010230"      # 과거 분봉, 최�
 INVEST_OPINION_TR_ID = "FHKST663300C0"
 FINANCE_FINANCIAL_RATIO_TR_ID = "FHKST66430300"
 
+# --- 국내주식 순위분석/시황 뉴스 — 조회 전용 (종목 발굴 소스) ---
+RANKING_FLUCTUATION_TR_ID = "FHPST01700000"
+RANKING_VOLUME_TR_ID = "FHPST01710000"
+NEWS_TITLE_TR_ID = "FHKST01011800"
+
 
 # =====================================================================
 # 해외주식 (Phase 3 — 현재는 미국(NASD/NYSE/AMEX)만 실증됨. 나머지 거래소는

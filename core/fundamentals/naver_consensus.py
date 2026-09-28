@@ -50,4 +50,8 @@ def fetch_consensus(symbol: str) -> Dict[str, Any]:
         "w52_high": _to_float(total_infos.get("highPriceOf52Weeks")),
         "w52_low": _to_float(total_infos.get("lowPriceOf52Weeks")),
         "last_close": _to_float(total_infos.get("lastClosePrice")),
+        "researches": [
+            {"broker": r.get("bnm"), "title": r.get("tit"), "date": r.get("wdt"), "read_count": _to_float(r.get("rcnt"))}
+            for r in (data.get("researches") or [])
+        ],
     }

@@ -62,6 +62,40 @@ class _PortfolioChangeSchema(BaseModel):
     rationale: str = Field(description="한국어 2~3문장 포트폴리오 전체 근거")
 
 
+def _format_candidate(c: Dict[str, Any]) -> str:
+    parts = []
+    if c.get("angle_label"):
+        parts.append(f"관점 {c['angle_label']} (점수 {c.get('score', 0):.2f})")
+    if c.get("theme"):
+        parts.append(f"테마 {c['theme']}")
+    if c.get("per") is not None:
+        parts.append(f"PER {c['per']:.1f}")
+    if c.get("pbr") is not None:
+        parts.append(f"PBR {c['pbr']:.2f}")
+    if c.get("target_gap_pct") is not None:
+        parts.append(f"목표가 괴리 {c['target_gap_pct']:+.0%}")
+    if c.get("news_accel") is not None:
+        parts.append(f"뉴스 가속 {c['news_accel']:.1f}배 (최근3일 {c.get('news_3d', 0)}건)")
+    if c.get("vol_ratio_5_20") is not None:
+        parts.append(f"거래량 5일/20일 {c['vol_ratio_5_20']:.1f}배")
+    if c.get("ret_5d_pct") is not None:
+        parts.append(f"5일 수익률 {c['ret_5d_pct']:+.1f}%")
+    if "period_return_pct" in c:
+        parts.append(f"90일 수익률 {c['period_return_pct']:+.1f}%")
+    if "mdd_pct" in c:
+        parts.append(f"MDD {c['mdd_pct']:.1f}%")
+    if "volatility_pct" in c:
+        parts.append(f"변동성 {c['volatility_pct']:.1f}%")
+    if "rsi" in c:
+        parts.append(f"RSI {c['rsi']:.0f}")
+    if c.get("tech"):
+        parts.append(f"기술적시그널 {c['tech'].get('direction')} {c['tech'].get('strength', 0):.2f}")
+    line = f"- {c['symbol']} ({c.get('name', '')}): " + ", ".join(parts)
+    for reason in c.get("thesis") or []:
+        line += f"\n    · {reason}"
+    return line
+
+
 class GeminiProvider(LLMProvider):
     def __init__(self):
         if not settings.GEMINI_API_KEY:
@@ -195,9 +229,13 @@ class GeminiProvider(LLMProvider):
             )
         if candidate_pool:
             lines.append("")
-            lines.append("[신규 편입 후보]")
+            lines.append(
+                "[신규 편입 후보] 관점별로 발굴됨. '하입 조기신호'는 관심 대비 주가 미반영이라는 관측일 뿐 "
+                "상승 예측이 아니고, 테마/모멘텀 후보는 변동성이 크다 — 이런 후보를 담는다면 최소 수준의 "
+                "비중으로만 담고 rationale에 반대 근거(리스크)도 함께 적어라."
+            )
             for c in candidate_pool:
-                lines.append(f"- {c['symbol']} ({c.get('name', '')}): {c}")
+                lines.append(_format_candidate(c))
         else:
             lines.append("")
             lines.append("[신규 편입 후보] 없음 - adds는 반드시 빈 배열로 응답하라.")

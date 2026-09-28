@@ -4,6 +4,9 @@
 
 실행: uvicorn api.main:app --port 8800
 """
+import asyncio
+import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -11,7 +14,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from core import db, discovery, kis_domestic, portfolio_agent, signal_engine
+from core import (
+    db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent, signal_engine,
+)
 from core.config import settings
 from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
 from core.lock import EngineAlreadyRunningError
@@ -27,6 +32,10 @@ portfolio_scheduler = PortfolioScheduler(engine.client)
 # 국내 종목 한글명 캐시. 이름은 사실상 불변이므로 프로세스 수명 동안 재조회하지 않는다
 # (엔진의 KIS 클라이언트를 그대로 재사용 — 대시보드 표시용으로 별도 토큰을 새로 발급하지 않기 위함).
 _symbol_name_cache: dict[str, str] = {}
+
+logger = logging.getLogger(__name__)
+# create_task 결과를 참조로 붙잡아 두지 않으면 실행 도중 GC될 수 있다
+_discovery_refresh_task: Optional[asyncio.Task] = None
 
 
 @asynccontextmanager
@@ -365,6 +374,66 @@ async def add_discovery_candidate(req: AddCandidateRequest):
     finally:
         await conn.close()
     return {"status": "added", "symbol": req.symbol, "name": resolved_name}
+
+
+@app.delete("/discovery/candidates/{symbol}")
+async def remove_discovery_candidate(symbol: str):
+    """후보에서 뺀다. 동적 후보라도 다음 갱신에서 다시 켜지지 않는다 (다시 넣으려면 수동 추가)."""
+    conn = await db.get_connection()
+    try:
+        removed = await db.disable_candidate_symbol(conn, symbol)
+    finally:
+        await conn.close()
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"활성 후보 중에 {symbol} 없음")
+    return {"status": "removed", "symbol": symbol}
+
+
+async def _run_discovery_refresh() -> None:
+    conn = await db.get_connection()
+    try:
+        await discovery_sources.refresh_dynamic_universe(conn, engine.client)
+    except Exception:
+        logger.exception("수동 종목 발굴 갱신 실패")
+    finally:
+        await conn.close()
+
+
+@app.post("/discovery/refresh")
+async def refresh_discovery():
+    """전종목 마스터 → 발굴 소스 → 후보 갱신 → 점수 재계산을 백그라운드로 시작한다. 모의투자에서는
+    수 분 걸리므로 응답을 기다리지 않는다 - 진행 여부는 GET /discovery/shortlist의 refreshing으로 확인.
+    (평소에는 스케줄러가 장 마감 후 하루 1회 자동으로 돈다)."""
+    global _discovery_refresh_task
+    if discovery_sources.is_refreshing():
+        raise HTTPException(status_code=409, detail="종목 발굴 갱신이 이미 진행 중")
+    _discovery_refresh_task = asyncio.create_task(_run_discovery_refresh())
+    return {"status": "started"}
+
+
+@app.get("/discovery/shortlist")
+async def get_discovery_shortlist():
+    """마지막 점수 캐시 기준 숏리스트 (현재 보유 종목 제외). KIS를 호출하지 않는다."""
+    conn = await db.get_connection()
+    try:
+        cache = await discovery.load_scored_cache(conn)
+        held = {row["symbol"] for row in await db.list_portfolio_symbols(conn)}
+        enabled = {c["symbol"] for c in await db.list_candidate_universe(conn)}
+        refreshed_at = await db.get_state(conn, discovery_sources.STATE_REFRESHED_AT)
+        summary_raw = await db.get_state(conn, discovery_sources.STATE_REFRESH_SUMMARY)
+    finally:
+        await conn.close()
+    entries = [e for e in (cache or {}).get("entries", []) if e["symbol"] in enabled]
+    return {
+        "refreshing": discovery_sources.is_refreshing(),
+        "scored_at": (cache or {}).get("scored_at"),
+        "refreshed_at": float(refreshed_at) if refreshed_at else None,
+        "refresh_summary": json.loads(summary_raw) if summary_raw else None,
+        "scored_count": len(entries),
+        "shortlist": discovery_signals.select_with_quota(
+            entries, settings.DISCOVERY_TOP_N, settings.DISCOVERY_ANGLE_QUOTA, exclude=held,
+        ),
+    }
 
 
 @app.get("/ai-rebalance/scheduler")

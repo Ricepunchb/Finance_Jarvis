@@ -87,6 +87,21 @@ def api_post(path: str, json_body: dict | None = None):
     return resp.json()
 
 
+def api_delete(path: str):
+    try:
+        resp = requests.delete(f"{API_BASE}{path}", timeout=10)
+    except requests.exceptions.RequestException as e:
+        st.error(str(e))
+        return None
+    if resp.status_code >= 400:
+        st.error(resp.json().get("detail", resp.text))
+        return None
+    return resp.json()
+
+
+SOURCE_LABELS = {"momentum": "급등/거래급증", "broker": "증권사 리포트", "news": "뉴스 언급", "value": "저평가", "theme": "테마 후발"}
+
+
 def fmt_kst(ts: float | None) -> str:
     if not ts:
         return "-"
@@ -521,15 +536,79 @@ with tab_ai:
                     "종목명": c.get("name") or "-",
                     "symbol": c["symbol"],
                     "태그": c["universe_tag"],
-                    "검증시각": fmt_kst(c.get("validated_at")),
+                    "발굴 소스": ", ".join(SOURCE_LABELS.get(s, s) for s in json.loads(c.get("sources_json") or "{}")) or "-",
+                    "만료": fmt_kst(c.get("expires_at")) if c.get("expires_at") else "없음",
                     "추가시각": fmt_kst(c.get("added_at")),
                 }
                 for c in candidates
             ]
         )
         st.dataframe(cdf, width='stretch', hide_index=True)
+        rc1, rc2 = st.columns([3, 1])
+        remove_target = rc1.selectbox(
+            "후보에서 뺄 종목 (동적 후보도 다음 갱신 때 다시 들어오지 않음)",
+            [f"{c['symbol']} {c.get('name') or ''}" for c in candidates],
+            index=None,
+            placeholder="종목 선택",
+        )
+        rc2.write("")
+        if rc2.button("후보에서 빼기", disabled=remove_target is None, width='stretch'):
+            if api_delete(f"/discovery/candidates/{remove_target.split()[0]}") is not None:
+                st.rerun()
     else:
-        st.caption("발굴 후보가 없습니다 - 위 시드 적재 버튼으로 초기 유니버스를 채워보세요.")
+        st.caption("발굴 후보가 없습니다 - 위 시드 적재 버튼이나 아래 발굴 갱신으로 채워보세요.")
+
+    st.divider()
+    st.markdown("#### 🧭 오늘의 발굴")
+    st.caption(
+        "KOSPI·KOSDAQ 전종목에서 매일 장 마감 후 자동 갱신: 급등/거래급증 순위, 증권사 리포트, 시장 뉴스 "
+        "언급, 컨센서스 목표가 괴리(저평가), 테마 동료 급등(후발주). '하입 조기신호'는 관심(뉴스·거래량·"
+        "테마)은 늘었는데 주가가 아직 덜 움직였다는 관측일 뿐, 오를 거라는 예측이 아니다."
+    )
+    discovery_view = api_get("/discovery/shortlist") or {}
+    dv1, dv2, dv3 = st.columns([1, 1, 2])
+    refreshed_at = discovery_view.get("refreshed_at")
+    dv1.metric("마지막 갱신", datetime.fromtimestamp(refreshed_at, tz=KST).strftime("%m-%d %H:%M") if refreshed_at else "-")
+    dv2.metric("점수 계산된 후보", discovery_view.get("scored_count", 0))
+    with dv3:
+        if discovery_view.get("refreshing"):
+            st.info("발굴 갱신 진행 중 (모의투자는 수 분 소요) - 잠시 후 새로고침하세요.")
+        elif st.button("🔎 지금 발굴 갱신", width='stretch'):
+            if api_post("/discovery/refresh") is not None:
+                st.info("발굴 갱신을 시작했습니다 - 수 분 뒤 새로고침하세요.")
+    refresh_summary = discovery_view.get("refresh_summary") or {}
+    if refresh_summary.get("sources"):
+        st.caption(
+            "소스별 발굴 수: "
+            + " · ".join(f"{SOURCE_LABELS.get(k, k)} {v}" for k, v in refresh_summary["sources"].items())
+            + f" → 후보 반영 {refresh_summary.get('upserted', 0)}, 만료 {refresh_summary.get('expired', 0)}"
+        )
+    for source, err in (refresh_summary.get("errors") or {}).items():
+        st.warning(f"{SOURCE_LABELS.get(source, source)} 소스 실패: {err}")
+
+    shortlist = discovery_view.get("shortlist") or []
+    if shortlist:
+        sdf = pd.DataFrame(
+            [
+                {
+                    "종목명": e.get("name"),
+                    "symbol": e["symbol"],
+                    "관점": e.get("angle_label"),
+                    "점수": round(e.get("score", 0), 3),
+                    "근거": " | ".join(e.get("thesis") or []) or "-",
+                    "소스": ", ".join(SOURCE_LABELS.get(s, s) for s in e.get("sources") or {}) or e.get("universe_tag"),
+                    "PER": e.get("per"),
+                    "목표가괴리": fmt_pct(e["target_gap_pct"]) if e.get("target_gap_pct") is not None else "-",
+                    "뉴스가속": e.get("news_accel"),
+                    "거래량5/20": e.get("vol_ratio_5_20"),
+                    "5일수익률": f"{e['ret_5d_pct']:+.1f}%" if e.get("ret_5d_pct") is not None else "-",
+                }
+                for e in shortlist
+            ]
+        )
+        st.dataframe(sdf, width='stretch', hide_index=True)
+    else:
+        st.caption("아직 점수가 계산된 발굴 결과가 없습니다 - '지금 발굴 갱신'을 눌러보세요.")
 
     st.divider()
     st.markdown("#### 📈 보유종목 성과 · 리스크 지표")
