@@ -17,18 +17,29 @@ class ExitDecision:
     reason: str  # "STOP_LOSS" | "TRAILING_TAKE_PROFIT"
 
 
-def evaluate_exit(avg_price: float, peak_price: Optional[float], current_price: float) -> Optional[ExitDecision]:
+def trailing_params(atr_pct: Optional[float]) -> tuple[float, float]:
+    """(트레일링 폭, 무장 기준 수익률). ATR%가 있으면 종목 변동성에 비례하고, 없으면 고정값 폴백."""
+    if atr_pct is None or atr_pct <= 0:
+        return settings.TRAILING_TAKE_PROFIT_PCT, settings.TRAILING_ARM_FALLBACK_PCT
+    trail = min(max(settings.TRAILING_ATR_MULT * atr_pct, settings.TRAILING_MIN_PCT), settings.TRAILING_MAX_PCT)
+    return trail, settings.TRAILING_ARM_ATR_MULT * atr_pct
+
+
+def evaluate_exit(
+    avg_price: float, peak_price: Optional[float], current_price: float, atr_pct: Optional[float] = None
+) -> Optional[ExitDecision]:
     if avg_price <= 0 or current_price <= 0:
         return None
 
     if (current_price - avg_price) / avg_price <= -settings.STOP_LOSS_PCT:
         return ExitDecision(reason="STOP_LOSS")
 
-    # peak가 avg_price보다 높았던 적(한 번이라도 이익 구간)이 있을 때만 트레일링을 "무장"한다.
-    # 안 그러면 진입 직후 단순 하락(아직 이익을 본 적 없음)도 트레일링 익절로 오발동해
-    # 손절(STOP_LOSS)과 구분이 안 된다 — 그 케이스는 위 손절 조건이 담당한다.
+    # 트레일링은 고점이 평단 대비 "충분한 이익"(무장 기준)에 도달한 적이 있을 때만 켠다.
+    # 평단을 살짝만 넘은 고점에서 폭만큼 빠지면 익절이 아니라 손실 매도가 되므로(라벨과 실제가
+    # 어긋남), 그 구간은 손절(STOP_LOSS)이 담당한다. 폭/무장 기준은 ATR로 종목별 산출한다.
+    trail_pct, arm_pct = trailing_params(atr_pct)
     peak = max(peak_price or avg_price, avg_price)
-    if peak > avg_price and (current_price - peak) / peak <= -settings.TRAILING_TAKE_PROFIT_PCT:
+    if (peak - avg_price) / avg_price >= arm_pct and (current_price - peak) / peak <= -trail_pct:
         return ExitDecision(reason="TRAILING_TAKE_PROFIT")
 
     return None

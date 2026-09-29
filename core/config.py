@@ -23,7 +23,18 @@ class Settings(BaseSettings):
 
     # --- 손절/트레일링익절 ---
     STOP_LOSS_PCT: float = 0.07             # 평단가 대비 -7% 시 전량 강제매도 (쿨다운/일일손실한도 우회)
-    TRAILING_TAKE_PROFIT_PCT: float = 0.05  # 진입 후 고점 대비 -5% 하락 시 전량매도
+    TRAILING_TAKE_PROFIT_PCT: float = 0.05  # 진입 후 고점 대비 -5% 하락 시 전량매도 (ATR 산출 불가 시 폴백)
+    # ATR 기반 트레일링: 종목 변동성에 맞춰 폭/무장 조건을 정한다 (ATR% = ATR(일봉) / 현재가)
+    ATR_LENGTH: int = 14
+    TRAILING_ATR_MULT: float = 2.5               # 트레일링 폭 = 이 배수 x ATR%
+    TRAILING_MIN_PCT: float = 0.03               # 폭 하한 (저변동 종목이 노이즈에 털리지 않게)
+    TRAILING_MAX_PCT: float = 0.12               # 폭 상한 (고변동 종목이 너무 늦게 청산되지 않게)
+    TRAILING_ARM_ATR_MULT: float = 1.5           # 고점이 평단 대비 이 배수 x ATR% 이상 올랐을 때만 트레일링 무장
+    TRAILING_ARM_FALLBACK_PCT: float = 0.03      # ATR 산출 불가 시 무장 기준 (평단 대비 +3%)
+
+    # --- 분할 온보딩 매수 (신규 편입/저비중 종목을 시그널 문턱 없이 며칠에 걸쳐 목표비중까지 채움) ---
+    ONBOARDING_ENABLED: bool = True
+    ONBOARDING_DAYS: int = 5                     # 목표금액을 이 일수로 나눈 만큼을 하루 매수 예산으로 사용
 
     # --- 스윙 시그널 (밴드는 보조 리스크 상한으로 전환) ---
     INTRADAY_BAR_MINUTES: int = 30                  # CYCLE_INTERVAL_SEC(엔진 사이클)와 반드시 일치
@@ -56,7 +67,7 @@ class Settings(BaseSettings):
     AI_REBALANCE_MAX_SYMBOLS_ADDED: int = 2
     AI_REBALANCE_MAX_SYMBOLS_REMOVED: int = 2
     AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT: float = 0.03
-    AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS: int = 8
+    AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS: int = 20
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지

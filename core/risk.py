@@ -88,6 +88,19 @@ class RiskManager:
             return False
         return (time.time() - row["created_at"]) < settings.ORDER_COOLDOWN_SEC
 
+    # --- 분할 온보딩 매수 일일 예산 ---
+
+    async def onboarding_notional_today(self, symbol: str) -> float:
+        """오늘(KST) 이 종목에 이미 낸(실패/취소 제외) 온보딩 매수의 명목금액 합."""
+        midnight = datetime.now(tz=KST).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        cur = await self.conn.execute(
+            "SELECT COALESCE(SUM(qty * COALESCE(price, 0)), 0) AS v FROM order_intents "
+            "WHERE symbol = ? AND side = 'buy' AND reason = 'onboarding_tranche' AND created_at >= ? "
+            "AND status NOT IN ('REJECTED', 'CANCELLED', 'NOT_SUBMITTED')",
+            (symbol, midnight),
+        )
+        return float((await cur.fetchone())["v"])
+
     # --- 일일 손실 한도 ---
 
     def _today_key(self) -> str:

@@ -10,7 +10,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
 
@@ -724,6 +724,25 @@ async def upsert_position(
     await conn.commit()
 
 
+async def sync_positions_from_balance(
+    conn: aiosqlite.Connection, held: Dict[str, Tuple[float, float, str]], overseas: bool
+) -> None:
+    """브로커 잔고(ground truth)로 positions를 동기화한다. held: symbol -> (qty, avg_price, currency).
+
+    전량 매도한 종목은 잔고 응답에서 아예 사라지므로, "응답에 있는 종목만 upsert"하면 청산이
+    영영 반영되지 않는다(qty/진입가/고점이 남아 재진입 시 옛 고점이 이월됨). 그래서 같은 시장
+    (국내=KRW, 해외=그 외 통화)의 기존 qty>0 행 중 응답에 없는 종목은 qty=0으로 내려
+    upsert_position의 "완전청산 -> 진입 상태 초기화" 분기를 태운다.
+    이것은 "보유 사실"만 다룬다 — 관심/제외 여부(active_target_weights)와는 무관하다."""
+    for symbol, (qty, avg_price, currency) in held.items():
+        await upsert_position(conn, symbol, qty, avg_price, currency=currency)
+    cur = await conn.execute("SELECT symbol, currency FROM positions WHERE qty > 0")
+    for row in await cur.fetchall():
+        if row["symbol"] in held or (row["currency"] != "KRW") != overseas:
+            continue
+        await upsert_position(conn, row["symbol"], 0.0, 0.0, currency=row["currency"])
+
+
 async def update_position_peak(conn: aiosqlite.Connection, symbol: str, current_price: float) -> None:
     """실시간가는 잔고 동기화 시점이 아니라 종목별 가격조회 시점에만 있으므로 별도 호출."""
     await conn.execute(
@@ -792,6 +811,22 @@ async def create_order_intent(
     return intent_id
 
 
+async def record_rest_fill(conn: aiosqlite.Connection, intent_id: str, total_qty: float, price: float) -> None:
+    """REST 체결내역 기준 누적 체결수량/평균가를 fills에 반영한다. 웹소켓이 놓친 체결을 채우기 위한 것.
+    이미 기록된 수량(WS 포함)을 넘는 증분만 넣어 중복 기록을 피한다."""
+    if total_qty <= 0 or price <= 0:
+        return
+    cur = await conn.execute("SELECT COALESCE(SUM(qty), 0) AS q FROM fills WHERE intent_id = ?", (intent_id,))
+    recorded = float((await cur.fetchone())["q"])
+    if total_qty <= recorded:
+        return
+    await conn.execute(
+        "INSERT INTO fills(intent_id, qty, price, filled_at, source) VALUES (?, ?, ?, ?, 'REST_POLL')",
+        (intent_id, total_qty - recorded, price, time.time()),
+    )
+    await conn.commit()
+
+
 async def update_order_intent(
     conn: aiosqlite.Connection,
     intent_id: str,
@@ -806,10 +841,12 @@ async def update_order_intent(
     await conn.commit()
 
 
-async def get_unresolved_intents(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
-    """재기동 시 reconciliation 대상: 아직 최종 상태가 아닌 intent들."""
+async def get_unresolved_intents(conn: aiosqlite.Connection, min_age_sec: float = 0.0) -> List[Dict[str, Any]]:
+    """reconciliation 대상: 아직 최종 상태가 아닌 intent들. min_age_sec>0이면 방금 낸 주문
+    (브로커 체결내역에 아직 안 잡혔을 수 있음)은 제외한다 — 사이클 중 주기 대조용."""
     cur = await conn.execute(
-        "SELECT * FROM order_intents WHERE status IN ('PENDING', 'SUBMITTED')"
+        "SELECT * FROM order_intents WHERE status IN ('PENDING', 'SUBMITTED') AND created_at <= ?",
+        (time.time() - min_age_sec,),
     )
     rows = await cur.fetchall()
     return [dict(row) for row in rows]

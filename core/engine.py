@@ -253,15 +253,23 @@ class TradingEngine:
         symbol_info = await db.get_portfolio_symbol_info(self.conn)
         cycle_id = await db.new_cycle(self.conn)
         ws_ok = await self.risk.is_ws_healthy()
+        try:
+            # 웹소켓이 체결통보를 놓쳐도 intent 상태/체결가가 복구되도록 매 사이클 대조한다.
+            await reconciliation.reconcile_unresolved_intents(self.client, self.conn, min_age_sec=60)
+        except Exception:
+            logger.exception("주기 체결 대조 실패 - 다음 사이클에 재시도")
         self._intraday_backfill_budget = intraday.BackfillBudget(settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE)
 
         balance = await kis_domestic.get_balance(self.client)
         holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
         total_equity = float(balance["summary"].get("nass_amt") or 0)
-        for symbol, holding in holdings_by_symbol.items():
-            await db.upsert_position(
-                self.conn, symbol, float(holding.get("hldg_qty") or 0), float(holding.get("pchs_avg_pric") or 0)
-            )
+        # 잔고에서 사라진(전량 청산) 종목도 qty=0으로 내려야 진입가/고점이 초기화된다.
+        await db.sync_positions_from_balance(
+            self.conn,
+            {s: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
+             for s, h in holdings_by_symbol.items()},
+            overseas=False,
+        )
 
         # 관리 중인 종목 중 해외가 하나라도 있을 때만 해외 잔고를 조회한다 (국내전용 사용자는
         # Phase 1/2 때와 동일하게 이 호출이 아예 발생하지 않는다).
@@ -271,11 +279,12 @@ class TradingEngine:
                 present = await kis_overseas.get_present_balance_krw(self.client)
                 overseas_holdings_by_symbol = {h["pdno"]: h for h in present["holdings"] if h.get("pdno")}
                 total_equity += float((present["totals"] or {}).get("tot_asst_amt") or 0)
-                for symbol, holding in overseas_holdings_by_symbol.items():
-                    await db.upsert_position(
-                        self.conn, symbol, float(holding.get("cblc_qty13") or 0),
-                        float(holding.get("avg_unpr3") or 0), currency=holding.get("crcy_cd") or "USD",
-                    )
+                await db.sync_positions_from_balance(
+                    self.conn,
+                    {s: (float(h.get("cblc_qty13") or 0), float(h.get("avg_unpr3") or 0), h.get("crcy_cd") or "USD")
+                     for s, h in overseas_holdings_by_symbol.items()},
+                    overseas=True,
+                )
             except Exception:
                 logger.exception("해외 잔고조회 실패 - 이번 사이클은 해외 종목 처리를 건너뜀")
 
@@ -288,6 +297,11 @@ class TradingEngine:
 
             if not _is_market_open(market, exchange):
                 continue  # 이 종목이 속한 시장이 지금 닫혀있음 - 매 사이클 로그가 쌓이지 않게 조용히 스킵
+
+            if active_weights[symbol] <= 0:
+                held = holdings_by_symbol.get(symbol) if market != "overseas" else overseas_holdings_by_symbol.get(symbol)
+                if not held or float(held.get("hldg_qty") or held.get("cblc_qty13") or 0) <= 0:
+                    continue  # 제외 종목이고 잔여 보유도 없음 — 청산 완료, 매매 루프에서 빠진다(발굴/후보 쪽에서만 관찰)
 
             try:
                 if market == "overseas":
@@ -355,6 +369,11 @@ class TradingEngine:
             "N/A", "N/A", "SELL", qty, exit_reason, intent_id, context=context,
         )
 
+    async def _load_daily_df(self, symbol: str, today: datetime):
+        start_date = (today - timedelta(days=CHART_LOOKBACK_DAYS)).strftime("%Y%m%d")
+        chart_rows = await kis_domestic.get_daily_chart(self.client, symbol, start_date, today.strftime("%Y%m%d"))
+        return indicators.chart_rows_to_dataframe(chart_rows)
+
     async def _process_symbol(
         self, cycle_id: int, symbol: str, target_weight: float, holding: Optional[dict],
         total_equity: float, ws_ok: bool,
@@ -366,7 +385,11 @@ class TradingEngine:
         # 멈췄든 log_decision에 그대로 넘긴다 (지금 안 남기면 그 사이클의 판단 근거는 영구 소실됨).
         context: dict = {"target_weight": target_weight, "total_equity": total_equity}
 
-        if not ws_ok:
+        # 웹소켓 비정상은 "신규 재량주문"만 막는다. 보유 종목의 손절/트레일링 평가까지 멈추면 오히려
+        # 손실이 커질 수 있으므로 보유분은 아래에서 강제청산 평가를 먼저 하고, 그 뒤에 게이트한다
+        # (체결/상태는 사이클 시작의 REST 대조가 복구한다). 미보유 종목은 API 호출 없이 바로 차단.
+        held_qty = float(holding.get("hldg_qty") or 0) if holding else 0.0
+        if not ws_ok and held_qty <= 0:
             await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
             return False
 
@@ -391,14 +414,22 @@ class TradingEngine:
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그리고 그것들과 무관하게 평가한다.
         # 이 두 게이트는 "새로운 재량매매"를 막기 위한 것이지 손실을 줄이는 강제청산을 막기
         # 위한 게 아니다 — 킬스위치와 같은 급의 예외로 취급한다.
+        today = datetime.now(tz=KST)
+        df = None
         if qty > 0:
             avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
             await db.update_position_peak(self.conn, symbol, price)
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
-            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price)
+            atr_pct = None
+            try:  # 일봉은 아래 시그널 계산에서도 쓰므로 재사용한다. 실패해도 손절/익절 평가는 폴백값으로 계속.
+                df = await self._load_daily_df(symbol, today)
+                atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
+            except Exception:
+                logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
+            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price, atr_pct)
             context["exit_check"] = {
-                "avg_price": avg_price, "peak_price": peak_price,
+                "avg_price": avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
                 "fired": exit_decision.reason if exit_decision else None,
             }
             if exit_decision is not None:
@@ -408,6 +439,10 @@ class TradingEngine:
                 )
                 return False
 
+        if not ws_ok:
+            await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
+            return False
+
         if await self.risk.is_cooldown_active(symbol):
             await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
             return False
@@ -415,11 +450,8 @@ class TradingEngine:
             await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
             return False
 
-        today = datetime.now(tz=KST)
-        start_date = (today - timedelta(days=CHART_LOOKBACK_DAYS)).strftime("%Y%m%d")
-        end_date = today.strftime("%Y%m%d")
-        chart_rows = await kis_domestic.get_daily_chart(self.client, symbol, start_date, end_date)
-        df = indicators.chart_rows_to_dataframe(chart_rows)
+        if df is None:
+            df = await self._load_daily_df(symbol, today)
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
@@ -448,6 +480,7 @@ class TradingEngine:
         context["valuation_signal"] = valuation_signal
 
         action = await signal_engine.decide(
+            symbol=symbol,
             current_weight=current_weight,
             target_weight=target_weight,
             band=settings.REBALANCE_BAND_PCT,
@@ -579,7 +612,9 @@ class TradingEngine:
 
         context: dict = {"target_weight": target_weight, "total_equity": total_equity, "exchange": exchange}
 
-        if not ws_ok:
+        # 국내와 동일: 웹소켓 비정상은 신규 재량주문만 막고, 보유분 손절/트레일링 평가는 계속한다.
+        held_qty = float(holding.get("cblc_qty13") or 0) if holding else 0.0
+        if not ws_ok and held_qty <= 0:
             await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
             return
 
@@ -614,15 +649,23 @@ class TradingEngine:
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그것들과 무관하게 평가한다.
         # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
         # 체결확률을 확보한다. 가격/평단가는 원화(KRW) 기준으로 일관되게 비교한다.
+        df = None
         if qty > 0:
             avg_price_foreign = float(holding.get("avg_unpr3") or 0) if holding else 0.0
             avg_price_krw = avg_price_foreign * bass_exrt
             await db.update_position_peak(self.conn, symbol, price_krw)
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
-            exit_decision = exit_guard.evaluate_exit(avg_price_krw, peak_price, price_krw)
+            atr_pct = None
+            try:  # 일봉은 아래 시그널 계산에서도 재사용. 실패해도 폴백값으로 청산 평가는 계속한다.
+                chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
+                df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+                atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
+            except Exception:
+                logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
+            exit_decision = exit_guard.evaluate_exit(avg_price_krw, peak_price, price_krw, atr_pct)
             context["exit_check"] = {
-                "avg_price_krw": avg_price_krw, "peak_price_krw": peak_price,
+                "avg_price_krw": avg_price_krw, "peak_price_krw": peak_price, "atr_pct": atr_pct,
                 "fired": exit_decision.reason if exit_decision else None,
             }
             if exit_decision is not None:
@@ -632,6 +675,10 @@ class TradingEngine:
                 )
                 return
 
+        if not ws_ok:
+            await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
+            return
+
         if await self.risk.is_cooldown_active(symbol):
             await self._log_no_op(cycle_id, symbol, target_weight, "쿨다운 중", context)
             return
@@ -639,8 +686,9 @@ class TradingEngine:
             await self._log_no_op(cycle_id, symbol, target_weight, "일일 손실 한도 도달", context)
             return
 
-        chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
-        df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+        if df is None:
+            chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
+            df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
         tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
@@ -661,6 +709,7 @@ class TradingEngine:
         context["valuation_signal"] = None
 
         action = await signal_engine.decide(
+            symbol=symbol,
             current_weight=current_weight,
             target_weight=target_weight,
             band=settings.REBALANCE_BAND_PCT,

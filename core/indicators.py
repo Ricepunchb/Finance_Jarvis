@@ -3,7 +3,7 @@
 (단, CCI는 예외 - pandas_ta 3.0.6의 cci() 자체에 버그가 있어 직접 계산한다. 아래
 _compute_cci 참고)."""
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import pandas_ta as ta
@@ -190,3 +190,18 @@ def compute_technical_detail(df: pd.DataFrame) -> Dict[str, Any]:
         pass
 
     return detail
+
+
+def compute_atr_pct(df: pd.DataFrame, length: int) -> Optional[float]:
+    """ATR(단순 이동평균 True Range) / 최근 종가. 봉이 부족하거나 값이 비정상이면 None."""
+    if df is None or df.empty or len(df) < length + 1:
+        return None
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1
+    ).max(axis=1)
+    atr = true_range.rolling(length).mean().iloc[-1]
+    last_close = df["close"].iloc[-1]
+    if pd.isna(atr) or pd.isna(last_close) or last_close <= 0 or atr <= 0:
+        return None
+    return float(atr / last_close)

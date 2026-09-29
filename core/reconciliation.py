@@ -30,8 +30,8 @@ _SIDE_TO_SLL_BUY_CD = {"sell": "01", "buy": "02"}
 # 국내/해외 체결내역 조회 응답의 필드명이 달라서(ord_qty vs ft_ord_qty 등)
 # market별로 어떤 필드를 볼지만 표로 관리하고, 매칭/상태판정 로직 자체는 공유한다.
 _MARKET_FIELDS = {
-    "domestic": {"qty": "ord_qty", "price": "ord_unpr", "ccld_qty": "tot_ccld_qty"},
-    "overseas": {"qty": "ft_ord_qty", "price": "ft_ord_unpr3", "ccld_qty": "ft_ccld_qty"},
+    "domestic": {"qty": "ord_qty", "price": "ord_unpr", "ccld_qty": "tot_ccld_qty", "ccld_price": "avg_prvs"},
+    "overseas": {"qty": "ft_ord_qty", "price": "ft_ord_unpr3", "ccld_qty": "ft_ccld_qty", "ccld_price": "ft_ccld_unpr3"},
 }
 
 
@@ -104,43 +104,49 @@ async def _find_candidates(
 
 
 async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
-    """KIS 잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다 (국내+해외)."""
+    """KIS 잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다 (국내+해외).
+    잔고에서 사라진(전량 청산된) 종목은 qty=0으로 내려 진입 상태를 초기화한다."""
     balance = await kis_domestic.get_balance(client)
-    for holding in balance["holdings"]:
-        symbol = holding.get("pdno")
-        qty = float(holding.get("hldg_qty") or 0)
-        avg_price = float(holding.get("pchs_avg_pric") or 0)
-        if symbol:
-            await db.upsert_position(conn, symbol, qty, avg_price)
+    held = {
+        h["pdno"]: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
+        for h in balance["holdings"] if h.get("pdno")
+    }
+    await db.sync_positions_from_balance(conn, held, overseas=False)
 
     try:
         present = await kis_overseas.get_present_balance_krw(client)
     except Exception:
         # 해외 잔고 조회가 실패해도(예: 보유 종목이 없어 계좌 자체가 해외 서비스 미이용) 국내
         # positions 재동기화는 이미 끝났으니 여기서 조용히 넘어간다 - 다음 재기동 때 다시 시도.
+        # (조회 실패를 "보유 없음"으로 오인해 해외 포지션을 0으로 내리지 않도록 동기화도 건너뛴다.)
         return
-    for holding in present["holdings"]:
-        symbol = holding.get("pdno")
-        qty = float(holding.get("cblc_qty13") or 0)
-        avg_price = float(holding.get("avg_unpr3") or 0)
-        currency = holding.get("crcy_cd") or "USD"
-        if symbol:
-            await db.upsert_position(conn, symbol, qty, avg_price, currency=currency)
+    held_overseas = {
+        h["pdno"]: (float(h.get("cblc_qty13") or 0), float(h.get("avg_unpr3") or 0), h.get("crcy_cd") or "USD")
+        for h in present["holdings"] if h.get("pdno")
+    }
+    await db.sync_positions_from_balance(conn, held_overseas, overseas=True)
 
 
-async def reconcile_unresolved_intents(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
-    """재기동 시 PENDING/SUBMITTED 상태로 남아있는 모든 intent를 KIS 실제 기록과 대조한다.
+async def reconcile_unresolved_intents(
+    client: AsyncKISClient, conn: aiosqlite.Connection, min_age_sec: float = 0.0
+) -> None:
+    """PENDING/SUBMITTED 상태로 남아있는 intent를 KIS 실제 기록과 대조하고, 체결분은 fills에 기록한다.
 
-    이 함수가 끝나기 전까지는 엔진이 신규 주문을 절대 내지 않아야 한다.
+    재기동 시(min_age_sec=0)에는 이 함수가 끝나기 전까지 엔진이 신규 주문을 절대 내지 않아야 한다.
+    사이클 중에도 주기적으로 호출한다(min_age_sec>0) — 웹소켓이 체결통보를 놓쳐도 다음 사이클에
+    상태/체결가가 복구되도록. 조회 시작일은 가장 오래된 미해결 intent의 생성일이라, 날짜를 넘겨
+    남은 주문도 대조된다.
     """
-    unresolved = await db.get_unresolved_intents(conn)
+    unresolved = await db.get_unresolved_intents(conn, min_age_sec=min_age_sec)
     if not unresolved:
         return
 
+    oldest = min(i["created_at"] for i in unresolved)
+    start = datetime.fromtimestamp(oldest, tz=KST).strftime("%Y%m%d")
     today = datetime.now(tz=KST).strftime("%Y%m%d")
-    domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=today, end_date=today)
+    domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=start, end_date=today)
     try:
-        overseas_rows = await kis_overseas.get_ccnl(client, start_date=today, end_date=today)
+        overseas_rows = await kis_overseas.get_ccnl(client, start_date=start, end_date=today)
     except Exception:
         logger.warning("해외 체결내역 조회 실패 - 국내 intent만 대조하고 해외는 다음 재기동에 재시도")
         overseas_rows = []
@@ -157,6 +163,14 @@ async def reconcile_unresolved_intents(client: AsyncKISClient, conn: aiosqlite.C
             await db.update_order_intent(
                 conn, intent["intent_id"], status=status, kis_order_no=row.get("odno")
             )
+            fields = _MARKET_FIELDS[intent.get("market", "domestic")]
+            try:
+                await db.record_rest_fill(
+                    conn, intent["intent_id"],
+                    float(row.get(fields["ccld_qty"]) or 0), float(row.get(fields["ccld_price"]) or 0),
+                )
+            except ValueError:
+                logger.warning(f"체결내역 수치 파싱 실패 - fills 기록 생략 (intent={intent['intent_id']})")
         else:
             # 후보가 여러 개면 추측하지 않는다 — 사람이 확인할 때까지 이 종목은 매매 금지 대상.
             await db.update_order_intent(conn, intent["intent_id"], status="UNKNOWN")

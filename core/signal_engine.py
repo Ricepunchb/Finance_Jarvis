@@ -13,6 +13,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from core.config import settings
 from core.rebalancer import compute_drift
 from core.risk import RiskManager
 
@@ -62,8 +63,43 @@ def combine_signals(
     return {"direction": direction, "strength": min(1.0, abs(combined_score))}
 
 
+async def _onboarding_action(
+    *, symbol: Optional[str], combined: Signal, drift, target_weight: float, price: float,
+    current_position_value: float, total_equity: float, risk: RiskManager,
+) -> Optional[Action]:
+    """분할 온보딩 매수. 스윙 시그널 문턱(0.5)은 "언제 비중을 키우느냐"를 정하는 용도라, 신규
+    편입/저비중 종목이 목표비중까지 가는 경로가 없었다. 퀀트의 통상 방식대로 목표비중과의 갭을
+    (목표금액 / ONBOARDING_DAYS)의 일일 예산만큼 여러 사이클에 나눠 메운다(TWAP 성격).
+    시그널은 진입 여부가 아니라 "명백한 하락 신호일 때만 보류"하는 최소 필터로만 쓴다."""
+    if not settings.ONBOARDING_ENABLED or symbol is None or target_weight <= 0:
+        return None
+    if drift.required_direction != "BUY":  # 밴드 안이면 이미 충분히 채워진 것
+        return None
+    if combined["direction"] == "SELL":
+        return None
+
+    gap_value = (target_weight - drift.current_weight) * total_equity
+    daily_budget = target_weight * total_equity / max(1, settings.ONBOARDING_DAYS)
+    remaining_today = daily_budget - await risk.onboarding_notional_today(symbol)
+    trade_value = min(gap_value, remaining_today)
+    if trade_value <= 0:
+        return None
+
+    qty = risk.clamp_qty_to_notional(trade_value / price, price)
+    qty = risk.clamp_buy_qty_to_position_cap(qty, price, current_position_value, total_equity)
+    qty = float(int(qty))
+    # 1주가 1회 주문 한도보다 비싼 종목도 편입은 가능해야 한다 — 한도의 2배까지는 1주를 허용.
+    if qty <= 0 and price <= 2 * settings.MAX_ORDER_NOTIONAL_KRW and trade_value >= price:
+        if risk.clamp_buy_qty_to_position_cap(1.0, price, current_position_value, total_equity) >= 1.0:
+            qty = 1.0
+    if qty <= 0:
+        return None
+    return Action(side="buy", qty=qty, order_type="limit", price=price, reason="onboarding_tranche")
+
+
 async def decide(
     *,
+    symbol: Optional[str] = None,
     current_weight: float,
     target_weight: float,
     band: float,
@@ -80,6 +116,19 @@ async def decide(
     if price <= 0 or total_equity <= 0:
         return None
 
+    if target_weight <= 0:
+        # "제외 종목" — 관심(모니터링) 대상이 아니라 포트폴리오에서 뺀 종목이다. 신규 매수는
+        # 시그널이 아무리 강해도 하지 않고, 잔여 보유분은 밴드 경계가 아니라 전량 청산한다
+        # (밴드 상한 로직은 목표 0이어도 band+buffer만큼을 남겨두므로 청산이 끝나지 않는다).
+        # 1회 주문 한도(clamp)로 여러 사이클에 나눠 팔릴 수 있다. 보유가 없으면 할 일 없음.
+        if current_position_qty <= 0:
+            return None
+        side = "sell"
+        # 주문 한도보다 비싼 종목(1주 > 한도)도 청산은 되어야 하므로 최소 1주는 허용한다.
+        qty = risk.clamp_qty_to_notional(current_position_qty, price)
+        qty = float(max(1, int(min(qty, current_position_qty))))
+        return Action(side=side, qty=qty, order_type="limit", price=price, reason="excluded_liquidation")
+
     combined = combine_signals(tech_signal, intraday_signal, sentiment_signal, valuation_signal)
     drift = compute_drift(current_weight, target_weight, band)
     ceiling_weight = target_weight + band + BAND_CEILING_BUFFER_PCT
@@ -92,7 +141,10 @@ async def decide(
         reason = "band_ceiling_forced_trim"
     else:
         if combined["direction"] == "HOLD" or combined["strength"] < SWING_SIGNAL_THRESHOLD:
-            return None
+            return await _onboarding_action(
+                symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
+                current_position_value=current_position_value, total_equity=total_equity, risk=risk,
+            )
         side = combined["direction"].lower()
         trade_value = combined["strength"] * SWING_TRADE_MAX_EQUITY_FRACTION * total_equity
         if side == "buy":
