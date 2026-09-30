@@ -32,12 +32,12 @@ from core.websocket_client import KISWebSocketClient
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
+NY = ZoneInfo("America/New_York")
 CYCLE_INTERVAL_SEC = 1800  # 종목당 모니터링/매매 윈도우: 30분
 CHART_LOOKBACK_DAYS = 90
 
-# 미국 거래소(NASD/NYSE/AMEX) 정규장. 정확한 DST 전환일은 아직 반영하지 않고
-# 월(3~11월 서머타임/12~2월 표준시)로만 근사한다 — 국내 KRX 휴장일 캘린더와
-# 마찬가지로 Phase 3에서도 의도적으로 미룬 부분.
+# 미국 거래소(NASD/NYSE/AMEX) 정규장. America/New_York 시간대로 판정하므로 서머타임 전환은
+# 자동 반영된다. 휴장일 캘린더는 아직 없음.
 _US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
 
 
@@ -51,17 +51,13 @@ def _is_krx_open_now() -> bool:
 
 
 def _is_us_market_open_now() -> bool:
-    now = datetime.now(tz=KST)
-    is_dst = 3 <= now.month <= 11
-    open_hour, close_hour = (22, 5) if is_dst else (23, 6)
-    # 야간장이라 날짜를 걸치므로(예: 23:30~06:00) 요일 판정은 개장 시각 기준으로 한다.
-    if now.hour >= open_hour:
-        weekday = now.weekday()  # 이날 밤에 열리는 장 (금요일 밤은 열림, 토요일 밤은 안 열림)
-        return weekday <= 4
-    if now.hour < close_hour:
-        weekday = (now.weekday() - 1) % 7  # 전날 밤 장이 아직 진행 중인 새벽 시간
-        return weekday <= 4
-    return False
+    # 뉴욕 현지 기준 09:30~16:00 평일. 서머타임이면 22:30~05:00 KST, 아니면 23:30~06:00 KST.
+    now = datetime.now(tz=NY)
+    if now.weekday() >= 5:
+        return False
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= now <= close_t
 
 
 def _is_market_open(market: str, exchange: Optional[str]) -> bool:
