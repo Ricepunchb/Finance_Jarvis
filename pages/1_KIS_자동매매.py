@@ -516,28 +516,37 @@ with tab_ai:
             st.caption("이력이 없습니다.")
 
     st.divider()
-    st.markdown("#### ⏱️ 자동 트리거 스케줄러")
+    st.markdown("#### ⏱️ 자동 트리거 스케줄러 & 자율 반영 (Auto-Apply)")
     st.caption(
-        "꺼져 있어도(기본값) 위의 수동 제안 버튼은 그대로 동작한다 — 이 토글은 정기/드리프트/"
-        "뉴스이벤트를 감지해 '자동으로' 제안을 생성할지만 결정하며, 최종 승인은 항상 사람 몫이다."
+        "스케줄러는 정기(30일)/드리프트(±10%)/뉴스이벤트를 감지해 자동으로 리밸런싱을 제안합니다. "
+        "**Auto-Apply**가 켜져 있으면 안전 가드레일을 통과한 제안을 사람 승인 대기 없이 즉시 포트폴리오에 자동 반영(자율 매매)합니다."
     )
     scheduler_status = api_get("/ai-rebalance/scheduler")
     if scheduler_status is not None:
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("스케줄러", "🟢 켜짐" if scheduler_status["enabled"] else "⚪ 꺼짐")
-        sc2.metric("마지막 자동 결정", fmt_kst(scheduler_status["last_decision_at"]))
-        sc3.metric("마지막 정기실행", fmt_kst(scheduler_status["last_scheduled_run_at"]))
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("스케줄러 트리거", "🟢 켜짐" if scheduler_status.get("enabled") else "⚪ 꺼짐")
+        is_auto = scheduler_status.get("auto_apply", False)
+        sc2.metric("자율 반영 (Auto-Apply)", "⚡ 자동 반영 (무승인)" if is_auto else "🔒 수동 승인 대기")
+        sc3.metric("마지막 자동 결정", fmt_kst(scheduler_status["last_decision_at"]))
+        sc4.metric("마지막 정기실행", fmt_kst(scheduler_status["last_scheduled_run_at"]))
         st.caption(
             f"정기 재검토 주기: {scheduler_status['periodic_interval_days']}일 · "
             f"에이전트 자체 결정 쿨다운: {scheduler_status['min_interval_sec'] // 3600}시간"
         )
-        sb1, sb2 = st.columns(2)
-        if sb1.button("🟢 켜기", disabled=scheduler_status["enabled"], width='stretch'):
+        sb1, sb2, sb3, sb4 = st.columns(4)
+        if sb1.button("🟢 스케줄러 켜기", disabled=scheduler_status["enabled"], use_container_width=True):
             api_post("/ai-rebalance/scheduler", {"enabled": True})
             st.rerun()
-        if sb2.button("⚪ 끄기", disabled=not scheduler_status["enabled"], width='stretch'):
+        if sb2.button("⚪ 스케줄러 끄기", disabled=not scheduler_status["enabled"], use_container_width=True):
             api_post("/ai-rebalance/scheduler", {"enabled": False})
             st.rerun()
+        if sb3.button("⚡ Auto-Apply 켜기", disabled=is_auto, use_container_width=True):
+            api_post("/ai-rebalance/scheduler", {"auto_apply": True})
+            st.rerun()
+        if sb4.button("🔒 Auto-Apply 끄기", disabled=not is_auto, use_container_width=True):
+            api_post("/ai-rebalance/scheduler", {"auto_apply": False})
+            st.rerun()
+
 
     st.divider()
     st.markdown("#### 🔭 종목 발굴 후보 (candidate_universe)")

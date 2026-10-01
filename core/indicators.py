@@ -8,15 +8,15 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import pandas_ta as ta
 
-MIN_BARS_REQUIRED = 30
+MIN_BARS_REQUIRED = 35
 CCI_COLUMN = "CCI_20"
 
 
-def _first_matching_column(df: pd.DataFrame, prefix: str) -> str:
+def _first_matching_column(df: pd.DataFrame, prefix: str) -> Optional[str]:
     for col in df.columns:
         if col.startswith(prefix):
             return col
-    raise KeyError(f"'{prefix}'로 시작하는 컬럼을 찾을 수 없습니다: {list(df.columns)}")
+    return None
 
 
 def _compute_cci(df: pd.DataFrame, length: int = 20, c: float = 0.015) -> pd.Series:
@@ -78,13 +78,7 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     """RSI/MACD/볼린저밴드를 종합해 -1.0(강한 매도)~+1.0(강한 매수) 점수를 낸다.
 
     세 지표 모두 이분법 투표가 아니라 연속값으로 -1.0~+1.0 사이를 매끄럽게 움직이는
-    "부분 투표"를 반환한다 (과거 30/70·밴드터치 임계값은 그대로 "완전 투표(±1.0)"
-    지점으로 유지하고, 그 안쪽 구간을 선형/비선형으로 보간한다). 그렇지 않으면
-    RSI·BB가 평상시(중립 구간) 거의 항상 정확히 0.0표를 던지고 MACD만 항상 ±1.0표를
-    던져 score가 {0, ±1/3, ±2/3, ±1}로만 양자화되고, strength가 0.333에 쏠린다.
-
-    LLM 결과와 동일한 형태({"direction", "strength", "detail"})로 반환해
-    signal_engine이 두 신호를 같은 방식으로 합칠 수 있게 한다.
+    "부분 투표"를 반환한다.
     """
     if len(df) < MIN_BARS_REQUIRED:
         return {"direction": "HOLD", "strength": 0.0, "detail": "데이터 부족"}
@@ -97,35 +91,37 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
 
     votes: List[float] = []
 
-    rsi = last[_first_matching_column(work, "RSI_")]
-    if pd.notna(rsi):
+    rsi_col = _first_matching_column(work, "RSI_")
+    if rsi_col and pd.notna(last.get(rsi_col)):
+        rsi = last[rsi_col]
         # 50=중립, 30/70에서 과거와 동일하게 ±1.0로 포화되는 선형 보간
         vote_rsi = (50.0 - rsi) / 20.0
         votes.append(max(-1.0, min(1.0, vote_rsi)))
 
-    macd = last[_first_matching_column(work, "MACD_")]
-    macd_signal = last[_first_matching_column(work, "MACDs_")]
-    if pd.notna(macd) and pd.notna(macd_signal):
+    macd_col = _first_matching_column(work, "MACD_")
+    macd_sig_col = _first_matching_column(work, "MACDs_")
+    if macd_col and macd_sig_col and pd.notna(last.get(macd_col)) and pd.notna(last.get(macd_sig_col)):
+        macd = last[macd_col]
+        macd_signal = last[macd_sig_col]
         hist_col = _first_matching_column(work, "MACDh_")
-        last_hist = last[hist_col]
-        hist_std = work[hist_col].tail(20).std()
-        if pd.notna(hist_std) and hist_std > 1e-9 and pd.notna(last_hist):
-            # 히스토그램을 최근 20봉 변동성으로 정규화한 z-score를 tanh로
-            # [-1, 1]에 매끄럽게 매핑 (크로스 방향뿐 아니라 강도까지 반영)
+        last_hist = last[hist_col] if hist_col else None
+        hist_std = work[hist_col].tail(20).std() if hist_col else None
+        if hist_std is not None and pd.notna(hist_std) and hist_std > 1e-9 and last_hist is not None and pd.notna(last_hist):
             vote_macd = math.tanh(last_hist / hist_std)
         else:
-            # 변동성을 추정할 데이터가 부족하면 기존처럼 부호만 사용
             vote_macd = 1.0 if macd > macd_signal else -1.0
         votes.append(vote_macd)
 
-    bb_lower = last[_first_matching_column(work, "BBL_")]
-    bb_upper = last[_first_matching_column(work, "BBU_")]
-    close = last["close"]
-    if pd.notna(bb_lower) and pd.notna(bb_upper) and bb_upper > bb_lower:
-        # %B: 0=하단밴드, 0.5=중심선, 1=상단밴드. 하단 터치 +1.0, 상단 터치 -1.0로 선형 매핑
-        percent_b = (close - bb_lower) / (bb_upper - bb_lower)
-        vote_bb = 1.0 - 2.0 * percent_b
-        votes.append(max(-1.0, min(1.0, vote_bb)))
+    bb_lower_col = _first_matching_column(work, "BBL_")
+    bb_upper_col = _first_matching_column(work, "BBU_")
+    if bb_lower_col and bb_upper_col and pd.notna(last.get(bb_lower_col)) and pd.notna(last.get(bb_upper_col)):
+        bb_lower = last[bb_lower_col]
+        bb_upper = last[bb_upper_col]
+        close = last["close"]
+        if bb_upper > bb_lower:
+            percent_b = (close - bb_lower) / (bb_upper - bb_lower)
+            vote_bb = 1.0 - 2.0 * percent_b
+            votes.append(max(-1.0, min(1.0, vote_bb)))
 
     score = sum(votes) / len(votes) if votes else 0.0
     direction = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"

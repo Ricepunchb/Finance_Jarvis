@@ -70,7 +70,8 @@ class AddCandidateRequest(BaseModel):
 
 
 class SchedulerToggleRequest(BaseModel):
-    enabled: bool
+    enabled: Optional[bool] = None
+    auto_apply: Optional[bool] = None
 
 
 @app.post("/engine/start")
@@ -533,12 +534,15 @@ async def get_scheduler_status():
     conn = await db.get_connection()
     try:
         enabled = (await db.get_state(conn, "ai_rebalance_scheduler_enabled")) == "1"
+        auto_apply_state = await db.get_state(conn, "ai_rebalance_auto_apply")
+        auto_apply = (auto_apply_state == "1") if auto_apply_state is not None else settings.AI_REBALANCE_AUTO_APPLY
         last_decision_at = await db.get_state(conn, "ai_rebalance_last_decision_at")
         last_scheduled_run_at = await db.get_state(conn, "ai_rebalance_last_scheduled_run_at")
     finally:
         await conn.close()
     return {
         "enabled": enabled,
+        "auto_apply": auto_apply,
         "last_decision_at": float(last_decision_at) if last_decision_at else None,
         "last_scheduled_run_at": float(last_scheduled_run_at) if last_scheduled_run_at else None,
         "periodic_interval_days": settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS,
@@ -548,12 +552,63 @@ async def get_scheduler_status():
 
 @app.post("/ai-rebalance/scheduler")
 async def set_scheduler_enabled(req: SchedulerToggleRequest):
-    """AI 포트폴리오 에이전트의 정기/드리프트/뉴스이벤트 트리거 루프를 켜고 끈다.
-    꺼져 있어도(기본값) 사람이 버튼으로 누르는 수동 제안(/portfolio/weights/propose)은
-    그대로 동작한다 — 이 토글은 '자동으로' 트리거되는지만 결정한다."""
+    """AI 포트폴리오 에이전트의 정기/드리프트/뉴스이벤트 트리거 루프 및 자동 반영(auto_apply)을 켜고 끈다."""
     conn = await db.get_connection()
     try:
-        await db.set_state(conn, "ai_rebalance_scheduler_enabled", "1" if req.enabled else "0")
+        if req.enabled is not None:
+            await db.set_state(conn, "ai_rebalance_scheduler_enabled", "1" if req.enabled else "0")
+        if req.auto_apply is not None:
+            await db.set_state(conn, "ai_rebalance_auto_apply", "1" if req.auto_apply else "0")
+        enabled = (await db.get_state(conn, "ai_rebalance_scheduler_enabled")) == "1"
+        auto_apply_state = await db.get_state(conn, "ai_rebalance_auto_apply")
+        auto_apply = (auto_apply_state == "1") if auto_apply_state is not None else settings.AI_REBALANCE_AUTO_APPLY
     finally:
         await conn.close()
-    return {"status": "enabled" if req.enabled else "disabled"}
+    return {"status": "ok", "enabled": enabled, "auto_apply": auto_apply}
+
+
+class RunBacktestRequest(BaseModel):
+    symbols: list[str] = ["005930", "000660", "017670"]
+    start_date: str = "2025-01-01"
+    end_date: str = "2026-09-30"
+    initial_cash: float = 10_000_000.0
+    benchmark_symbol: str = settings.BACKTEST_DEFAULT_BENCHMARK  # 360750
+    benchmark_market: str = "domestic"
+    benchmark_exchange: Optional[str] = None
+    target_weights: Optional[dict[str, float]] = None
+    fee_rate: float = settings.BACKTEST_DEFAULT_FEE_PCT
+    tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT
+    slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT
+    stop_loss_pct: float = settings.STOP_LOSS_PCT
+
+
+@app.post("/backtest/run")
+async def run_backtest_endpoint(req: RunBacktestRequest):
+    """지정 기간과 종목들에 대해 Finance Jarvis 트레이딩 전략(손절/ATR익절/지표시그널/온보딩)을
+    과거 데이터로 시뮬레이션하고 동기간 S&P 500 ETF(기본: 360750) 벤치마크와 비교 검증합니다."""
+    from core.backtest import BacktestConfig, BacktestRunner
+
+    config = BacktestConfig(
+        symbols=req.symbols,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        initial_cash=req.initial_cash,
+        benchmark_symbol=req.benchmark_symbol,
+        benchmark_market=req.benchmark_market,
+        benchmark_exchange=req.benchmark_exchange,
+        target_weights=req.target_weights,
+        fee_rate=req.fee_rate,
+        tax_rate=req.tax_rate,
+        slippage_pct=req.slippage_pct,
+        stop_loss_pct=req.stop_loss_pct,
+    )
+    conn = await db.get_connection()
+    try:
+        runner = BacktestRunner(conn, client=engine.client)
+        return await runner.run(config)
+    except Exception as e:
+        logger.exception("백테스트 실행 실패")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+

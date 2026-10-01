@@ -1,11 +1,16 @@
 # core/kis_client.py
 import aiohttp
 import asyncio
+import json
+from pathlib import Path
 import time
 from typing import Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .config import settings
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+TOKEN_CACHE_FILE = ROOT_DIR / "data" / "kis_token.json"
 
 # 발급된 토큰을 만료 임박(1일 유효기간) 전까지 재사용하기 위한 여유 시간.
 # 너무 늦게 갱신하면 만료된 토큰으로 요청을 보내다 401을 받을 수 있어 여유를 둔다.
@@ -58,8 +63,23 @@ class AsyncKISClient:
         토큰을 불필요하게 재발급받지 않도록 만료 시각을 직접 추적한다.
         """
         async with self._token_lock:  # 동시 요청들이 각자 재발급을 시도하지 않도록 직렬화
-            if self.access_token and time.monotonic() < self.token_expires_at:
+            now = time.time()
+            if self.access_token and now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SEC:
                 return self.access_token
+
+            # 프로세스 간 공유 디스크 캐시 확인
+            if TOKEN_CACHE_FILE.exists():
+                try:
+                    with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+                        cached_data = json.load(f)
+                    c_token = cached_data.get("access_token")
+                    c_expires = float(cached_data.get("expires_at", 0.0))
+                    if c_token and now < c_expires - TOKEN_REFRESH_MARGIN_SEC:
+                        self.access_token = c_token
+                        self.token_expires_at = c_expires
+                        return self.access_token
+                except Exception:
+                    pass
 
             url = f"{self.domain}/oauth2/tokenP"
             payload = {
@@ -74,7 +94,16 @@ class AsyncKISClient:
                 if response.status == 200:
                     self.access_token = data.get("access_token")
                     expires_in = int(data.get("expires_in", 86400))
-                    self.token_expires_at = time.monotonic() + expires_in - TOKEN_REFRESH_MARGIN_SEC
+                    self.token_expires_at = now + expires_in
+                    try:
+                        TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {"access_token": self.access_token, "expires_at": self.token_expires_at},
+                                f,
+                            )
+                    except Exception:
+                        pass
                     print("✅ KIS API 토큰 발급 성공")
                     return self.access_token
                 else:

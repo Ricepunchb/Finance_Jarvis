@@ -106,12 +106,18 @@ async def propose_rebalance(
     positions = await db.get_positions(conn)
     symbols = list(active_weights.keys())
 
+    is_auto = settings.AI_REBALANCE_AUTO_APPLY
+    state_val = await db.get_state(conn, "ai_rebalance_auto_apply")
+    if state_val is not None:
+        is_auto = (state_val == "1")
+    autonomy_mode = "autonomous" if is_auto else "approval_gated"
+
     prior_snapshot = json.dumps({"weights": active_weights, "symbols": symbols}, ensure_ascii=False)
     event_id = await db.create_rebalance_event(
         conn,
         trigger_type=trigger_type,
         trigger_detail=trigger_detail,
-        autonomy_mode="approval_gated",
+        autonomy_mode=autonomy_mode,
         prior_snapshot_json=prior_snapshot,
     )
 

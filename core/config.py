@@ -110,6 +110,13 @@ class Settings(BaseSettings):
     AI_REBALANCE_PERIODIC_INTERVAL_DAYS: int = 30         # 정기 재검토 주기
     AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT: float = 0.05   # REBALANCE_BAND_PCT를 넘어 이만큼 더 벗어나야 트리거
     AI_REBALANCE_NEWS_TRIGGER_STRENGTH: float = 0.7       # 보유종목 뉴스감성 강도가 이 이상이면 트리거
+    AI_REBALANCE_AUTO_APPLY: bool = False                 # True면 가드레일을 통과한 제안을 사람 승인 대기 없이 자동 반영
+
+    # --- 백테스팅 기본값 ---
+    BACKTEST_DEFAULT_BENCHMARK: str = "360750"            # TIGER 미국S&P500 (국내상장 S&P 500 ETF, KRW 기준)
+    BACKTEST_DEFAULT_FEE_PCT: float = 0.00015             # 편도 수수료 0.015%
+    BACKTEST_DEFAULT_TAX_PCT: float = 0.0018              # 매도 시 거래세 0.18%
+    BACKTEST_DEFAULT_SLIPPAGE_PCT: float = 0.0005         # 체결 슬리피지 0.05%
 
     @property
     def kis_domain(self) -> str:

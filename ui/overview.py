@@ -1,7 +1,7 @@
 # ui/overview.py
 """📊 성과 오버뷰 — 같은 수익률을 종목축 / 날짜축 / 종목×날짜 히트맵 세 가지로 본다."""
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -47,6 +47,15 @@ def _bar_by_symbol(rows: List[Dict[str, Any]], names: Dict[str, str], metric: st
     return theme.style(fig, height=max(220, 44 * len(data) + 60), legend=False)
 
 
+def _clean_num(val: Any) -> Optional[float]:
+    if val in (None, "-", ""):
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def _symbol_table(rows: List[Dict[str, Any]], names: Dict[str, str]) -> pd.DataFrame:
     out = []
     for r in rows:
@@ -57,11 +66,17 @@ def _symbol_table(rows: List[Dict[str, Any]], names: Dict[str, str]) -> pd.DataF
             notes.append(f"잔고 불일치({r['mismatch_qty']:g}주)")
         out.append({
             "종목": symbol_label(r["symbol"], names), "시장": "해외(USD)" if r["market"] == "overseas" else "국내",
-            "수량": r["qty"], "평단(현지)": r["avg_local"], "종가(현지)": r["last_close"], "평가액(원)": r["value_krw"],
-            "실현손익(원)": r["realized_krw"], "평가손익(원)": r["unrealized_krw"], "누적손익(원)": r["total_pnl_krw"],
-            "ROI": (r["roi"] * 100) if r["roi"] is not None else None, "기간손익(원)": r["period_pnl_krw"],
-            "승률": (r["win_rate"] * 100) if r["win_rate"] is not None else None,
-            "거래": r["trade_count"], "비고": ", ".join(notes),
+            "수량": _clean_num(r.get("qty")),
+            "평단(현지)": _clean_num(r.get("avg_local")),
+            "종가(현지)": _clean_num(r.get("last_close")),
+            "평가액(원)": _clean_num(r.get("value_krw")),
+            "실현손익(원)": _clean_num(r.get("realized_krw")),
+            "평가손익(원)": _clean_num(r.get("unrealized_krw")),
+            "누적손익(원)": _clean_num(r.get("total_pnl_krw")),
+            "ROI": (float(r["roi"]) * 100) if r.get("roi") is not None else None,
+            "기간손익(원)": _clean_num(r.get("period_pnl_krw")),
+            "승률": (float(r["win_rate"]) * 100) if r.get("win_rate") is not None else None,
+            "거래": r.get("trade_count", 0), "비고": ", ".join(notes),
         })
     return pd.DataFrame(out)
 

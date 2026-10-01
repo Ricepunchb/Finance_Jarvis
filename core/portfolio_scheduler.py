@@ -70,31 +70,47 @@ class PortfolioScheduler:
 
             if await self._periodic_due(conn):
                 logger.info("AI 포트폴리오 에이전트: 정기 재검토 트리거")
-                await portfolio_agent.propose_rebalance(
+                res = await portfolio_agent.propose_rebalance(
                     conn, client=self.client, trigger_type="SCHEDULED",
                     trigger_detail=f"{settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS}일 정기 재검토",
                 )
+                await self._maybe_auto_apply(conn, res)
                 await self._mark_decision(conn)
                 return
 
             drift_detail = await self._drift_trigger_detail(conn)
             if drift_detail:
                 logger.info(f"AI 포트폴리오 에이전트: 드리프트 트리거 - {drift_detail}")
-                await portfolio_agent.propose_rebalance(
+                res = await portfolio_agent.propose_rebalance(
                     conn, client=self.client, trigger_type="DRIFT", trigger_detail=drift_detail,
                 )
+                await self._maybe_auto_apply(conn, res)
                 await self._mark_decision(conn)
                 return
 
             news_detail = await self._news_event_trigger_detail(conn)
             if news_detail:
                 logger.info(f"AI 포트폴리오 에이전트: 뉴스이벤트 트리거 - {news_detail}")
-                await portfolio_agent.propose_rebalance(
+                res = await portfolio_agent.propose_rebalance(
                     conn, client=self.client, trigger_type="NEWS_EVENT", trigger_detail=news_detail,
                 )
+                await self._maybe_auto_apply(conn, res)
                 await self._mark_decision(conn)
         finally:
             await conn.close()
+
+    async def _maybe_auto_apply(self, conn, res: Optional[dict]) -> None:
+        if not res or res.get("status") != "PROPOSED":
+            return
+        is_auto = settings.AI_REBALANCE_AUTO_APPLY
+        state_val = await db.get_state(conn, "ai_rebalance_auto_apply")
+        if state_val is not None:
+            is_auto = (state_val == "1")
+        if is_auto:
+            event_id = res.get("event_id")
+            if event_id:
+                logger.info(f"AI 포트폴리오 에이전트: auto_apply 활성 — 이벤트 #{event_id} 자동 승인 및 포트폴리오 반영")
+                await db.apply_rebalance_event(conn, event_id, approve=True, decided_by="auto_apply")
 
     async def _maybe_refresh_discovery(self, conn) -> None:
         """AI 리밸런스 토글과 무관하게 돈다 - 발굴 결과는 대시보드에서 사람이 보는 용도이기도 하다.

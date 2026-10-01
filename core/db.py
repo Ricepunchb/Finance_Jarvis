@@ -222,6 +222,20 @@ CREATE TABLE IF NOT EXISTS daily_bars (
     close REAL NOT NULL,
     PRIMARY KEY (symbol, market, date)
 );
+
+-- 백테스팅용 전체 OHLCV 일봉 캐시. 과거 일봉 지표(RSI/MACD/BB/ATR) 재현용.
+CREATE TABLE IF NOT EXISTS backtest_bars (
+    symbol TEXT NOT NULL,
+    market TEXT NOT NULL,              -- 'domestic' | 'overseas'
+    date TEXT NOT NULL,                -- 'YYYY-MM-DD'
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume REAL NOT NULL,
+    PRIMARY KEY (symbol, market, date)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_bars_date ON backtest_bars(date);
 """
 
 
@@ -1065,3 +1079,42 @@ async def get_data_start_ts(conn: aiosqlite.Connection) -> Optional[float]:
     cur = await conn.execute("SELECT MIN(started_at) AS t FROM cycles")
     row = await cur.fetchone()
     return row["t"] if row and row["t"] is not None else None
+
+
+async def get_backtest_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, start_date: str, end_date: str
+) -> List[Dict[str, Any]]:
+    """백테스트용 OHLCV 일봉 조회. date 오름차순 정렬."""
+    cur = await conn.execute(
+        "SELECT symbol, market, date, open, high, low, close, volume "
+        "FROM backtest_bars "
+        "WHERE symbol = ? AND market = ? AND date >= ? AND date <= ? "
+        "ORDER BY date ASC",
+        (symbol, market, start_date, end_date),
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def save_backtest_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, bars: List[Dict[str, Any]]
+) -> None:
+    """백테스트용 OHLCV 일봉 일괄 저장."""
+    for bar in bars:
+        await conn.execute(
+            "INSERT INTO backtest_bars(symbol, market, date, open, high, low, close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol, market, date) DO UPDATE SET "
+            "open=excluded.open, high=excluded.high, low=excluded.low, "
+            "close=excluded.close, volume=excluded.volume",
+            (
+                symbol,
+                market,
+                bar["date"],
+                bar["open"],
+                bar["high"],
+                bar["low"],
+                bar["close"],
+                bar.get("volume", 0.0),
+            ),
+        )
+    await conn.commit()
