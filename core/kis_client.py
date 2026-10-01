@@ -15,6 +15,15 @@ TOKEN_REFRESH_MARGIN_SEC = 60 * 10
 # 그대로 부딪히면 "EGW00201 초당 거래건수를 초과하였습니다" 오류가 난다. 여유를 두고 낮게 잡는다.
 MAX_REQUESTS_PER_SECOND = 15 if not settings.IS_MOCK else 1
 
+# 호출 시작 사이의 최소 간격. 모의투자는 서버 한도(약 2건/초)에 비해 1건/초도 지터(요청 지연 편차)로
+# 같은 초에 두 건이 도착해 넘칠 수 있어 1.0초에 여유(20%)를 더한다.
+MIN_REQUEST_INTERVAL_SEC = (1.0 / MAX_REQUESTS_PER_SECOND) * (1.2 if settings.IS_MOCK else 1.0)
+
+# 초당 거래건수 초과(EGW00201)는 서버가 요청을 처리하지 않고 거절한 것이라, 조회(GET)는 잠시 뒤 재시도해도 안전하다.
+RATE_LIMIT_MSG_CD = "EGW00201"
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_SEC = 1.5
+
 
 class AsyncKISClient:
     def __init__(self):
@@ -25,7 +34,8 @@ class AsyncKISClient:
         self.access_token: Optional[str] = None
         self.token_expires_at: float = 0.0  # time.monotonic() 기준 만료 시각
         self._token_lock = asyncio.Lock()
-        self._rate_limiter = asyncio.Semaphore(MAX_REQUESTS_PER_SECOND)
+        self._rate_lock = asyncio.Lock()
+        self._next_request_at: float = 0.0  # time.monotonic() 기준, 다음 호출이 나갈 수 있는 가장 이른 시각
 
     async def get_session(self) -> aiohttp.ClientSession:
         """aiohttp 세션을 생성하거나 반환합니다 (Connection Pooling)"""
@@ -101,11 +111,23 @@ class AsyncKISClient:
             headers["hashkey"] = await self.get_hashkey(data)
 
         session = await self.get_session()
-        # 초당 호출 제한: 세마포어를 획득한 뒤 1초가 지나서야 반납해 초당 호출 수를 제한한다.
-        await self._rate_limiter.acquire()
-        asyncio.get_running_loop().call_later(1.0, self._rate_limiter.release)
-        async with session.request(method, url, headers=headers, json=data, params=params) as response:
-            return await response.json()
+        # 한도 초과 거절은 조회(GET)만 재시도한다 - 주문(POST)은 재전송이 중복 주문이 될 수 있어 호출자에게 그대로 돌려준다.
+        max_attempts = 1 + (RATE_LIMIT_RETRIES if method.upper() == "GET" else 0)
+        for attempt in range(1, max_attempts + 1):
+            await self._throttle()
+            async with session.request(method, url, headers=headers, json=data, params=params) as response:
+                result = await response.json()
+            if result.get("msg_cd") != RATE_LIMIT_MSG_CD or attempt == max_attempts:
+                return result
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC * attempt)
+
+    async def _throttle(self) -> None:
+        """직전 호출과의 최소 간격을 보장한다. 락 안에서 기다리므로 호출 순서가 유지된다."""
+        async with self._rate_lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._next_request_at = time.monotonic() + MIN_REQUEST_INTERVAL_SEC
 
     async def close(self):
         """앱 종료 시 세션을 안전하게 닫습니다."""
