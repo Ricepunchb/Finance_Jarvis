@@ -241,4 +241,5 @@ async def screen_candidates(
         entries = await score_candidates(conn, client, benchmark_returns=benchmark_returns)
     return discovery_signals.select_with_quota(
         entries, settings.DISCOVERY_TOP_N, settings.DISCOVERY_ANGLE_QUOTA, exclude=set(exclude_symbols),
+        min_score=settings.DISCOVERY_MIN_SCORE,
     )

@@ -9,6 +9,13 @@ class Settings(BaseSettings):
     KIS_HTS_ID: str        # 실시간 체결통보(웹소켓) 구독에 필요한 HTS 로그인 ID
     IS_MOCK: bool = True   # 기본값은 모의투자
 
+    # True면 국내(KRX 주식·ETF)만 매매·조회·발굴·등록한다. 해외는 수수료 부담이 커서 기본 비활성.
+    # DB에 이미 있는 해외 종목/체결 이력은 지우지 않고 엔진이 건너뛸 뿐이다(분석 대시보드에서는 그대로 보인다).
+    DOMESTIC_ONLY: bool = True
+    # 발굴 후보에서 뺄 ETF 이름 키워드(쉼표 구분, 대소문자 무시). 레버리지·인버스·파생 기반은 스윙 신호가
+    # 성과를 설명하지 못하고 변동성 끌림이 커서, 머니마켓·CD금리 같은 현금성은 가격이 거의 안 움직여서 제외한다.
+    ETF_EXCLUDE_NAME_KEYWORDS: str = "레버리지,인버스,곱버스,선물,커버드콜,2X,3X,머니마켓,CD금리,KOFR,단기채,단기통안"
+
     # 실전투자(IS_MOCK=False)로 전환하려면 이 값도 명시적으로 true여야 한다.
     # 실수로 .env의 IS_MOCK만 바꿔서 실거래가 시작되는 사고를 막기 위한 이중 안전장치.
     I_UNDERSTAND_REAL_MONEY_RISK: bool = False
@@ -35,6 +42,9 @@ class Settings(BaseSettings):
     # --- 분할 온보딩 매수 (신규 편입/저비중 종목을 시그널 문턱 없이 며칠에 걸쳐 목표비중까지 채움) ---
     ONBOARDING_ENABLED: bool = True
     ONBOARDING_DAYS: int = 5                     # 목표금액을 이 일수로 나눈 만큼을 하루 매수 예산으로 사용
+
+    # --- 포트폴리오 종목 삭제(정리 대기): 신규매수 중단 + 매도 신호 때 전량 매도, 기한 내 신호가 없으면 강제 청산 ---
+    WINDDOWN_MAX_DAYS: int = 5                   # 삭제 후 이 일수(달력일)가 지나면 신호와 무관하게 전량 청산
 
     # --- 스윙 시그널 (밴드는 보조 리스크 상한으로 전환) ---
     INTRADAY_BAR_MINUTES: int = 30                  # CYCLE_INTERVAL_SEC(엔진 사이클)와 반드시 일치
@@ -71,6 +81,7 @@ class Settings(BaseSettings):
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지
+    DISCOVERY_MIN_SCORE: float = 0.6  # 복합점수가 이 값 미만인 후보는 숏리스트/오늘의 발굴에서 제외
 
     # --- 동적 종목 발굴 (전종목 마스터 + 모멘텀/증권사/뉴스/저평가/테마후발 소스) ---
     DISCOVERY_DYNAMIC_ENABLED: bool = True

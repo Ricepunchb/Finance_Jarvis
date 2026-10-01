@@ -294,7 +294,10 @@ with tab_settings:
     a4.metric("1회 최대 신규편입", config["ai_rebalance_max_symbols_added"])
     a5.metric("1회 최대 제외", config["ai_rebalance_max_symbols_removed"])
     a6.metric("종목당 최소 비중", fmt_pct(config["ai_rebalance_min_symbol_weight_pct"]))
-    st.caption(f"발굴 스크리닝 상위 노출 종목수: {config['discovery_top_n']}개")
+    st.caption(
+        f"발굴 스크리닝 상위 노출 종목수: {config['discovery_top_n']}개 "
+        f"(점수 {config.get('discovery_min_score', 0.6):g} 이상만)"
+    )
 
     a7, a8 = st.columns(2)
     a7.metric("에이전트 자체 결정 쿨다운", f"{config['ai_rebalance_min_interval_sec'] // 3600}시간")
@@ -310,9 +313,14 @@ with tab_settings:
 with tab_portfolio:
     st.markdown("#### 📋 포트폴리오 종목 등록")
     with st.form("add_symbol_form"):
+        domestic_only = bool(config.get("domestic_only", False))
         fc1, fc2, fc3 = st.columns([1, 2, 1])
-        new_market = fc1.radio("구분", ["국내", "해외(미국만 실증됨)"], horizontal=False)
-        new_symbol = fc2.text_input("종목코드 (예: 005930 또는 AAPL)")
+        if domestic_only:
+            new_market = "국내"
+            fc1.caption("국내 전용 (주식·ETF)")
+        else:
+            new_market = fc1.radio("구분", ["국내", "해외(미국만 실증됨)"], horizontal=False)
+        new_symbol = fc2.text_input("종목코드 (예: 005930, ETF는 069500)" if domestic_only else "종목코드 (예: 005930 또는 AAPL)")
         new_exchange = None
         if new_market.startswith("해외"):
             new_exchange = fc3.selectbox("거래소", ["NASD", "NYSE", "AMEX"])
@@ -328,7 +336,33 @@ with tab_portfolio:
     if symbols:
         symbols_df = pd.DataFrame(symbols)
         symbols_df.insert(1, "종목명", symbols_df["symbol"].map(lambda s: symbol_names.get(s, "-")))
+        if "winding_down_at" not in symbols_df:  # API 서버가 구버전이면 컬럼 자체가 없다 (재시작 필요)
+            symbols_df["winding_down_at"] = None
+        symbols_df["상태"] = symbols_df["winding_down_at"].map(
+            lambda t: "-" if pd.isna(t) else f"정리 대기 ({fmt_kst(t)} 삭제)"
+        )
         st.dataframe(symbols_df, width='stretch', hide_index=True)
+
+        dc1, dc2 = st.columns([3, 1])
+        delete_target = dc1.selectbox(
+            "포트폴리오에서 삭제할 종목",
+            [f"{r['symbol']} {symbol_names.get(r['symbol'], '')}".strip()
+             for r in symbols if not r.get("winding_down_at")],
+            index=None,
+            placeholder="종목 선택",
+        )
+        dc1.caption(
+            "삭제해도 즉시 매도하지 않습니다. 보유 중이면 신규 매수를 멈추고 '정리 대기'로 두었다가, "
+            "매도 신호가 오면 전량 매도한 뒤 목록에서 사라집니다 "
+            f"(신호가 없어도 {config['winddown_max_days']}일 뒤에는 강제 청산)."
+        )
+        dc2.write("")
+        if dc2.button("삭제", disabled=delete_target is None, width='stretch'):
+            result = api_delete(f"/portfolio/symbols/{delete_target.split()[0]}")
+            if result is not None:
+                if result["status"] == "winding_down":
+                    st.toast(f"{delete_target}: 정리 대기로 전환했습니다")
+                st.rerun()
 
     st.divider()
     st.markdown("#### 🎯 목표 비중")
@@ -608,7 +642,10 @@ with tab_ai:
         )
         st.dataframe(sdf, width='stretch', hide_index=True)
     else:
-        st.caption("아직 점수가 계산된 발굴 결과가 없습니다 - '지금 발굴 갱신'을 눌러보세요.")
+        st.caption(
+            f"점수 {config.get('discovery_min_score', 0.6):g} 이상인 발굴 결과가 없습니다 - "
+            "'지금 발굴 갱신'을 눌러보세요."
+        )
 
     st.divider()
     st.markdown("#### 📈 보유종목 성과 · 리스크 지표")

@@ -177,11 +177,13 @@ def composite_score(components: Dict[str, float], weights: Dict[str, float]) -> 
 
 def select_with_quota(
     entries: List[Dict[str, Any]], top_n: int, quota: Dict[str, int], exclude: Optional[set] = None,
+    min_score: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """관점별 할당량을 점수순으로 먼저 채우고 남는 자리는 전체 점수순. 점수 0인 종목은 뽑지 않는다."""
+    """관점별 할당량을 점수순으로 먼저 채우고 남는 자리는 전체 점수순. 점수가 min_score 미만이거나
+    0인 종목은 뽑지 않는다 (top_n을 못 채우면 채우지 않고 적게 반환)."""
     exclude = exclude or set()
     pool = sorted(
-        (e for e in entries if e["symbol"] not in exclude and e.get("score", 0) > 0),
+        (e for e in entries if e["symbol"] not in exclude and e.get("score", 0) > 0 and e.get("score", 0) >= min_score),
         key=lambda e: e["score"], reverse=True,
     )
     chosen: List[Dict[str, Any]] = []

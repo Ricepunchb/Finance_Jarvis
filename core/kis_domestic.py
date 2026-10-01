@@ -151,7 +151,8 @@ async def get_financial_ratio(client: AsyncKISClient, symbol: str, div_cls: str 
 
 
 # 제외 마스크 10자리: 투자위험/경고/주의, 관리종목, 정리매매, 불성실공시, 우선주, 거래정지, ETF, ETN, 신용주문불가, SPAC
-_RANK_EXCLUDE_MASK = "1111111101"
+# ETF(7번째)는 포함, ETN(8번째)은 제외. 레버리지/인버스 ETF는 이름 기준으로 마스터 파일 단계(is_excluded)에서 걸러진다.
+_RANK_EXCLUDE_MASK = "1111110101"
 
 
 async def get_fluctuation_rank(

@@ -232,7 +232,9 @@ class GeminiProvider(LLMProvider):
             lines.append(
                 "[신규 편입 후보] 관점별로 발굴됨. '하입 조기신호'는 관심 대비 주가 미반영이라는 관측일 뿐 "
                 "상승 예측이 아니고, 테마/모멘텀 후보는 변동성이 크다 — 이런 후보를 담는다면 최소 수준의 "
-                "비중으로만 담고 rationale에 반대 근거(리스크)도 함께 적어라."
+                "비중으로만 담고 rationale에 반대 근거(리스크)도 함께 적어라. 후보에는 ETF(KODEX/TIGER 등 종목명)도 "
+                "섞여 있다 — ETF는 PER/PBR/목표가가 없고 지수·테마 분산 수단이므로 개별 종목과 같은 잣대로 비교하지 말고, "
+                "기초지수·분산 효과와 이미 보유한 종목과의 중복(같은 지수/섹터를 ETF와 개별주로 이중 보유)을 따져라."
             )
             for c in candidate_pool:
                 lines.append(_format_candidate(c))

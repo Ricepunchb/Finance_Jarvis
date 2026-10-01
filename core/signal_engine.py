@@ -112,9 +112,26 @@ async def decide(
     current_position_value: float,
     total_equity: float,
     risk: RiskManager,
+    winding_down: bool = False,
+    winddown_liquidating: bool = False,
 ) -> Optional[Action]:
     if price <= 0 or total_equity <= 0:
         return None
+
+    if winding_down:
+        # 사용자가 포트폴리오에서 삭제한 종목: 신규매수는 하지 않고 보유분만 정리한다. 즉시 청산이
+        # 아니라 "적절한 매도 타이밍"(결합 시그널 SELL)을 기다리되, 이미 정리 매도가 시작됐거나
+        # 기한이 지났으면(winddown_liquidating) 시그널과 무관하게 남은 수량을 끝까지 매도한다.
+        if current_position_qty <= 0:
+            return None
+        if not winddown_liquidating:
+            combined = combine_signals(tech_signal, intraday_signal, sentiment_signal, valuation_signal)
+            if combined["direction"] != "SELL":
+                return None
+        qty = risk.clamp_qty_to_notional(current_position_qty, price)
+        qty = float(max(1, int(min(qty, current_position_qty))))
+        reason = "winddown_liquidation" if winddown_liquidating else "winddown_signal_sell"
+        return Action(side="sell", qty=qty, order_type="limit", price=price, reason=reason)
 
     if target_weight <= 0:
         # "제외 종목" — 관심(모니터링) 대상이 아니라 포트폴리오에서 뺀 종목이다. 신규 매수는

@@ -107,6 +107,16 @@ def test_select_with_quota_keeps_minority_angles():
     assert symbols == sorted(symbols, key=lambda s: -next(e["score"] for e in entries if e["symbol"] == s))
 
 
+def test_select_with_quota_filters_below_min_score():
+    entries = [
+        {"symbol": "A", "angle": "value", "score": 0.8},
+        {"symbol": "B", "angle": "early", "score": 0.6},
+        {"symbol": "C", "angle": "momentum", "score": 0.59},
+    ]
+    chosen = ds.select_with_quota(entries, top_n=5, quota={"value": 1, "early": 1, "momentum": 1}, min_score=0.6)
+    assert [e["symbol"] for e in chosen] == ["A", "B"]
+
+
 def test_group_research_reports_applies_lookback():
     now = datetime(2026, 9, 28)
     reports = [
@@ -147,6 +157,33 @@ def test_parse_stock_master_line(market):
 def test_parse_stock_master_line_exclusions(fields):
     row = master_files.parse_stock_master_line(_master_line("KOSPI", "005935", "삼성전자우", **fields), "KOSPI")
     assert row["is_excluded"] is True
+
+
+def _etf_excluded(name, **fields):
+    row = master_files.parse_stock_master_line(_master_line("KOSPI", "069500", name, group="EF", **fields), "KOSPI")
+    return row["is_excluded"]
+
+
+def test_plain_etf_is_eligible_but_etn_and_single_stock_leverage_are_not():
+    assert _etf_excluded("KODEX 200", etp="2") is False
+    assert _etf_excluded("TIGER 미국S&P500", etp="1") is False
+    assert _etf_excluded("RISE SK하이닉스단일종목레버리지", etp="8") is True   # 단일종목 레버리지 ETP 코드
+    assert _etf_excluded("KODEX 200", etp=" ") is True                           # ETP 구분 없는 EF는 보수적으로 제외
+    row = master_files.parse_stock_master_line(_master_line("KOSPI", "500001", "삼성 ETN", group="EN", etp="3"), "KOSPI")
+    assert row["is_excluded"] is True
+
+
+@pytest.mark.parametrize("name", ["KODEX 레버리지", "KODEX 인버스", "KODEX 200선물인버스2X", "TIGER 원유선물Enhanced(H)",
+                                  "TIGER 엔비디아미국채커버드콜", "ACE 미국나스닥3x",
+                                  "KODEX 머니마켓액티브", "KODEX CD금리액티브(합성)", "RISE KOFR금리액티브"])
+def test_leveraged_inverse_and_derivative_etfs_are_excluded_by_name(name):
+    assert _etf_excluded(name, etp="2") is True
+
+
+def test_etf_keyword_filter_does_not_touch_plain_stocks_and_still_applies_other_flags():
+    stock = master_files.parse_stock_master_line(_master_line("KOSPI", "000001", "한국선물거래소"), "KOSPI")
+    assert stock["is_excluded"] is False
+    assert _etf_excluded("KODEX 200", etp="2", suspended="Y") is True            # 거래정지 ETF는 제외
 
 
 def test_parse_theme_line():

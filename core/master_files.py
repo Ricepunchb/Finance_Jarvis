@@ -1,6 +1,7 @@
 # core/master_files.py
 """KIS 정적 마스터 파일(전종목/테마) 다운로드·파싱. KIS REST에는 전종목 목록 TR이 없어서
-종목 발굴의 모집단은 이 파일에서만 얻는다. 필드 위치는 Hantu-api/open-trading-api/stocks_info의
+종목 발굴의 모집단은 이 파일에서만 얻는다. 보통주와 ETF(레버리지·인버스·파생 기반 제외)를 후보로 허용하고
+ETN·SPAC·관리/거래정지 등은 제외한다. 필드 위치는 Hantu-api/open-trading-api/stocks_info의
 공식 파서(kis_kospi_code_mst.py 등)와 같고, 실제 파일로 검증했다.
 
 행 구조: [단축코드 9][표준코드 12][한글명 가변] + 고정폭 꼬리(KOSPI 227자, KOSDAQ 221자) + 개행.
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from core import db
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,11 @@ def _to_float(raw: str) -> Optional[float]:
         return None
 
 
+def _has_excluded_etf_keyword(name: str) -> bool:
+    upper = name.upper()
+    return any(k.strip().upper() in upper for k in settings.ETF_EXCLUDE_NAME_KEYWORDS.split(",") if k.strip())
+
+
 def parse_stock_master_line(line: str, market: str) -> Optional[Dict[str, Any]]:
     layout = _LAYOUTS[market]
     line = line.rstrip("\r\n")
@@ -61,9 +68,12 @@ def parse_stock_master_line(line: str, market: str) -> Optional[Dict[str, Any]]:
         start, end = layout[key]
         return tail[start:end]
 
+    group, etp = field("group"), field("etp").strip()
+    is_stock = group == "ST" and etp in ("", "0")
+    # ETF: 그룹 EF + ETP 1(투자회사형)/2(수익증권형). EF라도 ETP 8(단일종목 레버리지)은 제외하고, ETN(그룹 EN)도 제외한다.
+    is_etf = group == "EF" and etp in ("1", "2") and not _has_excluded_etf_keyword(name)
     is_excluded = (
-        field("group") != "ST"
-        or field("etp").strip() not in ("", "0")
+        not (is_stock or is_etf)
         or field("spac") == "Y"
         or field("suspended") == "Y"
         or field("liquidation") == "Y"

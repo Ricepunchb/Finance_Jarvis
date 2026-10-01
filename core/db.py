@@ -212,6 +212,16 @@ CREATE TABLE IF NOT EXISTS symbol_thesis (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+
+-- 분석 대시보드용 일봉 종가 캐시. 과거 일자는 불변이라 한 번 받으면 다시 조회하지 않는다.
+-- date는 거래소 현지 거래일(국내 KST, 해외 미국 현지일) 'YYYY-MM-DD'.
+CREATE TABLE IF NOT EXISTS daily_bars (
+    symbol TEXT NOT NULL,
+    market TEXT NOT NULL,              -- 'domestic' | 'overseas'
+    date TEXT NOT NULL,
+    close REAL NOT NULL,
+    PRIMARY KEY (symbol, market, date)
+);
 """
 
 
@@ -267,6 +277,10 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_at REAL")
     if "disabled_by_event_id" not in columns:
         await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN disabled_by_event_id INTEGER")
+    if "winding_down_at" not in columns:
+        await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN winding_down_at REAL")
+    if "winddown_sell_started_at" not in columns:
+        await conn.execute("ALTER TABLE portfolio_symbols ADD COLUMN winddown_sell_started_at REAL")
 
     cur = await conn.execute("PRAGMA table_info(candidate_universe)")
     columns = {row["name"] for row in await cur.fetchall()}
@@ -299,9 +313,42 @@ async def add_portfolio_symbol(
 ) -> None:
     await conn.execute(
         "INSERT INTO portfolio_symbols(symbol, market, exchange, added_at, enabled) VALUES (?, ?, ?, ?, 1) "
-        "ON CONFLICT(symbol) DO UPDATE SET enabled = 1, market = excluded.market, exchange = excluded.exchange",
+        "ON CONFLICT(symbol) DO UPDATE SET enabled = 1, market = excluded.market, exchange = excluded.exchange, "
+        "disabled_at = NULL, winding_down_at = NULL, winddown_sell_started_at = NULL",
         (symbol, market, exchange, time.time()),
     )
+    await conn.commit()
+
+
+async def start_symbol_winddown(conn: aiosqlite.Connection, symbol: str) -> bool:
+    """사용자가 포트폴리오에서 종목을 삭제했지만 보유분이 남아있을 때 "정리 대기"로 표시한다.
+    즉시 청산이 아니다 — 엔진은 신규매수를 멈추고, 매도 신호가 오거나 기한(WINDDOWN_MAX_DAYS)이
+    지나면 전량 매도한다. 이미 정리 대기 중이면 시작 시각을 유지한다(기한 연장 방지)."""
+    cur = await conn.execute(
+        "UPDATE portfolio_symbols SET winding_down_at = COALESCE(winding_down_at, ?) "
+        "WHERE symbol = ? AND enabled = 1", (time.time(), symbol),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def mark_winddown_sell_started(conn: aiosqlite.Connection, symbol: str) -> None:
+    """첫 정리 매도가 나가면 표시한다 — 1회 주문 한도로 분할 매도되는 동안 신호가 HOLD로
+    돌아서도 잔여분이 남지 않고 끝까지 청산되도록 한다."""
+    await conn.execute(
+        "UPDATE portfolio_symbols SET winddown_sell_started_at = COALESCE(winddown_sell_started_at, ?) "
+        "WHERE symbol = ? AND winding_down_at IS NOT NULL", (time.time(), symbol),
+    )
+    await conn.commit()
+
+
+async def finish_symbol_removal(conn: aiosqlite.Connection, symbol: str) -> None:
+    """포트폴리오에서 완전히 제거: 비활성화 + 목표비중 삭제. 이력(target_weights/decision_log)은 보존."""
+    await conn.execute(
+        "UPDATE portfolio_symbols SET enabled = 0, disabled_at = ?, winding_down_at = NULL, "
+        "winddown_sell_started_at = NULL WHERE symbol = ?", (time.time(), symbol),
+    )
+    await conn.execute("DELETE FROM active_target_weights WHERE symbol = ?", (symbol,))
     await conn.commit()
 
 
@@ -314,7 +361,13 @@ async def list_portfolio_symbols(conn: aiosqlite.Connection) -> List[Dict[str, A
 async def get_portfolio_symbol_info(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:
     """symbol -> {"market": ..., "exchange": ...}. 사이클에서 국내/해외 처리 경로를 나누는 데 사용."""
     rows = await list_portfolio_symbols(conn)
-    return {row["symbol"]: {"market": row["market"], "exchange": row["exchange"]} for row in rows}
+    return {
+        row["symbol"]: {
+            "market": row["market"], "exchange": row["exchange"],
+            "winding_down_at": row["winding_down_at"], "winddown_sell_started_at": row["winddown_sell_started_at"],
+        }
+        for row in rows
+    }
 
 
 async def get_recent_decisions(conn: aiosqlite.Connection, limit: int = 50) -> List[Dict[str, Any]]:
@@ -880,3 +933,123 @@ async def log_decision(
          json.dumps(context, ensure_ascii=False, default=str) if context is not None else None),
     )
     await conn.commit()
+
+
+# --- analytics (읽기 전용 조회: 분석 대시보드용) ---
+
+async def list_all_portfolio_symbols(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    """비활성(편입 제외된) 종목까지 포함. 과거 체결 종목의 market/exchange를 찾는 데 쓴다."""
+    cur = await conn.execute("SELECT * FROM portfolio_symbols")
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_order_intents_since(conn: aiosqlite.Connection, since_ts: float) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT * FROM order_intents WHERE created_at >= ? ORDER BY created_at ASC", (since_ts,)
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_fills_for_intents(conn: aiosqlite.Connection, intent_ids: List[str]) -> List[Dict[str, Any]]:
+    if not intent_ids:
+        return []
+    out: List[Dict[str, Any]] = []
+    for i in range(0, len(intent_ids), 500):  # SQLite 변수 개수 제한 회피
+        chunk = intent_ids[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        cur = await conn.execute(
+            f"SELECT * FROM fills WHERE intent_id IN ({placeholders}) ORDER BY filled_at ASC", chunk
+        )
+        out.extend(dict(row) for row in await cur.fetchall())
+    return out
+
+
+async def list_decision_contexts_with_intent(conn: aiosqlite.Connection, since_ts: float) -> List[Dict[str, Any]]:
+    """주문으로 이어진 결정(intent_id 있음)의 컨텍스트. fills가 없는 체결의 가격/원가 추정에 쓴다."""
+    cur = await conn.execute(
+        "SELECT intent_id, ts, context_json FROM decision_log WHERE intent_id IS NOT NULL AND ts >= ?",
+        (since_ts,),
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_context_rows(conn: aiosqlite.Connection, since_ts: float) -> List[Dict[str, Any]]:
+    """환율(bass_exrt)·총자산(total_equity) 시계열 추출용. 두 값은 decision_log.context_json에만 남는다."""
+    cur = await conn.execute(
+        "SELECT ts, context_json FROM decision_log "
+        "WHERE ts >= ? AND (context_json LIKE '%bass_exrt%' OR context_json LIKE '%total_equity%') "
+        "ORDER BY ts ASC",
+        (since_ts,),
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def list_decisions_light(
+    conn: aiosqlite.Connection, symbol: Optional[str], since_ts: float, until_ts: float, include_noop: bool
+) -> List[Dict[str, Any]]:
+    """복기용 결정 목록. context_json은 제외(상세 조회에서만)하고 주문 상태/가격을 조인한다."""
+    sql = (
+        "SELECT d.id, d.cycle_id, d.symbol, d.ts, d.current_weight, d.target_weight, d.drift, "
+        "d.tech_signal, d.sentiment_signal, d.action, d.qty, d.reason, d.intent_id, "
+        "oi.status AS intent_status, oi.side AS intent_side, oi.price AS intent_price, oi.market AS market, "
+        "json_extract(d.context_json, '$.price') AS ctx_price, "
+        "json_extract(d.context_json, '$.price_foreign') AS ctx_price_foreign "
+        "FROM decision_log d LEFT JOIN order_intents oi ON oi.intent_id = d.intent_id "
+        "WHERE d.ts >= ? AND d.ts <= ?"
+    )
+    params: List[Any] = [since_ts, until_ts]
+    if symbol:
+        sql += " AND d.symbol = ?"
+        params.append(symbol)
+    if not include_noop:
+        sql += " AND d.action != 'NO_OP'"
+    sql += " ORDER BY d.ts ASC"
+    cur = await conn.execute(sql, params)
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_decision(conn: aiosqlite.Connection, decision_id: int) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT d.*, oi.status AS intent_status, oi.price AS intent_price, oi.qty AS intent_qty "
+        "FROM decision_log d LEFT JOIN order_intents oi ON oi.intent_id = d.intent_id WHERE d.id = ?",
+        (decision_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_daily_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, since_date: str
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT date, close FROM daily_bars WHERE symbol = ? AND market = ? AND date >= ? ORDER BY date ASC",
+        (symbol, market, since_date),
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def save_daily_bars(
+    conn: aiosqlite.Connection, symbol: str, market: str, bars: List[Dict[str, Any]]
+) -> None:
+    for bar in bars:
+        await conn.execute(
+            "INSERT INTO daily_bars(symbol, market, date, close) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(symbol, market, date) DO UPDATE SET close=excluded.close",
+            (symbol, market, bar["date"], bar["close"]),
+        )
+    await conn.commit()
+
+
+async def list_approved_weight_events(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    """비중 타임라인용: 적용된(APPROVED/AUTO_APPLIED) 리밸런싱 이벤트를 시간순으로."""
+    cur = await conn.execute(
+        "SELECT * FROM rebalance_events WHERE status IN ('APPROVED','AUTO_APPLIED') ORDER BY COALESCE(decided_at, created_at) ASC"
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
+async def get_data_start_ts(conn: aiosqlite.Connection) -> Optional[float]:
+    """엔진이 처음 사이클을 돈 시각. 그 이전의 보유/가격 변동은 이 DB로 알 수 없다."""
+    cur = await conn.execute("SELECT MIN(started_at) AS t FROM cycles")
+    row = await cur.fetchone()
+    return row["t"] if row and row["t"] is not None else None

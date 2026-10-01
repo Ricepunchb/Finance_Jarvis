@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 
 from core import db, kis_domestic, kis_overseas
+from core.config import settings
 from core.kis_client import AsyncKISClient
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,8 @@ async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection
         for h in balance["holdings"] if h.get("pdno")
     }
     await db.sync_positions_from_balance(conn, held, overseas=False)
+    if settings.DOMESTIC_ONLY:
+        return  # 국내 전용: 해외 잔고는 조회하지 않고 기존 해외 positions 행도 건드리지 않는다
 
     try:
         present = await kis_overseas.get_present_balance_krw(client)
@@ -138,6 +141,9 @@ async def reconcile_unresolved_intents(
     남은 주문도 대조된다.
     """
     unresolved = await db.get_unresolved_intents(conn, min_age_sec=min_age_sec)
+    if settings.DOMESTIC_ONLY:
+        # 해외 intent는 대조하지 않는다 (조회를 안 하면 KIS 기록에 없다고 오판해 NOT_SUBMITTED로 바꿔버리기 때문)
+        unresolved = [i for i in unresolved if (i.get("market") or "domestic") != "overseas"]
     if not unresolved:
         return
 
@@ -145,11 +151,12 @@ async def reconcile_unresolved_intents(
     start = datetime.fromtimestamp(oldest, tz=KST).strftime("%Y%m%d")
     today = datetime.now(tz=KST).strftime("%Y%m%d")
     domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=start, end_date=today)
-    try:
-        overseas_rows = await kis_overseas.get_ccnl(client, start_date=start, end_date=today)
-    except Exception:
-        logger.warning("해외 체결내역 조회 실패 - 국내 intent만 대조하고 해외는 다음 재기동에 재시도")
-        overseas_rows = []
+    overseas_rows: List[Dict[str, Any]] = []
+    if not settings.DOMESTIC_ONLY:
+        try:
+            overseas_rows = await kis_overseas.get_ccnl(client, start_date=start, end_date=today)
+        except Exception:
+            logger.warning("해외 체결내역 조회 실패 - 국내 intent만 대조하고 해외는 다음 재기동에 재시도")
 
     for intent in unresolved:
         rows = overseas_rows if intent.get("market") == "overseas" else domestic_rows

@@ -128,3 +128,69 @@ def test_onboarding_skipped_on_sell_signal_in_band_or_when_daily_budget_used():
 def test_onboarding_allows_one_share_when_price_exceeds_order_cap():
     a = _decide_onboard(0.0, price=1_800_000)
     assert a.qty == 1
+
+
+# --- 포트폴리오 삭제(정리 대기): 즉시 청산이 아니라 매도 신호/기한까지 대기 ---
+
+def _decide_winddown(tech, intraday, liquidating=False, qty=10, price=100_000):
+    async def run():
+        conn = await _conn()
+        return await signal_engine.decide(
+            current_weight=0.0, target_weight=0.0, band=0.05,
+            tech_signal=tech, intraday_signal=intraday, sentiment_signal=None,
+            price=price, current_position_qty=qty, current_position_value=qty * price,
+            total_equity=352_000_000, risk=RiskManager(conn),
+            winding_down=True, winddown_liquidating=liquidating,
+        )
+    return asyncio.run(run())
+
+
+BUY = {"direction": "BUY", "strength": 1.0}
+SELL = {"direction": "SELL", "strength": 1.0}
+HOLD = {"direction": "HOLD", "strength": 0.0}
+
+
+def test_winddown_waits_while_signal_is_not_sell():
+    assert _decide_winddown(BUY, BUY) is None
+    assert _decide_winddown(HOLD, HOLD) is None
+
+
+def test_winddown_sells_all_on_sell_signal():
+    action = _decide_winddown(SELL, SELL, qty=10)
+    assert action.side == "sell" and action.qty == 10 and action.reason == "winddown_signal_sell"
+
+
+def test_winddown_liquidating_sells_even_on_buy_signal():
+    action = _decide_winddown(BUY, BUY, liquidating=True, qty=10)
+    assert action.side == "sell" and action.qty == 10 and action.reason == "winddown_liquidation"
+
+
+def test_winddown_never_buys_and_ignores_empty_position():
+    assert _decide_winddown(BUY, BUY, liquidating=True, qty=0) is None
+    assert _decide_winddown(SELL, SELL, qty=0) is None
+
+
+def test_winddown_lifecycle_in_db():
+    async def run():
+        conn = await _conn()
+        await db.add_portfolio_symbol(conn, "005930")
+        assert await db.start_symbol_winddown(conn, "005930")
+        started = (await db.get_portfolio_symbol_info(conn))["005930"]["winding_down_at"]
+        assert started is not None
+        await db.start_symbol_winddown(conn, "005930")  # 재삭제해도 기한이 연장되지 않는다
+        assert (await db.get_portfolio_symbol_info(conn))["005930"]["winding_down_at"] == started
+
+        await db.mark_winddown_sell_started(conn, "005930")
+        assert (await db.get_portfolio_symbol_info(conn))["005930"]["winddown_sell_started_at"] is not None
+
+        pid = await db.propose_target_weight(conn, "005930", 0.0, proposed_by="manual")
+        await db.decide_target_weight(conn, pid, approve=True)
+        await db.finish_symbol_removal(conn, "005930")
+        assert await db.list_portfolio_symbols(conn) == []
+        assert "005930" not in await db.get_active_target_weights(conn)
+
+        # 다시 등록하면 정리 상태가 초기화된다
+        await db.add_portfolio_symbol(conn, "005930")
+        info = (await db.get_portfolio_symbol_info(conn))["005930"]
+        assert info["winding_down_at"] is None and info["winddown_sell_started_at"] is None
+    asyncio.run(run())

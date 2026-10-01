@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from core import (
-    db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent, signal_engine,
+    analytics, db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent, signal_engine,
 )
 from core.config import settings
 from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
@@ -132,6 +132,7 @@ async def get_config():
     """UI가 리스크/LLM 설정값을 보여주기 위한 읽기전용 엔드포인트. 비밀값(API 키 원문)은 노출하지 않는다."""
     return {
         "is_mock": settings.IS_MOCK,
+        "domestic_only": settings.DOMESTIC_ONLY,
         "cycle_interval_sec": CYCLE_INTERVAL_SEC,
         "rebalance_band_pct": settings.REBALANCE_BAND_PCT,
         "max_position_pct": settings.MAX_POSITION_PCT,
@@ -160,16 +161,20 @@ async def get_config():
         "ai_rebalance_min_symbol_weight_pct": settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
         "ai_rebalance_max_portfolio_symbols": settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
         "discovery_top_n": settings.DISCOVERY_TOP_N,
+        "discovery_min_score": settings.DISCOVERY_MIN_SCORE,
         "ai_rebalance_min_interval_sec": settings.AI_REBALANCE_MIN_INTERVAL_SEC,
         "ai_rebalance_periodic_interval_days": settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS,
         "ai_rebalance_drift_trigger_buffer_pct": settings.AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT,
         "ai_rebalance_news_trigger_strength": settings.AI_REBALANCE_NEWS_TRIGGER_STRENGTH,
         "risk_free_rate_annual": settings.RISK_FREE_RATE_ANNUAL,
+        "winddown_max_days": settings.WINDDOWN_MAX_DAYS,
     }
 
 
 @app.post("/portfolio/symbols")
 async def add_symbol(req: AddSymbolRequest):
+    if settings.DOMESTIC_ONLY and req.market != "domestic":
+        raise HTTPException(status_code=400, detail="국내 전용 모드(DOMESTIC_ONLY)라 해외 종목은 등록할 수 없습니다")
     conn = await db.get_connection()
     try:
         await db.add_portfolio_symbol(conn, req.symbol, req.market, req.exchange)
@@ -185,6 +190,35 @@ async def list_symbols():
         return await db.list_portfolio_symbols(conn)
     finally:
         await conn.close()
+
+
+@app.delete("/portfolio/symbols/{symbol}")
+async def remove_symbol(symbol: str):
+    """포트폴리오에서 종목을 삭제한다. 즉시 매도하지 않는다.
+
+    보유분이 없으면 바로 제거한다. 보유분이 있으면 목표비중을 0으로 내려 신규매수를 막고
+    "정리 대기"로 표시한다 — 엔진이 매도 신호가 오거나 WINDDOWN_MAX_DAYS가 지나면 전량 매도하고,
+    잔고에서 사라진 것을 확인한 뒤 포트폴리오에서 완전히 제거한다."""
+    conn = await db.get_connection()
+    try:
+        rows = {r["symbol"]: r for r in await db.list_portfolio_symbols(conn)}
+        if symbol not in rows:
+            raise HTTPException(status_code=404, detail=f"등록된 종목이 아닙니다: {symbol}")
+        position = await db.get_position(conn, symbol)
+        # 해외 종목은 관리 중일 때만 잔고가 동기화되어 positions가 낡았을 수 있으므로 0이어도 믿지 않는다 —
+        # 정리 대기로 넘기고, 엔진이 실제 잔고를 보고 보유가 없으면 제거한다.
+        if rows[symbol]["market"] != "overseas" and (not position or float(position["qty"] or 0) <= 0):
+            await db.finish_symbol_removal(conn, symbol)
+            return {"status": "removed", "symbol": symbol}
+
+        proposal_id = await db.propose_target_weight(
+            conn, symbol, 0.0, proposed_by="manual", rationale="사용자 삭제 - 정리 대기(매도 신호 시 전량 매도)",
+        )
+        await db.decide_target_weight(conn, proposal_id, approve=True)
+        await db.start_symbol_winddown(conn, symbol)
+    finally:
+        await conn.close()
+    return {"status": "winding_down", "symbol": symbol, "qty": position["qty"] if position else None}
 
 
 @app.post("/portfolio/weights")
@@ -284,28 +318,38 @@ async def decide_weight_proposal(proposal_id: int, req: DecideProposalRequest):
 
 @app.get("/portfolio/symbol-names")
 async def get_symbol_names():
-    """등록된 국내 종목의 코드->한글종목명 매핑 (대시보드 표시용, 매매 로직과 무관).
+    """국내 종목의 코드->한글종목명 매핑 (대시보드 표시용, 매매 로직과 무관).
 
-    KIS 조회 실패 종목은 결과에서 제외되며, 프론트엔드가 코드로 폴백한다.
+    이름은 DB(종목 마스터 -> 후보 풀)에서 먼저 찾고, 거기에 없는 종목만 KIS 시세 조회로 보충한다.
+    예전엔 KIS 호출에만 의존해서, 호출이 실패하면(장외/레이트리밋/토큰) 이름이 통째로 빈칸이 됐다.
+    비활성 종목과 보유(positions) 종목도 포함한다.
     """
     conn = await db.get_connection()
     try:
-        rows = await db.list_portfolio_symbols(conn)
+        portfolio_rows = await db.list_all_portfolio_symbols(conn)
+        positions = await db.get_positions(conn)
+        master = await db.get_stock_master(conn)
+        cur = await conn.execute("SELECT symbol, name FROM candidate_universe WHERE name IS NOT NULL AND name != ''")
+        candidate_names = {r["symbol"]: r["name"] for r in await cur.fetchall()}
     finally:
         await conn.close()
 
-    domestic_symbols = [r["symbol"] for r in rows if r["market"] == "domestic"]
-    for symbol in domestic_symbols:
-        if symbol in _symbol_name_cache:
-            continue
+    wanted = {r["symbol"] for r in portfolio_rows if r["market"] == "domestic"}
+    wanted |= {sym for sym, p in positions.items() if p.get("currency") == "KRW"}
+    names: dict[str, str] = {}
+    for symbol in wanted:
+        name = (master.get(symbol) or {}).get("name") or candidate_names.get(symbol) or _symbol_name_cache.get(symbol)
+        if name:
+            names[symbol] = name
+    for symbol in wanted - names.keys():  # DB에 없는 종목(드묾)만 KIS로 보충
         try:
             price_info = await kis_domestic.get_price(engine.client, symbol)
             name = price_info.get("hts_kor_isnm")
             if name:
-                _symbol_name_cache[symbol] = name
+                _symbol_name_cache[symbol] = names[symbol] = name
         except Exception:
             pass
-    return {s: _symbol_name_cache[s] for s in domestic_symbols if s in _symbol_name_cache}
+    return names
 
 
 @app.get("/portfolio/positions")
@@ -337,6 +381,53 @@ async def recent_decisions(limit: int = 50):
         return await db.get_recent_decisions(conn, limit)
     finally:
         await conn.close()
+
+
+# --- 분석 대시보드(app.py)용 읽기 전용 조회. 계산은 core/analytics.py, 여기서는 얇게 감싼다. ---
+
+async def _with_conn(fn, *args, **kwargs):
+    conn = await db.get_connection()
+    try:
+        return await fn(conn, *args, **kwargs)
+    finally:
+        await conn.close()
+
+
+@app.get("/analytics/overview")
+async def analytics_overview(days: int = 30, refresh: bool = False, fetch_prices: bool = True):
+    """성과 오버뷰: KPI + 종목별 요약 + 날짜별 포트폴리오 + 종목x날짜 행렬.
+    refresh=true면 일봉 캐시를 무시하고 KIS에서 다시 받는다 (모의계좌는 1 req/s라 오래 걸릴 수 있음)."""
+    return await _with_conn(analytics.build_overview, engine.client, days=days, refresh=refresh, fetch_prices=fetch_prices)
+
+
+@app.get("/analytics/realized")
+async def analytics_realized(start: str, end: str, symbol: Optional[str] = None):
+    return await _with_conn(analytics.build_realized, start, end, symbol)
+
+
+@app.get("/analytics/prices")
+async def analytics_prices(symbol: str, interval: str = "1d", days: int = 60):
+    if interval not in ("1d", "30m"):
+        raise HTTPException(status_code=422, detail="interval은 1d 또는 30m 입니다")
+    return await _with_conn(analytics.get_prices, engine.client, symbol, interval, days)
+
+
+@app.get("/analytics/decisions")
+async def analytics_decisions(start: str, end: str, symbol: Optional[str] = None, include_noop: bool = False):
+    return await _with_conn(analytics.list_decisions, symbol, start, end, include_noop)
+
+
+@app.get("/analytics/decisions/{decision_id}")
+async def analytics_decision_detail(decision_id: int):
+    row = await _with_conn(analytics.get_decision_detail, decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="해당 결정 기록이 없습니다")
+    return row
+
+
+@app.get("/analytics/rebalance-history")
+async def analytics_rebalance_history(limit: int = 50, with_returns: bool = False):
+    return await _with_conn(analytics.build_rebalance_history, engine.client, limit=limit, with_returns=with_returns)
 
 
 @app.post("/discovery/seed")
@@ -432,6 +523,7 @@ async def get_discovery_shortlist():
         "scored_count": len(entries),
         "shortlist": discovery_signals.select_with_quota(
             entries, settings.DISCOVERY_TOP_N, settings.DISCOVERY_ANGLE_QUOTA, exclude=held,
+            min_score=settings.DISCOVERY_MIN_SCORE,
         ),
     }
 

@@ -108,7 +108,7 @@ class TradingEngine:
 
         self.ws_client = KISWebSocketClient(
             hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
-            include_overseas=True,
+            include_overseas=not settings.DOMESTIC_ONLY,
         )
         await self.ws_client.start()
 
@@ -168,19 +168,20 @@ class TradingEngine:
         except Exception:
             logger.exception("긴급정지 중 국내 미체결주문 취소 실패 — 수동 확인 필요")
 
-        try:
-            today = datetime.now(tz=KST).strftime("%Y%m%d")
-            ccnl_rows = await kis_overseas.get_ccnl(self.client, start_date=today, end_date=today)
-            for row in ccnl_rows:
-                nccs_qty = float(row.get("nccs_qty") or 0)  # 미체결수량
-                if nccs_qty <= 0:
-                    continue
-                await kis_overseas.cancel_order(
-                    self.client, row.get("ovrs_excg_cd"), row.get("pdno"), row.get("odno"),
-                    int(nccs_qty), float(row.get("ft_ord_unpr3") or 0),
-                )
-        except Exception:
-            logger.exception("긴급정지 중 해외 미체결주문 취소 실패 — 수동 확인 필요")
+        if not settings.DOMESTIC_ONLY:
+            try:
+                today = datetime.now(tz=KST).strftime("%Y%m%d")
+                ccnl_rows = await kis_overseas.get_ccnl(self.client, start_date=today, end_date=today)
+                for row in ccnl_rows:
+                    nccs_qty = float(row.get("nccs_qty") or 0)  # 미체결수량
+                    if nccs_qty <= 0:
+                        continue
+                    await kis_overseas.cancel_order(
+                        self.client, row.get("ovrs_excg_cd"), row.get("pdno"), row.get("odno"),
+                        int(nccs_qty), float(row.get("ft_ord_unpr3") or 0),
+                    )
+            except Exception:
+                logger.exception("긴급정지 중 해외 미체결주문 취소 실패 — 수동 확인 필요")
         await self.stop()
 
     async def _on_any_ws_message(self) -> None:
@@ -237,8 +238,9 @@ class TradingEngine:
 
     async def _run_one_cycle(self) -> None:
         assert self.conn is not None and self.risk is not None
-        if not (_is_krx_open_now() or _is_us_market_open_now()):
-            return  # 국내/미국 둘 다 닫혀있으면 이번 사이클은 아예 건너뛴다 (불필요한 API 호출 방지)
+        us_open = (not settings.DOMESTIC_ONLY) and _is_us_market_open_now()
+        if not (_is_krx_open_now() or us_open):
+            return  # 거래 대상 시장이 모두 닫혀있으면 이번 사이클은 아예 건너뛴다 (불필요한 API 호출 방지)
         if await self.risk.is_kill_switch_active():
             return
 
@@ -270,7 +272,8 @@ class TradingEngine:
         # 관리 중인 종목 중 해외가 하나라도 있을 때만 해외 잔고를 조회한다 (국내전용 사용자는
         # Phase 1/2 때와 동일하게 이 호출이 아예 발생하지 않는다).
         overseas_holdings_by_symbol: dict = {}
-        if any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
+        overseas_balance_ok = False
+        if not settings.DOMESTIC_ONLY and any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
             try:
                 present = await kis_overseas.get_present_balance_krw(self.client)
                 overseas_holdings_by_symbol = {h["pdno"]: h for h in present["holdings"] if h.get("pdno")}
@@ -281,6 +284,7 @@ class TradingEngine:
                      for s, h in overseas_holdings_by_symbol.items()},
                     overseas=True,
                 )
+                overseas_balance_ok = True
             except Exception:
                 logger.exception("해외 잔고조회 실패 - 이번 사이클은 해외 종목 처리를 건너뜀")
 
@@ -291,12 +295,25 @@ class TradingEngine:
             market = info.get("market") or "domestic"
             exchange = info.get("exchange")
 
+            if settings.DOMESTIC_ONLY and market == "overseas":
+                continue  # 국내 전용: 해외 종목은 매매·정리 모두 건너뛴다 (DB의 종목/이력은 그대로 둔다)
             if not _is_market_open(market, exchange):
                 continue  # 이 종목이 속한 시장이 지금 닫혀있음 - 매 사이클 로그가 쌓이지 않게 조용히 스킵
 
-            if active_weights[symbol] <= 0:
+            # 정리 대기(사용자가 삭제한 종목): None=해당없음, False=매도 신호 대기, True=끝까지 청산.
+            winddown_liquidating: Optional[bool] = None
+            if info.get("winding_down_at"):
+                winddown_liquidating = bool(info.get("winddown_sell_started_at")) or (
+                    time.time() - info["winding_down_at"] >= settings.WINDDOWN_MAX_DAYS * 86400
+                )
+
+            if active_weights[symbol] <= 0 or winddown_liquidating is not None:
                 held = holdings_by_symbol.get(symbol) if market != "overseas" else overseas_holdings_by_symbol.get(symbol)
                 if not held or float(held.get("hldg_qty") or held.get("cblc_qty13") or 0) <= 0:
+                    if winddown_liquidating is not None and (market != "overseas" or overseas_balance_ok):
+                        # 잔고 조회가 성공했는데 보유가 없다 — 정리 완료, 포트폴리오에서 완전히 제거한다.
+                        await db.finish_symbol_removal(self.conn, symbol)
+                        logger.info(f"'{symbol}' 정리 완료 - 포트폴리오에서 제거")
                     continue  # 제외 종목이고 잔여 보유도 없음 — 청산 완료, 매매 루프에서 빠진다(발굴/후보 쪽에서만 관찰)
 
             try:
@@ -304,12 +321,13 @@ class TradingEngine:
                     await self._process_overseas_symbol(
                         cycle_id, symbol, exchange, active_weights[symbol],
                         overseas_holdings_by_symbol.get(symbol), total_equity, ws_ok,
+                        winddown_liquidating=winddown_liquidating,
                     )
                 else:
                     domestic_symbol_count += 1
                     halted = await self._process_symbol(
                         cycle_id, symbol, active_weights[symbol], holdings_by_symbol.get(symbol),
-                        total_equity, ws_ok,
+                        total_equity, ws_ok, winddown_liquidating=winddown_liquidating,
                     )
                     if halted:
                         halted_count += 1
@@ -372,7 +390,7 @@ class TradingEngine:
 
     async def _process_symbol(
         self, cycle_id: int, symbol: str, target_weight: float, holding: Optional[dict],
-        total_equity: float, ws_ok: bool,
+        total_equity: float, ws_ok: bool, winddown_liquidating: Optional[bool] = None,
     ) -> bool:
         """반환값: 이 종목이 VI/거래정지 상태였는지 (시장전체 이상 감지용)."""
         assert self.conn is not None and self.risk is not None
@@ -489,12 +507,15 @@ class TradingEngine:
             current_position_value=position_value,
             total_equity=total_equity,
             risk=self.risk,
+            winding_down=winddown_liquidating is not None,
+            winddown_liquidating=bool(winddown_liquidating),
         )
 
         if action is None:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
-                f"조건 미충족 (tech={tech_signal}, intraday={intraday_signal}, "
+                ("정리 대기 - 매도 신호 대기 중 " if winddown_liquidating is not None else "조건 미충족 ")
+                + f"(tech={tech_signal}, intraday={intraday_signal}, "
                 f"sentiment={sentiment_signal}, valuation={valuation_signal})",
                 context,
             )
@@ -542,6 +563,8 @@ class TradingEngine:
             )
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            if winddown_liquidating is not None:
+                await db.mark_winddown_sell_started(self.conn, symbol)
         except KisApiError as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()
@@ -601,6 +624,7 @@ class TradingEngine:
     async def _process_overseas_symbol(
         self, cycle_id: int, symbol: str, exchange: str, target_weight: float,
         holding: Optional[dict], total_equity: float, ws_ok: bool,
+        winddown_liquidating: Optional[bool] = None,
     ) -> None:
         """해외주식 처리 (현재 미국 NASD/NYSE/AMEX만 실증). VI 개념이 없어 국내와 달리
         halted 반환이 없다 — 시장전체 이상 감지는 국내 종목 수만으로 판단한다."""
@@ -718,12 +742,15 @@ class TradingEngine:
             current_position_value=position_value,
             total_equity=total_equity,
             risk=self.risk,
+            winding_down=winddown_liquidating is not None,
+            winddown_liquidating=bool(winddown_liquidating),
         )
 
         if action is None:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
-                f"조건 미충족 (tech={tech_signal}, intraday={intraday_signal}, sentiment={sentiment_signal})",
+                ("정리 대기 - 매도 신호 대기 중 " if winddown_liquidating is not None else "조건 미충족 ")
+                + f"(tech={tech_signal}, intraday={intraday_signal}, sentiment={sentiment_signal})",
                 context,
             )
             return
@@ -763,6 +790,8 @@ class TradingEngine:
             )
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            if winddown_liquidating is not None:
+                await db.mark_winddown_sell_started(self.conn, symbol)
         except KisApiError as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()

@@ -4,11 +4,12 @@
 시그널이 매매 방향/타이밍의 주 동력이고, 목표비중 밴드는 과대비중을 강제로
 줄이는 보조 리스크 상한으로만 쓰인다. 여기에 뉴스 LLM 감성분석과 (선택) 펀더멘털
 밸류에이션 시그널을 결합하고, 개별 포지션 손절/트레일링익절이 항상 최우선으로
-평가된다. 국내주식·미국주식(NASD/NYSE/AMEX) 지원. 기본은 모의투자.
+평가된다. 국내주식·ETF 기본(`DOMESTIC_ONLY=True`), 미국주식(NASD/NYSE/AMEX)은 `DOMESTIC_ONLY=False`로 켠다. 기본은 모의투자.
 
-`app.py`는 별개의 개인용 리서치 도구(yfinance 기반 종목 스캐너/뉴스 감성분석,
-`my_portfolio.json` 워치리스트 사용)이며 KIS 자동매매와는 무관하다. KIS 자동매매는
-Streamlit의 좌측 페이지 메뉴 중 **"1 KIS 자동매매"**에서 별도로 동작한다.
+Streamlit 화면은 둘로 나뉜다. **`app.py`(홈)는 매매 복기·분석 대시보드**(읽기 전용)로,
+쌓인 체결·판단·리밸런싱 기록을 성과 오버뷰(종목별/날짜별/종목×날짜) · 매매 달력 ·
+의사결정 복기 · 리밸런싱 이력으로 보여준다. 주문·설정 조작은 좌측 페이지 메뉴의
+**"1 KIS 자동매매"**에서 한다.
 
 ## 빠른 시작
 
@@ -24,8 +25,13 @@ Streamlit의 좌측 페이지 메뉴 중 **"1 KIS 자동매매"**에서 별도�
    ```
    uv run streamlit run app.py
    ```
-   브라우저에서 열리면 좌측 메뉴 → **"1 KIS 자동매매"** 클릭.
+   홈(`app.py`)이 분석 대시보드이고, 브라우저 좌측 메뉴 → **"1 KIS 자동매매"**에서 엔진을 조작한다.
+   분석 대시보드는 `/analytics/*` 엔드포인트를 쓰므로 API 서버를 코드 변경 후 재시작해야 반영된다.
 5. 대시보드에서: 종목 등록 → 목표 비중 설정(수동 또는 LLM 제안 후 승인) → **▶️ 시작**.
+
+분석 대시보드의 손익은 `fills`(수수료·세금 미반영)와 `decision_log`에서 계산한다.
+체결 기록이 없는 과거 매도는 판단 시점 가격으로 추정하고(UI에 '추정' 표시), 해외 종목은
+미국 현지 거래일·원화 환산 기준이다. 테스트: `uv run pytest`.
 
 **실전투자 전환 주의**: `.env`의 `IS_MOCK=False`만으로는 실거래가 시작되지 않는다.
 `I_UNDERSTAND_REAL_MONEY_RISK=true`까지 명시적으로 같이 설정해야 하는 이중 안전장치가
@@ -37,7 +43,7 @@ Streamlit의 좌측 페이지 메뉴 중 **"1 KIS 자동매매"**에서 별도�
 ### 아키텍처
 
 ```
-Streamlit (pages/1_KIS_자동매매.py)   ← thin client, 엔진 로직 없음
+Streamlit: app.py + ui/ (분석, 읽기 전용) / pages/1_KIS_자동매매.py (조작)   ← thin client, 엔진 로직 없음
         │  HTTP 폴링
         ▼
 FastAPI 제어 플레인 (api/main.py, :8800)
@@ -54,6 +60,11 @@ TradingEngine (core/engine.py)  — 30분마다 한 사이클, 등록된 전 종
         ├─ core/risk.py           — 쿨다운/일일손실한도/VI게이트/WS staleness/kill switch
         ├─ core/kis_domestic.py, core/kis_overseas.py — 국내/해외 KIS REST 래퍼
         └─ core/db.py             — SQLite(data/jarvis.db)에 전부 기록 (크래시 복구 근거)
+
+분석 대시보드용 (매매 판단에는 관여하지 않음, 읽기 전용):
+        ├─ core/analytics.py      — /analytics/* 가 호출하는 조회 오케스트레이션
+        ├─ core/pnl.py            — 실현손익(이동평균단가)·일별 평가손익·종목×날짜 행렬 (순수 함수)
+        └─ core/daily_prices.py   — KIS 일봉 종가 캐시(daily_bars), 실패 시 30분봉 캐시로 폴백
 ```
 
 ### 매매 판단: 스윙 시그널이 방향을, 밴드는 상한만 정한다
@@ -132,6 +143,7 @@ TradingEngine (core/engine.py)  — 30분마다 한 사이클, 등록된 전 종
 
 | 항목 | 기본값 | 설명 |
 |---|---|---|
+| 국내 전용 기본 | `DOMESTIC_ONLY=True` | 해외 종목은 등록 거부, 엔진·재조정·일봉 조회에서 해외 KIS 호출을 하지 않음 (DB의 해외 이력은 보존) |
 | 모의투자 기본 | `IS_MOCK=True` | 실거래는 `I_UNDERSTAND_REAL_MONEY_RISK=true`까지 있어야 진입 |
 | 모니터링/매매 윈도우 | 30분 | 종목당 사이클 주기 (`CYCLE_INTERVAL_SEC`) |
 | 재주문 쿨다운 | 30분 | 동일 종목 재주문 최소 간격 (`ORDER_COOLDOWN_SEC`, 손절/익절은 우회) |
