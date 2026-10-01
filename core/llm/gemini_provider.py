@@ -184,6 +184,8 @@ class GeminiProvider(LLMProvider):
         candidate_pool: List[Dict[str, Any]],
         macro_context: Optional[str],
         max_symbols: int,
+        min_weight: float,
+        max_weight: float,
     ) -> Dict[str, Any]:
         current_weights = {p["symbol"]: p["weight"] for p in current_positions}
         candidate_symbols = {c["symbol"] for c in candidate_pool}
@@ -249,7 +251,11 @@ class GeminiProvider(LLMProvider):
             f"[제약] 최종 포트폴리오 종목 수는 최대 {max_symbols}개. weights의 키는 반드시 "
             "현재 포트폴리오 종목코드 또는 후보 종목코드와 정확히 일치해야 하고, 값의 합은 "
             "1.0을 넘으면 안 된다 (전액을 다 투자할 필요는 없다 - 확신이 부족하면 나머지는 "
-            "현금으로 남겨두는 것이 안전하다)."
+            "현금으로 남겨두는 것이 안전하다).\n"
+            f"[비중 범위] 보유할 종목(비중>0)의 비중은 반드시 {min_weight:.0%} 이상 {max_weight:.0%} 이하여야 한다. "
+            f"이 범위를 벗어난 종목이 하나라도 있으면 제안 전체가 폐기된다. '최소 비중'으로 담으려면 "
+            f"{min_weight:.0%}를 쓰고, 그 이하로 담을 만큼의 확신이면 adds에 넣지 마라. "
+            "제외하려는 종목은 removes에 넣고 비중을 0으로 둔다."
         )
         prompt = "\n".join(lines)
 

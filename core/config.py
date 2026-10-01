@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     AI_REBALANCE_MAX_SYMBOLS_REMOVED: int = 2
     AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT: float = 0.03
     AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS: int = 20
+    AI_REBALANCE_REMOVED_COOLDOWN_DAYS: int = 30       # 삭제한 종목을 신규 편입 후보에서 제외하는 기간
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지

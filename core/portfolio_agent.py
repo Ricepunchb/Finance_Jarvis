@@ -132,8 +132,12 @@ async def propose_rebalance(
     candidate_pool: List[Dict[str, Any]] = []
     if client is not None:
         try:
+            # 사용자가 삭제한 종목이 동적 발굴로 되살아나 재편입 제안되지 않도록 쿨다운 동안 제외한다.
+            recently_removed = await db.list_recently_removed_symbols(
+                conn, settings.AI_REBALANCE_REMOVED_COOLDOWN_DAYS
+            )
             candidate_pool = await discovery.screen_candidates(
-                conn, client, exclude_symbols=symbols, benchmark_returns=benchmark_returns,
+                conn, client, exclude_symbols=symbols + recently_removed, benchmark_returns=benchmark_returns,
             )
         except Exception:
             logger.exception("후보종목 스크리닝 실패 - 발굴 없이 재비중만 제안")
@@ -147,6 +151,8 @@ async def propose_rebalance(
         candidate_pool=candidate_pool,
         macro_context=macro_context,
         max_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
+        min_weight=settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
+        max_weight=settings.MAX_POSITION_PCT,
     )
 
     if result.get("degraded"):

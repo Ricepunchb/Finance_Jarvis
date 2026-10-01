@@ -352,6 +352,18 @@ async def finish_symbol_removal(conn: aiosqlite.Connection, symbol: str) -> None
     await conn.commit()
 
 
+async def list_recently_removed_symbols(conn: aiosqlite.Connection, within_days: int) -> List[str]:
+    """최근 within_days일 안에 포트폴리오에서 제거(비활성화)된 종목코드. 삭제한 종목이 발굴
+    후보로 되살아나 AI가 다시 편입 제안하는 것을 막는 데 쓴다. 재등록하면 disabled_at이
+    NULL로 돌아가므로 다시 담은 종목은 포함되지 않는다."""
+    cutoff = time.time() - within_days * 86400
+    cur = await conn.execute(
+        "SELECT symbol FROM portfolio_symbols WHERE enabled = 0 AND disabled_at IS NOT NULL AND disabled_at >= ?",
+        (cutoff,),
+    )
+    return [row["symbol"] for row in await cur.fetchall()]
+
+
 async def list_portfolio_symbols(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
     cur = await conn.execute("SELECT * FROM portfolio_symbols WHERE enabled = 1")
     rows = await cur.fetchall()

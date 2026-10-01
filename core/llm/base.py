@@ -40,6 +40,8 @@ class LLMProvider(ABC):
         candidate_pool: List[Dict[str, Any]],
         macro_context: Optional[str],
         max_symbols: int,
+        min_weight: float,
+        max_weight: float,
     ) -> Dict[str, Any]:
         """현재 포트폴리오 맥락(비중/손익/시그널)과 후보종목 숏리스트를 근거로 리밸런싱을
         제안한다 (사용자 승인 전까지는 활성화되지 않음). candidate_pool이 비어 있으면
@@ -52,6 +54,8 @@ class LLMProvider(ABC):
                 종목은 절대 adds에 포함시키면 안 된다는 것을 프롬프트에 명시해야 한다.
             macro_context: 선택적 자유 텍스트(거시 이벤트 등). 없으면 None.
             max_symbols: 최종 포트폴리오가 넘지 말아야 할 종목 수 상한.
+            min_weight/max_weight: 보유(비중>0) 종목 1개당 허용 비중 범위. 어기면 제안 전체가
+                반려되므로 프롬프트에 명시해야 한다 (비중 0 = 제외는 예외).
 
         Returns:
             {
