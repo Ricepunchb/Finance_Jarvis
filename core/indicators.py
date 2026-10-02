@@ -75,10 +75,15 @@ def chart_rows_to_dataframe_overseas(rows: List[Dict[str, Any]]) -> pd.DataFrame
 
 
 def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
-    """RSI/MACD/볼린저밴드를 종합해 -1.0(강한 매도)~+1.0(강한 매수) 점수를 낸다.
+    """RSI/MACD/볼린저밴드 및 이동평균 추세를 종합해 -1.0(강한 매도)~+1.0(강한 매수) 점수를 낸다.
 
-    세 지표 모두 이분법 투표가 아니라 연속값으로 -1.0~+1.0 사이를 매끄럽게 움직이는
-    "부분 투표"를 반환한다.
+    단순 평균회귀(역추세)에 치우쳐 강한 상승장에서 주도주를 조기 매도하거나 하락장에서
+    물타기하는 한계를 극복하기 위해, 이동평균선(SMA20/SMA60) 기반의 추세 국면(Trend Regime)을
+    반영합니다:
+    - 상승 추세(Uptrend): RSI 50~75를 모멘텀 매수(+0.6), 40~50을 눌림목 매수(+0.9)로 해석하며,
+      볼린저 밴드 상단 돌파(%B >= 0.8)를 '밴드 워킹 추세 지속(+0.8)'으로 인정.
+    - 하락 추세(Downtrend): 반등 시 매도(-1.0), 과매도(<30)에서도 추가 하락 위험 경계(-0.2).
+    - 횡보/중립: 기존의 부드러운 연속값 평균회귀 점수 유지.
     """
     if len(df) < MIN_BARS_REQUIRED:
         return {"direction": "HOLD", "strength": 0.0, "detail": "데이터 부족"}
@@ -88,16 +93,45 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     work.ta.macd(fast=12, slow=26, signal=9, append=True)
     work.ta.bbands(length=20, std=2, append=True)
     last = work.iloc[-1]
+    close = float(last["close"])
+
+    if len(work) >= 60:
+        sma20 = float(work["close"].rolling(20).mean().iloc[-1])
+        sma60 = float(work["close"].rolling(60).mean().iloc[-1])
+        is_uptrend = (sma20 >= sma60)
+        is_downtrend = (sma20 < sma60) and (close < sma20)
+    else:
+        is_uptrend = False
+        is_downtrend = False
 
     votes: List[float] = []
 
+    # 1. RSI
     rsi_col = _first_matching_column(work, "RSI_")
     if rsi_col and pd.notna(last.get(rsi_col)):
-        rsi = last[rsi_col]
-        # 50=중립, 30/70에서 과거와 동일하게 ±1.0로 포화되는 선형 보간
-        vote_rsi = (50.0 - rsi) / 20.0
+        rsi = float(last[rsi_col])
+        if is_uptrend:
+            if rsi >= 80.0:
+                vote_rsi = -0.5  # 극단적 과열 시에만 완만한 경고
+            elif rsi >= 50.0:
+                vote_rsi = 0.6   # 강세 모멘텀 지속
+            elif rsi >= 40.0:
+                vote_rsi = 0.9   # 추세 내 최적의 눌림목 매수
+            else:
+                vote_rsi = 0.2
+        elif is_downtrend:
+            if rsi < 30.0:
+                vote_rsi = -0.2  # 하락장 과매도는 하락 지속 위험 (물타기 금지)
+            elif rsi > 40.0:
+                vote_rsi = -1.0  # 하락장 반등 시 강력 매도
+            else:
+                vote_rsi = -0.6
+        else:
+            # 횡보/중립: 50=중립, 30/70에서 ±1.0 선형 보간
+            vote_rsi = (50.0 - rsi) / 20.0
         votes.append(max(-1.0, min(1.0, vote_rsi)))
 
+    # 2. MACD
     macd_col = _first_matching_column(work, "MACD_")
     macd_sig_col = _first_matching_column(work, "MACDs_")
     if macd_col and macd_sig_col and pd.notna(last.get(macd_col)) and pd.notna(last.get(macd_sig_col)):
@@ -112,16 +146,37 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
             vote_macd = 1.0 if macd > macd_signal else -1.0
         votes.append(vote_macd)
 
+    # 3. 볼린저 밴드
     bb_lower_col = _first_matching_column(work, "BBL_")
     bb_upper_col = _first_matching_column(work, "BBU_")
     if bb_lower_col and bb_upper_col and pd.notna(last.get(bb_lower_col)) and pd.notna(last.get(bb_upper_col)):
         bb_lower = last[bb_lower_col]
         bb_upper = last[bb_upper_col]
-        close = last["close"]
         if bb_upper > bb_lower:
             percent_b = (close - bb_lower) / (bb_upper - bb_lower)
-            vote_bb = 1.0 - 2.0 * percent_b
+            if is_uptrend:
+                if percent_b >= 0.8:
+                    vote_bb = 0.8  # 상승장 상단 돌파는 강력한 모멘텀 (Band Walking)
+                elif percent_b <= 0.3:
+                    vote_bb = 1.0  # 밴드 하단 터치는 매수 기회
+                else:
+                    vote_bb = 0.4
+            elif is_downtrend:
+                if percent_b <= 0.2:
+                    vote_bb = -0.8  # 하락장 밴드 하단 이탈은 추가 하락 가속
+                elif percent_b >= 0.6:
+                    vote_bb = -1.0  # 하락장 밴드 반등 시 강력 매도
+                else:
+                    vote_bb = -0.5
+            else:
+                vote_bb = 1.0 - 2.0 * percent_b
             votes.append(max(-1.0, min(1.0, vote_bb)))
+
+    # 4. 추세 국면 팩터 가산/감산
+    if is_uptrend:
+        votes.append(0.8)
+    elif is_downtrend:
+        votes.append(-0.8)
 
     score = sum(votes) / len(votes) if votes else 0.0
     direction = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"

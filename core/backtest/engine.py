@@ -164,11 +164,17 @@ class BacktestEngine:
         return df[df["date"] <= pd.to_datetime(cur_date)].copy()
 
     def _evaluate_exits(self, cur_date: str) -> None:
-        """손절(-7%)과 ATR 트레일링 익절을 평가하여 트리거 시 당일 청산."""
+        """손절(-7%)과 ATR 트레일링 익절을 평가하여 트리거 시 당일 청산.
+        
+        상승 추세(is_uptrend) 종목은 노이즈로 털리지 않도록 트레일링 여유폭을 확대하고,
+        50% 분할 익절(Scale-Out)을 적용하여 잔여 수량으로 랠리를 끝까지 추종합니다.
+        """
         symbols_held = list(self.positions.keys())
 
         for symbol in symbols_held:
-            pos = self.positions[symbol]
+            pos = self.positions.get(symbol)
+            if not pos:
+                continue
             bar = self._get_bar_at(symbol, cur_date)
             if bar is None:
                 continue
@@ -178,8 +184,15 @@ class BacktestEngine:
             open_p = float(bar["open"])
             close_p = float(bar["close"])
 
-            # ATR 계산을 위한 슬라이스
+            # 이동평균 및 ATR 계산을 위한 슬라이스
             hist = self._get_historical_slice(symbol, cur_date)
+            if len(hist) >= 60:
+                sma20 = hist["close"].rolling(20).mean().iloc[-1]
+                sma60 = hist["close"].rolling(60).mean().iloc[-1]
+                is_uptrend = (sma20 >= sma60)
+            else:
+                is_uptrend = False
+
             atr_pct = None
             if len(hist) >= 15:
                 tr = pd.concat([
@@ -194,7 +207,7 @@ class BacktestEngine:
             # 고점 갱신 (당일 장중 고가 반영)
             pos.peak_price = max(pos.peak_price, high)
 
-            # 1. 손절 체크: 장중 최저가가 평단 대비 -7% 도달 여부
+            # 1. 손절 체크: 장중 최저가가 평단 대비 -7% 도달 여부 (전량 청산)
             if (low - pos.avg_price) / pos.avg_price <= -self.stop_loss_pct:
                 exec_price = min(open_p, pos.avg_price * (1.0 - self.stop_loss_pct))
                 exec_price = max(exec_price, low)
@@ -202,14 +215,18 @@ class BacktestEngine:
                 continue
 
             # 2. 트레일링 익절 체크
-            trail_pct, arm_pct = exit_guard.trailing_params(atr_pct)
+            trail_pct, arm_pct = exit_guard.trailing_params(atr_pct, is_uptrend=is_uptrend)
             peak = max(pos.peak_price, pos.avg_price)
             if (peak - pos.avg_price) / pos.avg_price >= arm_pct:
                 # 고점 대비 하락 여부
                 if (low - peak) / peak <= -trail_pct:
                     exec_price = peak * (1.0 - trail_pct)
                     exec_price = max(exec_price, low)
-                    self._execute_sell(symbol, pos.qty, exec_price, cur_date, "TRAILING_TAKE_PROFIT")
+                    # 상승 추세에서는 50% 분할 익절, 그 외에는 전량 익절
+                    sell_qty = pos.qty if not is_uptrend else max(1.0, float(int(pos.qty * 0.5)))
+                    self._execute_sell(symbol, sell_qty, exec_price, cur_date, "TRAILING_TAKE_PROFIT")
+                    if symbol in self.positions:
+                        self.positions[symbol].peak_price = close_p
                     continue
 
     def _evaluate_signals_and_weights(self, cur_date: str) -> None:
@@ -233,8 +250,22 @@ class BacktestEngine:
             cur_weight = cur_pos_val / cur_total_equity
             target_weight = self.target_weights.get(symbol, 0.0)
 
-            # 1. 밴드 상한 강제 축소 (목표비중 + 5% + 5% 초과)
-            band_ceiling = target_weight + settings.REBALANCE_BAND_PCT + signal_engine.BAND_CEILING_BUFFER_PCT
+            hist = self._get_historical_slice(symbol, cur_date)
+            if len(hist) < indicators.MIN_BARS_REQUIRED:
+                continue
+
+            if len(hist) >= 60:
+                sma20 = hist["close"].rolling(20).mean().iloc[-1]
+                sma60 = hist["close"].rolling(60).mean().iloc[-1]
+                is_uptrend = (sma20 >= sma60)
+                is_downtrend = (sma20 < sma60) and (close_p < sma20)
+            else:
+                is_uptrend = False
+                is_downtrend = False
+
+            # 1. 밴드 상한 강제 축소 (상승 추세 시 버퍼 여유 부여)
+            buffer_pct = signal_engine.BAND_CEILING_BUFFER_PCT * (2.0 if is_uptrend else 1.0)
+            band_ceiling = target_weight + settings.REBALANCE_BAND_PCT + buffer_pct
             if cur_weight > band_ceiling and cur_qty > 0:
                 excess_val = (cur_weight - (target_weight + settings.REBALANCE_BAND_PCT)) * cur_total_equity
                 trim_qty = min(cur_qty, float(int(excess_val / close_p)))
@@ -243,18 +274,14 @@ class BacktestEngine:
                     continue
 
             # 2. 기술적 지표 시그널 산출
-            hist = self._get_historical_slice(symbol, cur_date)
-            if len(hist) < indicators.MIN_BARS_REQUIRED:
-                continue
-
             tech_sig = indicators.compute_technical_signal(hist)
             combined = signal_engine.combine_signals(tech_sig, None, None, None)
             direction = combined.get("direction", "HOLD")
             strength = float(combined.get("strength", 0.0))
 
-            # 3. 분할 온보딩 매수 (저비중/신규 종목의 점진적 채우기)
+            # 3. 분할 온보딩 매수 (하락 추세 종목은 물타기 방지를 위해 유예)
             if settings.ONBOARDING_ENABLED and target_weight > 0 and cur_weight < (target_weight - settings.REBALANCE_BAND_PCT):
-                if direction != "SELL":
+                if direction != "SELL" and not is_downtrend:
                     gap_val = (target_weight - cur_weight) * cur_total_equity
                     daily_budget = (target_weight * cur_total_equity) / max(1, self.onboarding_days)
                     buy_val = min(gap_val, daily_budget, self.max_order_notional)

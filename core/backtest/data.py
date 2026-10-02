@@ -55,12 +55,24 @@ class HistoricalDataManager:
         else:
             first_cached = min(cached_dates)
             last_cached = max(cached_dates)
-            if first_cached > fetch_start or last_cached < end_date:
+            first_dt = datetime.strptime(first_cached, "%Y-%m-%d")
+            fetch_start_dt = datetime.strptime(fetch_start, "%Y-%m-%d")
+            last_dt = datetime.strptime(last_cached, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            # 주말/휴일로 인한 최대 4일 이내의 미세 차이는 기존 캐시로 충분
+            if (first_dt - fetch_start_dt).days > 4 or (end_dt - last_dt).days > 4:
                 need_fetch = True
 
         if need_fetch and self.client is not None:
-            await self._fetch_and_cache(symbol, market, exchange, fetch_start, end_date)
+            try:
+                await self._fetch_and_cache(symbol, market, exchange, fetch_start, end_date)
+            except Exception as e:
+                logger.warning("과거 데이터 수집 실패로 기존 캐시를 유지합니다 %s: %s", symbol, e)
             cached = await db.get_backtest_bars(self.conn, symbol, market, fetch_start, end_date)
+
+        if not cached:
+            # fetch_start 기준 캐시가 없더라도 해당 종목의 전체 캐시가 있으면 그것이라도 사용
+            cached = await db.get_backtest_bars(self.conn, symbol, market, start_date, end_date)
 
         if not cached:
             return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])

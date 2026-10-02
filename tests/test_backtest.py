@@ -197,3 +197,82 @@ def test_backtest_runner_integration(tmp_path, monkeypatch):
             await conn.close()
 
     asyncio.run(run())
+
+
+def test_trend_aware_signal_computation():
+    """상승 추세(Uptrend) 및 하락 추세(Downtrend)에서 지표 방향성 검증."""
+    from core.indicators import compute_technical_signal
+
+    dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(70)]
+    
+    # 강한 상승 추세: 매일 +1% 상승
+    df_up = _create_synthetic_ohlcv(dates, 50000.0, trend=0.01)
+    sig_up = compute_technical_signal(df_up)
+    assert sig_up["direction"] == "BUY"
+    assert sig_up["strength"] > 0.5
+
+    # 강한 하락 추세: 매일 -1% 하락
+    df_down = _create_synthetic_ohlcv(dates, 100000.0, trend=-0.01)
+    sig_down = compute_technical_signal(df_down)
+    assert sig_down["direction"] == "SELL"
+
+
+def test_partial_trailing_take_profit_uptrend():
+    """상승 추세 종목에서 트레일링 익절 발동 시 50% 분할 청산 검증."""
+    dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(90)]
+    rows = []
+    p = 100000.0
+    for i, d in enumerate(dates):
+        if i <= 65:
+            p *= 1.015  # 지속적 상승 추세
+            rows.append({
+                "date": pd.to_datetime(d),
+                "open": p * 0.99,
+                "high": p * 1.01,
+                "low": p * 0.99,
+                "close": p,
+                "volume": 10000.0,
+            })
+        elif i == 66:
+            p *= 0.82  # 고점 대비 -18% 급락 (상승 추세 트레일링 트리거, len >= 60 성립)
+            rows.append({
+                "date": pd.to_datetime(d),
+                "open": p * 1.01,
+                "high": p * 1.01,
+                "low": p * 0.98,
+                "close": p,
+                "volume": 10000.0,
+            })
+        else:
+            rows.append({
+                "date": pd.to_datetime(d),
+                "open": p,
+                "high": p * 1.01,
+                "low": p * 0.99,
+                "close": p,
+                "volume": 10000.0,
+            })
+
+    df = pd.DataFrame(rows)
+    data = {"005930": df}
+
+    engine = BacktestEngine(
+        symbols=["005930"],
+        data_by_symbol=data,
+        initial_cash=10_000_000.0,
+    )
+    # 초기 100주 보유 상태로 시작
+    engine.positions["005930"] = Position(
+        symbol="005930",
+        qty=100.0,
+        avg_price=100000.0,
+        peak_price=100000.0,
+        entry_date="2025-01-01",
+        entry_avg_price=100000.0,
+    )
+
+    result = engine.run("2025-01-01", dates[-1])
+    tp_trades = [t for t in result.trades if t.side == "sell" and t.reason == "TRAILING_TAKE_PROFIT"]
+    assert len(tp_trades) >= 1
+    # 50% 분할 매도(50주) 확인
+    assert tp_trades[0].qty == 50.0
