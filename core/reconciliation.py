@@ -113,6 +113,7 @@ async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection
         for h in balance["holdings"] if h.get("pdno")
     }
     await db.sync_positions_from_balance(conn, held, overseas=False)
+    logger.info(f"KIS 국내 잔고 동기화(더블 체크) 완료: {list(held.keys())} ({len(held)}종목)")
     if settings.DOMESTIC_ONLY:
         return  # 국내 전용: 해외 잔고는 조회하지 않고 기존 해외 positions 행도 건드리지 않는다
 
@@ -128,6 +129,7 @@ async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection
         for h in present["holdings"] if h.get("pdno")
     }
     await db.sync_positions_from_balance(conn, held_overseas, overseas=True)
+    logger.info(f"KIS 해외 잔고 동기화(더블 체크) 완료: {list(held_overseas.keys())} ({len(held_overseas)}종목)")
 
 
 async def reconcile_unresolved_intents(

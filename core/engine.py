@@ -80,6 +80,7 @@ class TradingEngine:
         # 실제로 백필이 필요한 종목만 소비하도록 intraday.BackfillBudget이 알아서 차감한다
         # (예전엔 처리한 종목 수만큼 무조건 차감해서 뒤 순서 종목이 영원히 못 받는 버그가 있었음).
         self._intraday_backfill_budget = intraday.BackfillBudget(0)
+        self._orders_submitted_in_cycle = 0
 
     async def start(self) -> None:
         settings.assert_trading_allowed()
@@ -223,6 +224,17 @@ class TradingEngine:
             status = "FILLED" if cntg_qty >= float(intent["qty"]) else "PARTIALLY_FILLED"
             await db.update_order_intent(self.conn, intent["intent_id"], status=status)
 
+            # [체결 후 실잔고 재조회 및 더블 체크]
+            # 주문이 실제로 체결되었으므로 한투 API를 호출해 실제 잔고를 즉시 더블 체크하고 positions를 확정 갱신한다.
+            if self.client is not None:
+                try:
+                    await reconciliation.reconcile_positions(self.client, self.conn)
+                    logger.info(
+                        f"체결통보 수신 후 KIS 실잔고 재조회(더블 체크) 완료 (intent={intent['intent_id']}, cntg_qty={cntg_qty})"
+                    )
+                except Exception:
+                    logger.exception("체결통보 후 KIS 실잔고 재조회(더블 체크) 실패")
+
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -257,6 +269,7 @@ class TradingEngine:
         except Exception:
             logger.exception("주기 체결 대조 실패 - 다음 사이클에 재시도")
         self._intraday_backfill_budget = intraday.BackfillBudget(settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE)
+        self._orders_submitted_in_cycle = 0
 
         balance = await kis_domestic.get_balance(self.client)
         holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
@@ -338,6 +351,24 @@ class TradingEngine:
             # 해외 종목은 VI 개념이 없어 halted 판정에 안 들어가므로, 분모를 국내 종목 수로만 잡는다.
             await self.risk.check_market_wide_halt_breadth(halted_count, domestic_symbol_count)
 
+        if self._orders_submitted_in_cycle > 0:
+            logger.info(
+                f"이번 사이클에서 {self._orders_submitted_in_cycle}건의 주문 발주됨 — 체결 대기 후 KIS 실잔고 재조회(더블 체크) 수행"
+            )
+            # 주문 등록 및 체결 처리를 위해 잠시 대기
+            await asyncio.sleep(2.0)
+            try:
+                # 1. 미해결 주문 체결 대조 (REST 폴링)
+                await reconciliation.reconcile_unresolved_intents(self.client, self.conn, min_age_sec=0)
+            except Exception:
+                logger.exception("주문 발주 후 체결 대조 중 예외 발생")
+            try:
+                # 2. 한투 잔고 API 재조회로 DB positions 최종 동기화 (Double Check)
+                await reconciliation.reconcile_positions(self.client, self.conn)
+                logger.info("주문 발주 후 KIS 실잔고 재조회(더블 체크) 및 positions 동기화 완료")
+            except Exception:
+                logger.exception("주문 발주 후 KIS 실잔고 재조회(더블 체크) 실패")
+
     async def _log_no_op(
         self, cycle_id: int, symbol: str, target_weight: float, reason: str,
         context: Optional[dict] = None,
@@ -368,6 +399,7 @@ class TradingEngine:
             result = await kis_domestic.order_cash(self.client, symbol, "sell", int(qty), None)
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            self._orders_submitted_in_cycle += 1
         except KisApiError as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()
@@ -533,8 +565,10 @@ class TradingEngine:
             # 아닙니다"로 거부되는 것을 실제로 확인했다 — 모의투자에서는 이번 사이클 시작에
             # 조회한 보유수량을 안전한(과대추정 없는) 상한으로 대신 사용한다.
             if settings.IS_MOCK:
-                action.qty = min(action.qty, qty)
-                context["sellable_check"] = {"mock_fallback_to_held_qty": qty}
+                # inquire-balance 응답의 ord_psbl_qty(주문가능수량)가 있으면 우선 사용하여 미체결 주문으로 인한 초과 매도 방지
+                ord_psbl = float(holding.get("ord_psbl_qty") or qty) if holding else qty
+                action.qty = min(action.qty, ord_psbl)
+                context["sellable_check"] = {"mock_fallback_to_ord_psbl_qty": ord_psbl}
             else:
                 psbl = await kis_domestic.get_sellable_qty(self.client, symbol)
                 context["sellable_check"] = psbl
@@ -563,6 +597,7 @@ class TradingEngine:
             )
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            self._orders_submitted_in_cycle += 1
             if winddown_liquidating is not None:
                 await db.mark_winddown_sell_started(self.conn, symbol)
         except KisApiError as e:
@@ -606,6 +641,7 @@ class TradingEngine:
             result = await kis_overseas.order(self.client, exchange, symbol, "sell", int(qty), discounted_price)
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            self._orders_submitted_in_cycle += 1
         except KisApiError as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()
@@ -790,6 +826,7 @@ class TradingEngine:
             )
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            self._orders_submitted_in_cycle += 1
             if winddown_liquidating is not None:
                 await db.mark_winddown_sell_started(self.conn, symbol)
         except KisApiError as e:

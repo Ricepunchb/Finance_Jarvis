@@ -409,7 +409,12 @@ with tab_portfolio:
         st.caption("승인된 목표 비중이 없습니다.")
 
     st.divider()
-    st.markdown("#### 💼 현재 포지션")
+    cp1, cp2 = st.columns([3, 1])
+    cp1.markdown("#### 💼 현재 포지션")
+    if cp2.button("🔄 실잔고 더블 체크", help="한투 API로부터 최신 잔고를 즉시 재조회하여 positions 테이블과 동기화합니다."):
+        api_post("/portfolio/positions/sync")
+        st.success("한투 실잔고 동기화 완료")
+        st.rerun()
     if positions:
         pdf = pd.DataFrame(
             [

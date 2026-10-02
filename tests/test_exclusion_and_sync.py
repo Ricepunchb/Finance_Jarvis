@@ -194,3 +194,39 @@ def test_winddown_lifecycle_in_db():
         info = (await db.get_portfolio_symbol_info(conn))["005930"]
         assert info["winding_down_at"] is None and info["winddown_sell_started_at"] is None
     asyncio.run(run())
+
+
+def test_on_fill_triggers_reconciliation_double_check():
+    """웹소켓 체결통보(on_fill) 수신 시 KIS 잔고 재조회(reconcile_positions)를 호출하여 positions를 동기화하는지 검증."""
+    from unittest.mock import AsyncMock, patch
+    from core.engine import TradingEngine
+
+    async def run():
+        conn = await _conn()
+        engine = TradingEngine()
+        engine.conn = conn
+
+        # 가상 intent 생성
+        iid = await db.create_order_intent(conn, 1, "005930", "sell", 4, "limit", 270000, "test")
+        await db.update_order_intent(conn, iid, status="SUBMITTED", kis_order_no="99999")
+
+        # reconcile_positions 모킹
+        with patch("core.reconciliation.reconcile_positions", new_callable=AsyncMock) as mock_reconcile:
+            msg = {"ODER_NO": "99999", "CNTG_YN": "2", "CNTG_QTY": "4", "CNTG_UNPR": "270000"}
+            await engine._on_fill(msg)
+
+            # fills 기록 확인
+            cur = await conn.execute("SELECT qty, price FROM fills WHERE intent_id = ?", (iid,))
+            fill_row = await cur.fetchone()
+            assert fill_row["qty"] == 4.0 and fill_row["price"] == 270000.0
+
+            # intent 상태 FILLED 확인
+            cur = await conn.execute("SELECT status FROM order_intents WHERE intent_id = ?", (iid,))
+            intent_row = await cur.fetchone()
+            assert intent_row["status"] == "FILLED"
+
+            # 실잔고 더블 체크가 호출되었는지 검증
+            mock_reconcile.assert_awaited_once_with(engine.client, conn)
+
+    asyncio.run(run())
+

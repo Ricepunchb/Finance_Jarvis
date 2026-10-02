@@ -15,7 +15,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from core import (
-    analytics, db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent, signal_engine,
+    analytics, db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent,
+    reconciliation, signal_engine,
 )
 from core.config import settings
 from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
@@ -357,6 +358,17 @@ async def get_symbol_names():
 async def get_positions():
     conn = await db.get_connection()
     try:
+        return await db.get_positions(conn)
+    finally:
+        await conn.close()
+
+
+@app.post("/portfolio/positions/sync")
+async def sync_positions():
+    """한투 API로부터 최신 잔고를 즉시 재조회하여 positions 테이블을 강제 재동기화한다 (더블 체크)."""
+    conn = await db.get_connection()
+    try:
+        await reconciliation.reconcile_positions(engine.client, conn)
         return await db.get_positions(conn)
     finally:
         await conn.close()
