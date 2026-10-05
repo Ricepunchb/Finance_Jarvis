@@ -9,8 +9,10 @@ Redis 대신 SQLite를 쓰는 이유: 개인 단일 프로세스 시스템에서
 import json
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -236,6 +238,88 @@ CREATE TABLE IF NOT EXISTS backtest_bars (
     PRIMARY KEY (symbol, market, date)
 );
 CREATE INDEX IF NOT EXISTS idx_backtest_bars_date ON backtest_bars(date);
+
+-- AI 종목 발굴 및 뉴스/리포트 분석 묶음 (발굴 갱신 1회 = 1묶음)
+CREATE TABLE IF NOT EXISTS insight_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type TEXT NOT NULL,          -- 'SCHEDULED' | 'MANUAL'
+    status TEXT NOT NULL,                -- RUNNING | DONE | PARTIAL | FAILED
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    window_start REAL,                   -- 보유종목 뉴스 집계 구간 시작
+    counts_json TEXT,                    -- {broker_report, new_report, market_headline, holding_news, candidate, shortlist}
+    refresh_summary_json TEXT,           -- 발굴 summary 스냅샷
+    digest_json TEXT,                    -- LLM 다이제스트 (headline, themes, notable_symbols, risks, holdings_watch)
+    digest_error TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_insight_batches_started ON insight_batches(started_at DESC);
+
+-- 묶음 안의 개별 항목 (리포트/헤드라인/보유뉴스/발굴후보)
+CREATE TABLE IF NOT EXISTS insight_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES insight_batches(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,                  -- broker_report | market_headline | holding_news | candidate
+    symbol TEXT,
+    name TEXT,
+    title TEXT,
+    source TEXT,
+    url TEXT,
+    published_at REAL,
+    ref_id TEXT,                         -- broker_report: research_id
+    is_new INTEGER NOT NULL DEFAULT 0,   -- 이 묶음에서 처음 본 항목
+    payload_json TEXT                    -- 상세 데이터 JSON
+);
+CREATE INDEX IF NOT EXISTS idx_insight_items_batch ON insight_items(batch_id, kind);
+CREATE INDEX IF NOT EXISTS idx_insight_items_symbol ON insight_items(symbol);
+
+-- 증권사 리포트 본문 및 LLM 분석 캐시
+CREATE TABLE IF NOT EXISTS research_reports (
+    research_id INTEGER PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    broker TEXT,
+    title TEXT,
+    write_date TEXT,
+    read_count INTEGER,
+    opinion TEXT,
+    target_price REAL,
+    price_at_write REAL,
+    content_text TEXT,
+    attach_url TEXT,
+    end_url TEXT,
+    analysis_json TEXT,                  -- {stance, summary, key_points, catalysts, risks}
+    analyzed_at REAL,
+    fetched_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_reports_symbol ON research_reports(symbol);
+CREATE INDEX IF NOT EXISTS idx_research_reports_date ON research_reports(write_date DESC);
+
+-- 배당 및 ETF 분배금 이력 (현금배당, ETF분배금, 주식배당)
+CREATE TABLE IF NOT EXISTS dividends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    market TEXT NOT NULL DEFAULT 'domestic',     -- 'domestic' | 'overseas'
+    dividend_type TEXT NOT NULL DEFAULT 'CASH',  -- 'CASH' | 'ETF_DIST' | 'STOCK'
+    record_date TEXT,                            -- 배당기준일 (YYYY-MM-DD)
+    payment_date TEXT NOT NULL,                  -- 실제 지급/입금일 (YYYY-MM-DD)
+    qty REAL NOT NULL DEFAULT 0,                 -- 배당 당시 보유 수량
+    dps REAL,                                    -- 주당 배당금 (Dividend Per Share)
+    gross_amount REAL NOT NULL,                  -- 세전 배당금액
+    tax_amount REAL NOT NULL DEFAULT 0,          -- 배당소득세 등 원천징수 세금
+    net_amount REAL NOT NULL,                    -- 세후 실수령액
+    currency TEXT NOT NULL DEFAULT 'KRW',        -- KRW | USD
+    fx_rate REAL NOT NULL DEFAULT 1.0,           -- 지급일 기준 환율
+    net_amount_krw REAL NOT NULL,                -- KRW 환산 세후 실수령액
+    source TEXT NOT NULL DEFAULT 'MANUAL',       -- 'AUTO_KIS' | 'MANUAL' | 'CSV'
+    kis_mgmt_no TEXT,                            -- KIS 중복 방지 식별 키
+    notes TEXT,                                  -- 메모
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dividends_symbol ON dividends(symbol);
+CREATE INDEX IF NOT EXISTS idx_dividends_payment_date ON dividends(payment_date);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dividends_kis_mgmt ON dividends(kis_mgmt_no) WHERE kis_mgmt_no IS NOT NULL;
 """
 
 
@@ -1118,3 +1202,532 @@ async def save_backtest_bars(
             ),
         )
     await conn.commit()
+
+
+# --- insight_batches & insight_items & research_reports ---
+
+async def create_insight_batch(
+    conn: aiosqlite.Connection,
+    trigger_type: str = "SCHEDULED",
+    started_at: Optional[float] = None,
+    window_start: Optional[float] = None,
+) -> int:
+    started_at = started_at or time.time()
+    cur = await conn.execute(
+        "INSERT INTO insight_batches(trigger_type, status, started_at, window_start) "
+        "VALUES (?, 'RUNNING', ?, ?)",
+        (trigger_type, started_at, window_start),
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def finish_insight_batch(
+    conn: aiosqlite.Connection,
+    batch_id: int,
+    status: str,
+    finished_at: Optional[float] = None,
+    counts_json: Optional[str] = None,
+    refresh_summary_json: Optional[str] = None,
+    digest_json: Optional[str] = None,
+    digest_error: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    finished_at = finished_at or time.time()
+    await conn.execute(
+        "UPDATE insight_batches SET status = ?, finished_at = ?, counts_json = ?, "
+        "refresh_summary_json = ?, digest_json = ?, digest_error = ?, error = ? "
+        "WHERE id = ?",
+        (status, finished_at, counts_json, refresh_summary_json, digest_json, digest_error, error, batch_id),
+    )
+    await conn.commit()
+
+
+async def add_insight_items(conn: aiosqlite.Connection, items: List[Dict[str, Any]]) -> None:
+    if not items:
+        return
+    rows = [
+        (
+            item["batch_id"],
+            item["kind"],
+            item.get("symbol"),
+            item.get("name"),
+            item.get("title"),
+            item.get("source"),
+            item.get("url"),
+            item.get("published_at"),
+            str(item["ref_id"]) if item.get("ref_id") is not None else None,
+            1 if item.get("is_new") else 0,
+            item.get("payload_json"),
+        )
+        for item in items
+    ]
+    await conn.executemany(
+        "INSERT INTO insight_items(batch_id, kind, symbol, name, title, source, url, "
+        "published_at, ref_id, is_new, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    await conn.commit()
+
+
+async def list_insight_batches(conn: aiosqlite.Connection, limit: int = 30) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT id, trigger_type, status, started_at, finished_at, window_start, counts_json, "
+        "refresh_summary_json, digest_json, digest_error, error "
+        "FROM insight_batches ORDER BY started_at DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_insight_batch(conn: aiosqlite.Connection, batch_id: int) -> Optional[Dict[str, Any]]:
+    cur = await conn.execute("SELECT * FROM insight_batches WHERE id = ?", (batch_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_insight_items(
+    conn: aiosqlite.Connection, batch_id: int, kind: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    if kind:
+        cur = await conn.execute(
+            "SELECT * FROM insight_items WHERE batch_id = ? AND kind = ? ORDER BY id ASC",
+            (batch_id, kind),
+        )
+    else:
+        cur = await conn.execute(
+            "SELECT * FROM insight_items WHERE batch_id = ? ORDER BY id ASC",
+            (batch_id,),
+        )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_symbol_insights(
+    conn: aiosqlite.Connection, symbol: str, limit: int = 50
+) -> List[Dict[str, Any]]:
+    cur = await conn.execute(
+        "SELECT i.*, b.started_at as batch_started_at, b.trigger_type as batch_trigger_type "
+        "FROM insight_items i JOIN insight_batches b ON i.batch_id = b.id "
+        "WHERE i.symbol = ? ORDER BY i.id DESC LIMIT ?",
+        (symbol, limit),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_research_reports(
+    conn: aiosqlite.Connection, research_ids: List[int]
+) -> Dict[int, Dict[str, Any]]:
+    if not research_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in research_ids)
+    cur = await conn.execute(
+        f"SELECT * FROM research_reports WHERE research_id IN ({placeholders})",
+        research_ids,
+    )
+    rows = await cur.fetchall()
+    return {row["research_id"]: dict(row) for row in rows}
+
+
+async def upsert_research_reports(conn: aiosqlite.Connection, reports: List[Dict[str, Any]]) -> None:
+    if not reports:
+        return
+    now = time.time()
+    for r in reports:
+        await conn.execute(
+            "INSERT INTO research_reports("
+            "research_id, symbol, name, broker, title, write_date, read_count, "
+            "opinion, target_price, price_at_write, content_text, attach_url, end_url, fetched_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(research_id) DO UPDATE SET "
+            "read_count = excluded.read_count, "
+            "opinion = COALESCE(excluded.opinion, research_reports.opinion), "
+            "target_price = COALESCE(excluded.target_price, research_reports.target_price), "
+            "price_at_write = COALESCE(excluded.price_at_write, research_reports.price_at_write), "
+            "content_text = COALESCE(excluded.content_text, research_reports.content_text), "
+            "attach_url = COALESCE(excluded.attach_url, research_reports.attach_url), "
+            "end_url = COALESCE(excluded.end_url, research_reports.end_url)",
+            (
+                r["research_id"],
+                r.get("symbol") or "",
+                r.get("name"),
+                r.get("broker"),
+                r.get("title"),
+                r.get("write_date") or r.get("date"),
+                r.get("read_count", 0),
+                r.get("opinion"),
+                r.get("target_price"),
+                r.get("price_at_write"),
+                r.get("content_text"),
+                r.get("attach_url"),
+                r.get("end_url"),
+                now,
+            ),
+        )
+    await conn.commit()
+
+
+async def update_research_report_detail(
+    conn: aiosqlite.Connection,
+    research_id: int,
+    content_text: str,
+    opinion: Optional[str] = None,
+    target_price: Optional[float] = None,
+    price_at_write: Optional[float] = None,
+    attach_url: Optional[str] = None,
+) -> None:
+    await conn.execute(
+        "UPDATE research_reports SET "
+        "content_text = COALESCE(?, content_text), "
+        "opinion = COALESCE(?, opinion), "
+        "target_price = COALESCE(?, target_price), "
+        "price_at_write = COALESCE(?, price_at_write), "
+        "attach_url = COALESCE(?, attach_url) "
+        "WHERE research_id = ?",
+        (content_text, opinion, target_price, price_at_write, attach_url, research_id),
+    )
+    await conn.commit()
+
+
+async def save_report_analysis(
+    conn: aiosqlite.Connection,
+    research_id: int,
+    analysis_json: str,
+    analyzed_at: Optional[float] = None,
+) -> None:
+    analyzed_at = analyzed_at or time.time()
+    await conn.execute(
+        "UPDATE research_reports SET analysis_json = ?, analyzed_at = ? WHERE research_id = ?",
+        (analysis_json, analyzed_at, research_id),
+    )
+    await conn.commit()
+
+
+async def get_last_insight_batch_finished_at(conn: aiosqlite.Connection) -> Optional[float]:
+    cur = await conn.execute(
+        "SELECT finished_at FROM insight_batches WHERE status IN ('DONE', 'PARTIAL') "
+        "AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    return float(row["finished_at"]) if row and row["finished_at"] is not None else None
+
+
+async def cleanup_old_insights(conn: aiosqlite.Connection, retention_days: int = 365) -> int:
+    """1년(retention_days) 지난 인사이트 묶음 및 하위 항목을 정리한다."""
+    cutoff = time.time() - retention_days * 86400
+    cur = await conn.execute(
+        "SELECT id FROM insight_batches WHERE started_at < ?", (cutoff,)
+    )
+    old_ids = [r["id"] for r in await cur.fetchall()]
+    if not old_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in old_ids)
+    await conn.execute(f"DELETE FROM insight_items WHERE batch_id IN ({placeholders})", old_ids)
+    await conn.execute(f"DELETE FROM insight_batches WHERE id IN ({placeholders})", old_ids)
+    await conn.commit()
+    return len(old_ids)
+
+
+
+async def get_symbol_semantic_profile(
+    conn: aiosqlite.Connection, symbol: str, lookback_days: int = 7
+) -> Dict[str, Any]:
+    """종목의 최근 뉴스 감성 및 증권사 리포트 LLM 분석 결과를 통합한 정형 시맨틱 프로필을 반환한다."""
+    cutoff_ts = time.time() - lookback_days * 86400
+
+    # 1. 뉴스 감성 집계 (news_cache)
+    cur = await conn.execute(
+        "SELECT sentiment_score, sentiment_reasoning, fetched_at "
+        "FROM news_cache WHERE symbol = ? AND fetched_at >= ? "
+        "ORDER BY fetched_at DESC LIMIT 20",
+        (symbol, cutoff_ts),
+    )
+    news_rows = await cur.fetchall()
+    news_scores = [float(r["sentiment_score"]) for r in news_rows if r["sentiment_score"] is not None]
+    avg_news_sentiment = (sum(news_scores) / len(news_scores)) if news_scores else None
+    latest_news_reasoning = news_rows[0]["sentiment_reasoning"] if news_rows else None
+
+    # 2. 증권사 리포트 분석 (research_reports)
+    cutoff_date = (datetime.now(tz=ZoneInfo("Asia/Seoul")) - timedelta(days=14)).strftime("%Y%m%d")
+    cur = await conn.execute(
+        "SELECT broker, title, opinion, target_price, price_at_write, write_date, analysis_json "
+        "FROM research_reports WHERE symbol = ? AND write_date >= ? "
+        "ORDER BY write_date DESC LIMIT 5",
+        (symbol, cutoff_date),
+    )
+    report_rows = await cur.fetchall()
+
+    latest_stance = None
+    latest_summary = None
+    target_price = None
+    stance_counts = {"POSITIVE": 0, "NEUTRAL": 0, "CAUTION": 0}
+
+    for r in report_rows:
+        if target_price is None and r["target_price"]:
+            try:
+                target_price = float(r["target_price"])
+            except (ValueError, TypeError):
+                pass
+        if r["analysis_json"]:
+            try:
+                ad = json.loads(r["analysis_json"])
+                st = (ad.get("stance") or "").upper()
+                if st in stance_counts:
+                    stance_counts[st] += 1
+                if latest_stance is None and st:
+                    latest_stance = st
+                    latest_summary = ad.get("summary")
+            except Exception:
+                pass
+
+    return {
+        "symbol": symbol,
+        "news_count": len(news_rows),
+        "avg_news_sentiment": avg_news_sentiment,
+        "latest_news_reasoning": latest_news_reasoning,
+        "report_count": len(report_rows),
+        "latest_report_stance": latest_stance,
+        "latest_report_summary": latest_summary,
+        "report_stance_counts": stance_counts,
+        "target_price": target_price,
+    }
+
+
+async def get_latest_insight_digest(conn: aiosqlite.Connection) -> Optional[Dict[str, Any]]:
+    """가장 최근 완료된 인사이트 배치의 AI 다이제스트 JSON을 파싱하여 반환한다."""
+    cur = await conn.execute(
+        "SELECT digest_json FROM insight_batches WHERE status IN ('DONE', 'PARTIAL') "
+        "AND digest_json IS NOT NULL ORDER BY started_at DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    if not row or not row["digest_json"]:
+        return None
+    try:
+        return json.loads(row["digest_json"])
+    except Exception:
+        return None
+
+
+# =========================================================================
+# 배당 및 ETF 분배금 관리
+# =========================================================================
+
+async def add_dividend(conn: aiosqlite.Connection, data: Dict[str, Any]) -> int:
+    """새 배당/분배금 기록을 추가하고 id를 반환한다."""
+    now = time.time()
+    gross = float(data.get("gross_amount") or 0.0)
+    tax = float(data.get("tax_amount") or 0.0)
+    net = float(data.get("net_amount") if data.get("net_amount") is not None else (gross - tax))
+    fx_rate = float(data.get("fx_rate") or 1.0)
+    net_krw = float(data.get("net_amount_krw") if data.get("net_amount_krw") is not None else (net * fx_rate))
+
+    cur = await conn.execute(
+        """
+        INSERT INTO dividends (
+            symbol, market, dividend_type, record_date, payment_date,
+            qty, dps, gross_amount, tax_amount, net_amount,
+            currency, fx_rate, net_amount_krw, source, kis_mgmt_no,
+            notes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["symbol"],
+            data.get("market") or "domestic",
+            data.get("dividend_type") or "CASH",
+            data.get("record_date"),
+            data["payment_date"],
+            float(data.get("qty") or 0.0),
+            float(data["dps"]) if data.get("dps") is not None else None,
+            gross,
+            tax,
+            net,
+            data.get("currency") or "KRW",
+            fx_rate,
+            net_krw,
+            data.get("source") or "MANUAL",
+            data.get("kis_mgmt_no"),
+            data.get("notes"),
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+    return cur.lastrowid or 0
+
+
+async def get_dividend(conn: aiosqlite.Connection, dividend_id: int) -> Optional[Dict[str, Any]]:
+    """배당 기록 단건 조회."""
+    cur = await conn.execute("SELECT * FROM dividends WHERE id = ?", (dividend_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_dividends(
+    conn: aiosqlite.Connection,
+    symbol: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """조건에 맞는 배당/분배금 목록을 최신 지급일 순으로 조회."""
+    clauses: List[str] = []
+    params: List[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if start_date:
+        clauses.append("payment_date >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("payment_date <= ?")
+        params.append(end_date)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = f"SELECT * FROM dividends {where} ORDER BY payment_date DESC, id DESC"
+    cur = await conn.execute(query, params)
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def update_dividend(conn: aiosqlite.Connection, dividend_id: int, data: Dict[str, Any]) -> bool:
+    """배당 기록 수정."""
+    now = time.time()
+    fields = []
+    params = []
+    updatable = [
+        "symbol", "market", "dividend_type", "record_date", "payment_date",
+        "qty", "dps", "gross_amount", "tax_amount", "net_amount",
+        "currency", "fx_rate", "net_amount_krw", "notes", "source",
+    ]
+    for key in updatable:
+        if key in data:
+            fields.append(f"{key} = ?")
+            params.append(data[key])
+    if not fields:
+        return False
+    fields.append("updated_at = ?")
+    params.append(now)
+    params.append(dividend_id)
+
+    cur = await conn.execute(
+        f"UPDATE dividends SET {', '.join(fields)} WHERE id = ?", params
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def delete_dividend(conn: aiosqlite.Connection, dividend_id: int) -> bool:
+    """배당 기록 삭제."""
+    cur = await conn.execute("DELETE FROM dividends WHERE id = ?", (dividend_id,))
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def get_dividend_summary_by_symbol(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:
+    """종목별 배당금 합계(세후, 세전, 세금) 및 건수 집계."""
+    cur = await conn.execute(
+        """
+        SELECT symbol,
+               SUM(net_amount_krw) as total_net_krw,
+               SUM(gross_amount) as total_gross,
+               SUM(tax_amount) as total_tax,
+               COUNT(*) as count,
+               MAX(payment_date) as last_payment_date
+        FROM dividends
+        GROUP BY symbol
+        """
+    )
+    rows = await cur.fetchall()
+    return {
+        r["symbol"]: {
+            "total_net_krw": float(r["total_net_krw"] or 0.0),
+            "total_gross": float(r["total_gross"] or 0.0),
+            "total_tax": float(r["total_tax"] or 0.0),
+            "count": int(r["count"]),
+            "last_payment_date": r["last_payment_date"],
+        }
+        for r in rows
+    }
+
+
+async def get_monthly_dividends(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    """월별 배당금 합계(세후, 세전, 세금) 및 건수 집계."""
+    cur = await conn.execute(
+        """
+        SELECT SUBSTR(payment_date, 1, 7) as month,
+               SUM(net_amount_krw) as total_net_krw,
+               SUM(gross_amount) as total_gross,
+               SUM(tax_amount) as total_tax,
+               COUNT(*) as count
+        FROM dividends
+        GROUP BY SUBSTR(payment_date, 1, 7)
+        ORDER BY month ASC
+        """
+    )
+    rows = await cur.fetchall()
+    return [
+        {
+            "month": r["month"],
+            "total_net_krw": float(r["total_net_krw"] or 0.0),
+            "total_gross": float(r["total_gross"] or 0.0),
+            "total_tax": float(r["total_tax"] or 0.0),
+            "count": int(r["count"]),
+        }
+        for r in rows
+    ]
+
+
+async def upsert_kis_dividends(conn: aiosqlite.Connection, items: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """KIS API 등에서 수집한 배당 목록을 삽입/스킵한다. (inserted_count, skipped_count) 반환."""
+    inserted = 0
+    skipped = 0
+    now = time.time()
+    for it in items:
+        kis_mgmt_no = it.get("kis_mgmt_no")
+        if kis_mgmt_no:
+            cur = await conn.execute("SELECT id FROM dividends WHERE kis_mgmt_no = ?", (kis_mgmt_no,))
+            if await cur.fetchone():
+                skipped += 1
+                continue
+
+        gross = float(it.get("gross_amount") or 0.0)
+        tax = float(it.get("tax_amount") or 0.0)
+        net = float(it.get("net_amount") if it.get("net_amount") is not None else (gross - tax))
+        fx_rate = float(it.get("fx_rate") or 1.0)
+        net_krw = float(it.get("net_amount_krw") if it.get("net_amount_krw") is not None else (net * fx_rate))
+
+        await conn.execute(
+            """
+            INSERT INTO dividends (
+                symbol, market, dividend_type, record_date, payment_date,
+                qty, dps, gross_amount, tax_amount, net_amount,
+                currency, fx_rate, net_amount_krw, source, kis_mgmt_no,
+                notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                it["symbol"],
+                it.get("market") or "domestic",
+                it.get("dividend_type") or "CASH",
+                it.get("record_date"),
+                it["payment_date"],
+                float(it.get("qty") or 0.0),
+                float(it["dps"]) if it.get("dps") is not None else None,
+                gross,
+                tax,
+                net,
+                it.get("currency") or "KRW",
+                fx_rate,
+                net_krw,
+                it.get("source") or "AUTO_KIS",
+                kis_mgmt_no,
+                it.get("notes"),
+                now,
+                now,
+            ),
+        )
+        inserted += 1
+    await conn.commit()
+    return inserted, skipped
+
+

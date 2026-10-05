@@ -272,6 +272,7 @@ def daily_mtm(
     axis: List[str],
     fx: Callable[[float], float],
     anchor_first_day: bool = False,
+    dividends_by_symbol_date: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """종목 x 날짜 평가손익.  pnl = 평가액 변화 + 현금흐름(−매수대금/+매도대금), KRW 기준(환차손익 포함).
 
@@ -318,11 +319,13 @@ def daily_mtm(
             fx_d = fx_for(market, eod_ts(d), fx)
             close = filled[d]
             value_krw = qty * close * fx_d
-            pnl_krw = value_krw - value_prev + cash_krw
+            div_krw = (dividends_by_symbol_date.get(sym) or {}).get(d, 0.0) if dividends_by_symbol_date else 0.0
+            pnl_krw = value_krw - value_prev + cash_krw + div_krw
             denom = value_prev + buys_krw
             rows[d] = {
                 "qty": qty, "close": close, "value_krw": value_krw, "pnl_krw": pnl_krw,
                 "base_krw": denom, "buys_krw": buys_krw, "cash_krw": cash_krw,
+                "dividend_krw": div_krw,
                 "ret": (pnl_krw / denom) if denom > 1.0 else None,
             }
             value_prev = value_krw
@@ -387,6 +390,7 @@ def summarize_symbols(
     mtm: Dict[str, Dict[str, Dict[str, Any]]],
     mismatch: Dict[str, float],
     fx_now: float,
+    symbol_dividends: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """종목축 요약. 누적손익(원가 기준: 실현+평가)과 기간손익(일별 평가손익 합)을 함께 낸다."""
     events_by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -413,14 +417,20 @@ def summarize_symbols(
         invested_krw = op["qty"] * op["avg_krw"] + sum(
             t["qty"] * t["price"] * t["fx"] for t in sym_trades if t["side"] == "buy"
         )
-        total = realized_krw + unrealized_krw
+        capital_pnl = realized_krw + unrealized_krw
+        div_krw = (symbol_dividends.get(sym) or 0.0) if symbol_dividends else 0.0
+        total = capital_pnl + div_krw
         wins = sum(1 for e in evs if e["pnl_krw"] > 0)
         sym_mtm = mtm.get(sym, {})
         rows.append({
             "symbol": sym, "market": market, "qty": qty, "avg_local": st["avg_local"],
             "last_close": close, "value_krw": value_krw,
-            "realized_krw": realized_krw, "unrealized_krw": unrealized_krw, "total_pnl_krw": total,
-            "invested_krw": invested_krw, "roi": (total / invested_krw) if invested_krw > 1.0 else None,
+            "realized_krw": realized_krw, "unrealized_krw": unrealized_krw,
+            "capital_pnl_krw": capital_pnl, "dividend_krw": div_krw,
+            "total_pnl_krw": total,
+            "invested_krw": invested_krw,
+            "price_roi": (capital_pnl / invested_krw) if invested_krw > 1.0 else None,
+            "roi": (total / invested_krw) if invested_krw > 1.0 else None,
             "period_pnl_krw": sum(r["pnl_krw"] for r in sym_mtm.values()),
             "trade_count": len(sym_trades), "sell_count": len(evs),
             "win_rate": (wins / len(evs)) if evs else None,

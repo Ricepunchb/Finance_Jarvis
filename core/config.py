@@ -102,6 +102,13 @@ class Settings(BaseSettings):
     # 관점별 최소 할당 - 한 관점이 숏리스트를 독식하지 않게 먼저 채운 뒤 나머지는 점수순
     DISCOVERY_ANGLE_QUOTA: dict[str, int] = {"value": 3, "early": 3, "momentum": 3, "broker": 2}
 
+    # --- AI 리포트/뉴스 인사이트 묶음 (인사이트 탭) ---
+    INSIGHT_ENABLED: bool = True
+    INSIGHT_RETENTION_DAYS: int = 365             # 1년 단위 보관 후 자동 정리
+    INSIGHT_REPORT_ANALYZE_MAX_PER_RUN: int = 60  # 1회 갱신에서 본문 수집·분석할 최대 리포트 수 (백로그 상한)
+    INSIGHT_REPORT_LLM_BATCH_SIZE: int = 8        # LLM 1회 호출당 리포트 수
+    INSIGHT_HEADLINE_STORE_MAX: int = 300         # 표본 헤드라인 중 종목 매칭된 것 저장 상한
+    INSIGHT_DIGEST_ENABLED: bool = True           # 묶음당 종합 AI 다이제스트 생성 여부
     # --- 성과/리스크 지표 (샤프/소티노 계산용) ---
     RISK_FREE_RATE_ANNUAL: float = 0.035  # 한국 무위험수익률 근사치 (연 기준, 필요시 조정)
 

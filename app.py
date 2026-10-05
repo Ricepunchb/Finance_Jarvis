@@ -8,5 +8,6 @@ import streamlit as st
 pages = [
     st.Page("dashboard.py", title="매매 복기·분석", icon="📈", default=True),
     st.Page("pages/1_KIS_자동매매.py", title="KIS 자동매매", icon="🤖"),
+    st.Page("pages/2_인사이트.py", title="AI 인사이트", icon="💡"),
 ]
 st.navigation(pages).run()

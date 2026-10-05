@@ -56,6 +56,10 @@ def ccnl_notice_tr_id() -> str:
     return _pick(real="H0STCNI0", demo="H0STCNI9")
 
 
+# --- 국내주식 기간별계좌권리현황조회 (inquire-period-rights, 배당/권리) ---
+INQUIRE_PERIOD_RIGHTS_TR_ID = "CTRGA011R"
+
+
 # --- 국내주식 현재가시세/차트/VI조회는 조회(quotation) 전용 API로 실전/모의 구분이 없다 ---
 INQUIRE_PRICE_TR_ID = "FHKST01010100"
 INQUIRE_DAILY_ITEMCHARTPRICE_TR_ID = "FHKST03010100"

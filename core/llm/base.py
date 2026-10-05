@@ -39,6 +39,7 @@ class LLMProvider(ABC):
         current_signals: Dict[str, Dict[str, Any]],
         candidate_pool: List[Dict[str, Any]],
         macro_context: Optional[str],
+        insight_digest: Optional[Dict[str, Any]] = None,
         max_symbols: int,
         min_weight: float,
         max_weight: float,
@@ -71,3 +72,65 @@ class LLMProvider(ABC):
             degraded=True. "균등비중 폴백"이 아니라 "무변경 폴백"이어야 한다 — 살아있는
             포트폴리오를 LLM 오류로 흩어버리는 것은 무변경보다 더 위험하다.
         """
+
+    @abstractmethod
+    async def analyze_research_reports(
+        self, reports: List[Dict[str, Any]]
+    ) -> Dict[int, Dict[str, Any]]:
+        """증권사 리포트(제목, 본문 텍스트, 투자의견, 목표가)를 분석한다.
+
+        Args:
+            reports: [{"research_id": int, "symbol": str, "name": str, "title": str,
+                      "content_text": str, "opinion": str, ...}]
+
+        Returns:
+            {research_id: {"stance": "POSITIVE"|"NEUTRAL"|"NEGATIVE", "summary": str,
+                           "key_points": [str], "catalysts": [str], "risks": [str]}}
+        """
+
+    @abstractmethod
+    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """발굴 갱신 1회의 종합 데이터(리포트 분석, 시장 헤드라인, 보유종목 뉴스, 발굴 숏리스트)를
+        바탕으로 AI 다이제스트를 생성한다.
+
+        Returns:
+            {
+              "headline": str,
+              "themes": [{"theme": str, "evidence": str, "symbols": [str]}],
+              "notable_symbols": [{"symbol": str, "name": str, "why": str, "stance": str}],
+              "risks": [str],
+              "holdings_watch": [str],
+            }
+        """
+
+
+    @abstractmethod
+    async def analyze_research_reports(
+        self, reports: List[Dict[str, Any]]
+    ) -> Dict[int, Dict[str, Any]]:
+        """증권사 리포트(제목, 본문 텍스트, 투자의견, 목표가)를 분석한다.
+
+        Args:
+            reports: [{"research_id": int, "symbol": str, "name": str, "title": str,
+                      "content_text": str, "opinion": str, ...}]
+
+        Returns:
+            {research_id: {"stance": "POSITIVE"|"NEUTRAL"|"NEGATIVE", "summary": str,
+                           "key_points": [str], "catalysts": [str], "risks": [str]}}
+        """
+
+    @abstractmethod
+    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """발굴 갱신 1회의 종합 데이터(리포트 분석, 시장 헤드라인, 보유종목 뉴스, 발굴 숏리스트)를
+        바탕으로 AI 다이제스트를 생성한다.
+
+        Returns:
+            {
+              "headline": str,
+              "themes": [{"theme": str, "evidence": str, "symbols": [str]}],
+              "notable_symbols": [{"symbol": str, "name": str, "why": str, "stance": str}],
+              "risks": [str],
+              "holdings_watch": [str],
+            }
+        """
+

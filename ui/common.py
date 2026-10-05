@@ -39,6 +39,26 @@ def api_get(path: str, timeout: float = 20, **params) -> Optional[Any]:
     return resp.json()
 
 
+def api_post(path: str, json_body: Optional[Dict[str, Any]] = None, timeout: float = 60) -> Optional[Any]:
+    try:
+        resp = requests.post(f"{API_BASE}{path}", json=json_body, timeout=timeout)
+    except requests.RequestException:
+        return None
+    if resp.status_code >= 400:
+        return None
+    return resp.json()
+
+
+def api_delete(path: str, timeout: float = 20) -> Optional[Any]:
+    try:
+        resp = requests.delete(f"{API_BASE}{path}", timeout=timeout)
+    except requests.RequestException:
+        return None
+    if resp.status_code >= 400:
+        return None
+    return resp.json()
+
+
 def cached_get(path: str, ttl: float = 60, timeout: float = 180, fresh: bool = False, **params) -> Optional[Any]:
     """세션 단위 TTL 캐시. 실패(None)는 캐시하지 않아 다음 런에서 재시도한다.
 

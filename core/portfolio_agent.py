@@ -130,10 +130,17 @@ async def propose_rebalance(
     benchmark_returns = await quant_metrics.fetch_benchmark_return_series(client) if client is not None else None
 
     current_positions = await _build_current_positions(client, active_weights, positions, benchmark_returns)
-    # 뉴스감성 등 LLM 기반 시그널은 아직 연결하지 않았다 - 매 제안마다 보유종목 전부에
-    # 뉴스 LLM 호출을 추가하면 비용이 커지고, 성과/리스크 지표(ROI/MDD/샤프 등)만으로도
-    # Phase 5.0 대비 제안 품질이 이미 크게 개선된다. 필요성이 확인되면 별도로 연결한다.
     current_signals: Dict[str, Any] = {}
+    for p in current_positions:
+        sym = p["symbol"]
+        prof = await db.get_symbol_semantic_profile(conn, sym)
+        parts = []
+        if prof.get("news_count", 0) > 0 and prof.get("avg_news_sentiment") is not None:
+            parts.append(f"최근뉴스감성 {prof['avg_news_sentiment']:+.2f}")
+        if prof.get("latest_report_stance"):
+            parts.append(f"리포트 {prof['latest_report_stance']}")
+        if parts:
+            current_signals[sym] = " / ".join(parts)
 
     candidate_pool: List[Dict[str, Any]] = []
     if client is not None:
@@ -149,6 +156,7 @@ async def propose_rebalance(
             logger.exception("후보종목 스크리닝 실패 - 발굴 없이 재비중만 제안")
 
     macro_context = await macro.get_fear_greed_context(conn)
+    latest_digest = await db.get_latest_insight_digest(conn)
 
     provider = get_llm_provider()
     result = await provider.propose_portfolio_changes(
@@ -156,6 +164,7 @@ async def propose_rebalance(
         current_signals=current_signals,
         candidate_pool=candidate_pool,
         macro_context=macro_context,
+        insight_digest=latest_digest,
         max_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
         min_weight=settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
         max_weight=settings.MAX_POSITION_PCT,

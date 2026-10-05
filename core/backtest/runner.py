@@ -27,14 +27,14 @@ class BacktestConfig(BaseModel):
     benchmark_market: str = "domestic"
     benchmark_exchange: Optional[str] = None
     target_weights: Optional[Dict[str, float]] = None
-    fee_rate: float = settings.BACKTEST_DEFAULT_FEE_PCT
-    tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT
-    slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT
-    stop_loss_pct: float = settings.STOP_LOSS_PCT
-    stop_loss_cooldown_days: int = settings.STOP_LOSS_COOLDOWN_DAYS
-    onboarding_days: int = settings.ONBOARDING_DAYS
-    require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING
-    require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY
+    fee_rate: float = getattr(settings, "BACKTEST_DEFAULT_FEE_PCT", 0.00015)
+    tax_rate: float = getattr(settings, "BACKTEST_DEFAULT_TAX_PCT", 0.0018)
+    slippage_pct: float = getattr(settings, "BACKTEST_DEFAULT_SLIPPAGE_PCT", 0.0005)
+    stop_loss_pct: float = getattr(settings, "STOP_LOSS_PCT", 0.06)
+    stop_loss_cooldown_days: int = getattr(settings, "STOP_LOSS_COOLDOWN_DAYS", 5)
+    onboarding_days: int = getattr(settings, "ONBOARDING_DAYS", 3)
+    require_uptrend_for_onboarding: bool = getattr(settings, "REQUIRE_UPTREND_FOR_ONBOARDING", True)
+    require_sma20_for_buy: bool = getattr(settings, "REQUIRE_SMA20_FOR_BUY", True)
 
 
 class BacktestRunner:

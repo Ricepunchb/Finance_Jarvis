@@ -5,7 +5,7 @@
 """
 import streamlit as st
 
-from ui import backtest_tab, calendar_tab, overview, rebalance, replay
+from ui import backtest_tab, calendar_tab, dividend_tab, overview, rebalance, replay
 from ui.common import API_BASE, api_get, cached_get, clear_cache, fmt_kst
 
 st.set_page_config(layout="wide", page_title="Finance Jarvis 분석", page_icon="📈")
@@ -46,8 +46,8 @@ st.title("📈 매매 복기·분석")
 st.caption(f"계산 시각 {fmt_kst(data['generated_at'], '%Y-%m-%d %H:%M:%S')} · 읽기 전용 — 주문·설정 변경은 'KIS 자동매매' 페이지에서")
 
 symbols = [r["symbol"] for r in data["symbols"]]
-tab_overview, tab_calendar, tab_replay, tab_rebalance, tab_backtest = st.tabs(
-    ["📊 성과 오버뷰", "📅 매매 달력", "🧠 의사결정 복기", "🔁 리밸런싱 이력", "🧪 전략 백테스팅"]
+tab_overview, tab_calendar, tab_replay, tab_rebalance, tab_backtest, tab_dividend = st.tabs(
+    ["📊 성과 오버뷰", "📅 매매 달력", "🧠 의사결정 복기", "🔁 리밸런싱 이력", "🧪 전략 백테스팅", "💰 배당·분배금"]
 )
 with tab_overview:
     overview.render(data, names)
@@ -59,4 +59,6 @@ with tab_rebalance:
     rebalance.render(names)
 with tab_backtest:
     backtest_tab.render(names)
+with tab_dividend:
+    dividend_tab.render(names)
 

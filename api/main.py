@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from core import (
@@ -588,14 +588,14 @@ class RunBacktestRequest(BaseModel):
     benchmark_market: str = "domestic"
     benchmark_exchange: Optional[str] = None
     target_weights: Optional[dict[str, float]] = None
-    fee_rate: float = settings.BACKTEST_DEFAULT_FEE_PCT
-    tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT
-    slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT
-    stop_loss_pct: float = settings.STOP_LOSS_PCT
-    stop_loss_cooldown_days: int = settings.STOP_LOSS_COOLDOWN_DAYS
-    onboarding_days: int = settings.ONBOARDING_DAYS
-    require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING
-    require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY
+    fee_rate: float = getattr(settings, "BACKTEST_DEFAULT_FEE_PCT", 0.00015)
+    tax_rate: float = getattr(settings, "BACKTEST_DEFAULT_TAX_PCT", 0.0018)
+    slippage_pct: float = getattr(settings, "BACKTEST_DEFAULT_SLIPPAGE_PCT", 0.0005)
+    stop_loss_pct: float = getattr(settings, "STOP_LOSS_PCT", 0.06)
+    stop_loss_cooldown_days: int = getattr(settings, "STOP_LOSS_COOLDOWN_DAYS", 5)
+    onboarding_days: int = getattr(settings, "ONBOARDING_DAYS", 3)
+    require_uptrend_for_onboarding: bool = getattr(settings, "REQUIRE_UPTREND_FOR_ONBOARDING", True)
+    require_sma20_for_buy: bool = getattr(settings, "REQUIRE_SMA20_FOR_BUY", True)
 
 
 @app.post("/backtest/run")
@@ -631,4 +631,286 @@ async def run_backtest_endpoint(req: RunBacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await conn.close()
+
+
+# --- AI 리포트/뉴스 인사이트 묶음 엔드포인트 ---
+
+
+@app.get("/insights/batches")
+async def get_insight_batches(limit: int = 30):
+    """최근 생성된 인사이트 묶음 목록을 반환한다."""
+    conn = await db.get_connection()
+    try:
+        batches = await db.list_insight_batches(conn, limit=limit)
+        res = []
+        for b in batches:
+            b_dict = dict(b)
+            if b_dict.get("counts_json"):
+                try:
+                    b_dict["counts"] = json.loads(b_dict["counts_json"])
+                except Exception:
+                    b_dict["counts"] = {}
+            else:
+                b_dict["counts"] = {}
+            res.append(b_dict)
+        return res
+    finally:
+        await conn.close()
+
+
+@app.get("/insights/batches/{batch_id}")
+async def get_insight_batch_detail(batch_id: int, kind: Optional[str] = None):
+    """특정 인사이트 묶음의 메타데이터와 하위 항목(리포트/헤드라인/뉴스/후보)을 반환한다."""
+    conn = await db.get_connection()
+    try:
+        batch = await db.get_insight_batch(conn, batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        b_dict = dict(batch)
+        if b_dict.get("counts_json"):
+            try:
+                b_dict["counts"] = json.loads(b_dict["counts_json"])
+            except Exception:
+                b_dict["counts"] = {}
+        else:
+            b_dict["counts"] = {}
+
+        if b_dict.get("digest_json"):
+            try:
+                b_dict["digest"] = json.loads(b_dict["digest_json"])
+            except Exception:
+                b_dict["digest"] = None
+        else:
+            b_dict["digest"] = None
+
+        raw_items = await db.list_insight_items(conn, batch_id, kind=kind)
+        grouped_items: dict[str, list] = {
+            "broker_report": [],
+            "market_headline": [],
+            "holding_news": [],
+            "candidate": [],
+        }
+        for it in raw_items:
+            it_dict = dict(it)
+            if it_dict.get("payload_json"):
+                try:
+                    it_dict["payload"] = json.loads(it_dict["payload_json"])
+                except Exception:
+                    it_dict["payload"] = {}
+            else:
+                it_dict["payload"] = {}
+            k = it_dict.get("kind")
+            if k in grouped_items:
+                grouped_items[k].append(it_dict)
+            else:
+                grouped_items.setdefault(k, []).append(it_dict)
+
+        b_dict["items"] = grouped_items
+        return b_dict
+    finally:
+        await conn.close()
+
+
+@app.get("/insights/symbols/{symbol}")
+async def get_symbol_insights(symbol: str, limit: int = 50):
+    """특정 종목에 대한 시계열 인사이트(리포트, 뉴스, 후보 변동) 항목을 반환한다."""
+    conn = await db.get_connection()
+    try:
+        items = await db.list_symbol_insights(conn, symbol, limit=limit)
+        res = []
+        for it in items:
+            it_dict = dict(it)
+            if it_dict.get("payload_json"):
+                try:
+                    it_dict["payload"] = json.loads(it_dict["payload_json"])
+                except Exception:
+                    it_dict["payload"] = {}
+            else:
+                it_dict["payload"] = {}
+            res.append(it_dict)
+        return res
+    finally:
+        await conn.close()
+
+
+@app.post("/insights/batches/{batch_id}/digest")
+async def regenerate_batch_digest(batch_id: int):
+    """특정 인사이트 묶음의 종합 AI 다이제스트를 Gemini로 재생성한다."""
+    conn = await db.get_connection()
+    try:
+        from core.insights import generate_batch_digest
+        from core.llm.factory import get_llm_provider
+
+        llm = get_llm_provider()
+        digest = await generate_batch_digest(conn, batch_id, llm)
+        if digest:
+            return {"status": "ok", "digest": digest}
+        else:
+            return {"status": "error", "message": "Failed to generate digest"}
+    finally:
+        await conn.close()
+
+
+# --- Dividends Endpoints ---
+
+
+class DividendCreateRequest(BaseModel):
+    symbol: str
+    market: str = "domestic"
+    dividend_type: str = "CASH"
+    record_date: Optional[str] = None
+    payment_date: str
+    qty: Optional[float] = 0.0
+    dps: Optional[float] = None
+    gross_amount: Optional[float] = 0.0
+    tax_amount: Optional[float] = 0.0
+    net_amount: Optional[float] = None
+    currency: str = "KRW"
+    fx_rate: float = 1.0
+    notes: Optional[str] = None
+    source: str = "MANUAL"
+
+
+class DividendUpdateRequest(BaseModel):
+    symbol: Optional[str] = None
+    market: Optional[str] = None
+    dividend_type: Optional[str] = None
+    record_date: Optional[str] = None
+    payment_date: Optional[str] = None
+    qty: Optional[float] = None
+    dps: Optional[float] = None
+    gross_amount: Optional[float] = None
+    tax_amount: Optional[float] = None
+    net_amount: Optional[float] = None
+    currency: Optional[str] = None
+    fx_rate: Optional[float] = None
+    notes: Optional[str] = None
+
+
+@app.post("/dividends")
+async def create_dividend(req: DividendCreateRequest):
+    conn = await db.get_connection()
+    try:
+        div_id = await db.add_dividend(conn, req.model_dump())
+        return {"status": "ok", "id": div_id}
+    finally:
+        await conn.close()
+
+
+@app.get("/dividends")
+async def get_dividends(
+    symbol: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    conn = await db.get_connection()
+    try:
+        rows = await db.list_dividends(conn, symbol=symbol, start_date=start_date, end_date=end_date)
+        return rows
+    finally:
+        await conn.close()
+
+
+@app.get("/dividends/summary")
+async def get_dividends_summary():
+    conn = await db.get_connection()
+    try:
+        by_sym = await db.get_dividend_summary_by_symbol(conn)
+        monthly = await db.get_monthly_dividends(conn)
+        total_net = sum(v["total_net_krw"] for v in by_sym.values())
+        total_gross = sum(v["total_gross"] for v in by_sym.values())
+        total_tax = sum(v["total_tax"] for v in by_sym.values())
+        total_count = sum(v["count"] for v in by_sym.values())
+        return {
+            "totals": {
+                "total_net_krw": total_net,
+                "total_gross_krw": total_gross,
+                "total_tax_krw": total_tax,
+                "count": total_count,
+            },
+            "by_symbol": [
+                {"symbol": s, **v}
+                for s, v in sorted(by_sym.items(), key=lambda x: x[1]["total_net_krw"], reverse=True)
+            ],
+            "by_month": monthly,
+        }
+    finally:
+        await conn.close()
+
+
+@app.get("/dividends/{dividend_id}")
+async def get_dividend_endpoint(dividend_id: int):
+    conn = await db.get_connection()
+    try:
+        row = await db.get_dividend(conn, dividend_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Dividend not found")
+        return row
+    finally:
+        await conn.close()
+
+
+@app.put("/dividends/{dividend_id}")
+async def update_dividend_endpoint(dividend_id: int, req: DividendUpdateRequest):
+    conn = await db.get_connection()
+    try:
+        data = {k: v for k, v in req.model_dump().items() if v is not None}
+        ok = await db.update_dividend(conn, dividend_id, data)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Dividend not found")
+        return {"status": "ok"}
+    finally:
+        await conn.close()
+
+
+@app.delete("/dividends/{dividend_id}")
+async def delete_dividend_endpoint(dividend_id: int):
+    conn = await db.get_connection()
+    try:
+        ok = await db.delete_dividend(conn, dividend_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Dividend not found")
+        return {"status": "ok"}
+    finally:
+        await conn.close()
+
+
+@app.post("/dividends/import-csv")
+async def import_dividends_csv(request: Request):
+    import csv
+    import io
+
+    body = await request.body()
+    text = body.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text))
+    conn = await db.get_connection()
+    try:
+        inserted = 0
+        for row in reader:
+            if not row.get("symbol") or not row.get("payment_date"):
+                continue
+            data = {
+                "symbol": row["symbol"].strip(),
+                "payment_date": row["payment_date"].strip(),
+                "net_amount": float(row.get("net_amount") or 0.0),
+                "dividend_type": row.get("dividend_type", "CASH").strip(),
+                "notes": row.get("notes", "").strip(),
+                "currency": row.get("currency", "KRW").strip(),
+                "source": "CSV_IMPORT",
+            }
+            if row.get("gross_amount"):
+                data["gross_amount"] = float(row["gross_amount"])
+            if row.get("tax_amount"):
+                data["tax_amount"] = float(row["tax_amount"])
+            if row.get("qty"):
+                data["qty"] = float(row["qty"])
+            if row.get("dps"):
+                data["dps"] = float(row["dps"])
+            await db.add_dividend(conn, data)
+            inserted += 1
+        return {"status": "ok", "inserted_count": inserted}
+    finally:
+        await conn.close()
+
+
 

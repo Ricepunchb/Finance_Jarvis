@@ -48,23 +48,26 @@ def parse_args():
         default=10_000_000.0,
         help="초기 자본금 (원, 기본: 10,000,000)",
     )
+    sl_pct = getattr(settings, "STOP_LOSS_PCT", 0.06)
+    sl_cooldown = getattr(settings, "STOP_LOSS_COOLDOWN_DAYS", 5)
+    ob_days = getattr(settings, "ONBOARDING_DAYS", 3)
     parser.add_argument(
         "--stop-loss",
         type=float,
-        default=settings.STOP_LOSS_PCT,
-        help=f"손절 기준 (기본: {settings.STOP_LOSS_PCT})",
+        default=sl_pct,
+        help=f"손절 기준 (기본: {sl_pct})",
     )
     parser.add_argument(
         "--cooldown",
         type=int,
-        default=settings.STOP_LOSS_COOLDOWN_DAYS,
-        help=f"손절 후 재진입 쿨다운 일수 (기본: {settings.STOP_LOSS_COOLDOWN_DAYS})",
+        default=sl_cooldown,
+        help=f"손절 후 재진입 쿨다운 일수 (기본: {sl_cooldown})",
     )
     parser.add_argument(
         "--onboarding-days",
         type=int,
-        default=settings.ONBOARDING_DAYS,
-        help=f"분할 온보딩 일수 (기본: {settings.ONBOARDING_DAYS})",
+        default=ob_days,
+        help=f"분할 온보딩 일수 (기본: {ob_days})",
     )
     parser.add_argument(
         "--out",

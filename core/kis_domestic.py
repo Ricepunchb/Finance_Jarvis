@@ -402,3 +402,60 @@ async def get_daily_ccld(
         },
     )
     return _ensure_ok(response).get("output1", [])
+
+
+async def get_period_rights(
+    client: AsyncKISClient,
+    start_date: str,
+    end_date: str,
+    symbol: str = "",
+    right_type: str = "",
+    max_pages: int = 5,
+) -> List[Dict[str, Any]]:
+    """기간별계좌권리현황조회 (CTRGA011R). 배당, 분배금, 무상, 유상 등 권리 및 현금 입금 내역.
+
+    모의투자는 권리조회가 지원되지 않을 수 있으므로 실패 시 빈 목록을 반환하거나 KisApiError를 발생시킨다.
+    """
+    all_rows: List[Dict[str, Any]] = []
+    fk100 = ""
+    nk100 = ""
+    tr_cont = ""
+
+    for _ in range(max_pages):
+        headers = {"tr_cont": tr_cont} if tr_cont in ("M", "F") else None
+        response = await client.request(
+            method="GET",
+            path="/uapi/domestic-stock/v1/trading/period-rights",
+            tr_id=tr_ids.INQUIRE_PERIOD_RIGHTS_TR_ID,
+            headers=headers,
+            params={
+                "CANO": settings.cano,
+                "ACNT_PRDT_CD": settings.acnt_prdt_cd,
+                "INQR_STRT_DT": start_date,
+                "INQR_END_DT": end_date,
+                "INQR_DVSN": "03",  # 03: 권리/배당
+                "CUST_RNCNO25": "",
+                "HMID": "",
+                "RGHT_TYPE_CD": right_type,
+                "PDNO": symbol,
+                "PRDT_TYPE_CD": "",
+                "CTX_AREA_FK100": fk100,
+                "CTX_AREA_NK100": nk100,
+            },
+        )
+        data = _ensure_ok(response)
+        rows = data.get("output", [])
+        if isinstance(rows, list):
+            all_rows.extend(rows)
+
+        resp_headers = response.headers or {}
+        tr_cont = resp_headers.get("tr_cont", "")
+        if tr_cont not in ("M", "F"):
+            break
+        fk100 = data.get("ctx_area_fk100", "")
+        nk100 = data.get("ctx_area_nk100", "")
+        if not fk100 and not nk100:
+            break
+
+    return all_rows
+

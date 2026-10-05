@@ -62,6 +62,76 @@ class _PortfolioChangeSchema(BaseModel):
     rationale: str = Field(description="한국어 2~3문장 포트폴리오 전체 근거")
 
 
+class _ReportAnalysisItem(BaseModel):
+    research_id: int = Field(description="리포트 ID")
+    stance: str = Field(description="리포트 어조: POSITIVE, NEUTRAL, NEGATIVE 중 하나")
+    summary: str = Field(description="한국어 2문장 핵심 요약")
+    key_points: List[str] = Field(description="핵심 분석 포인트 (최대 3개)")
+    catalysts: List[str] = Field(description="상승/실적 개선 모멘텀 및 촉매 (최대 2개)")
+    risks: List[str] = Field(description="주의해야 할 리스크/우려 요인 (최대 2개)")
+
+
+class _ReportAnalysisBatchSchema(BaseModel):
+    items: List[_ReportAnalysisItem] = Field(description="분석된 리포트 목록")
+
+
+class _ThemeItem(BaseModel):
+    theme: str = Field(description="테마/키워드 명칭")
+    evidence: str = Field(description="해당 테마가 부각된 이유/근거")
+    symbols: List[str] = Field(description="관련 종목명 또는 종목코드 목록")
+
+
+class _NotableSymbolItem(BaseModel):
+    symbol: str = Field(description="종목코드")
+    name: str = Field(description="종목명")
+    why: str = Field(description="주목해야 하는 핵심 이유 1~2문장")
+    stance: str = Field(description="POSITIVE, NEUTRAL, 또는 CAUTION")
+
+
+class _InsightDigestSchema(BaseModel):
+    headline: str = Field(description="오늘 시장/발굴 종합 한 줄 요약")
+    themes: List[_ThemeItem] = Field(description="오늘 주목할 핵심 테마 목록 (최대 5개)")
+    notable_symbols: List[_NotableSymbolItem] = Field(description="가장 주목할 종목 목록 (최대 8개)")
+    risks: List[str] = Field(description="시장 및 업종 주요 경계 요인 (최대 4개)")
+    holdings_watch: List[str] = Field(description="현재 보유 종목과 관련된 관전 포인트 및 주의점")
+
+
+
+class _ReportAnalysisItem(BaseModel):
+    research_id: int = Field(description="리포트 ID")
+    stance: str = Field(description="리포트 어조: POSITIVE, NEUTRAL, NEGATIVE 중 하나")
+    summary: str = Field(description="한국어 2문장 핵심 요약")
+    key_points: List[str] = Field(description="핵심 분석 포인트 (최대 3개)")
+    catalysts: List[str] = Field(description="상승/실적 개선 모멘텀 및 촉매 (최대 2개)")
+    risks: List[str] = Field(description="주의해야 할 리스크/우려 요인 (최대 2개)")
+
+
+class _ReportAnalysisBatchSchema(BaseModel):
+    items: List[_ReportAnalysisItem] = Field(description="분석된 리포트 목록")
+
+
+class _ThemeItem(BaseModel):
+    theme: str = Field(description="테마/키워드 명칭")
+    evidence: str = Field(description="해당 테마가 부각된 이유/근거")
+    symbols: List[str] = Field(description="관련 종목명 또는 종목코드 목록")
+
+
+class _NotableSymbolItem(BaseModel):
+    symbol: str = Field(description="종목코드")
+    name: str = Field(description="종목명")
+    why: str = Field(description="주목해야 하는 핵심 이유 1~2문장")
+    stance: str = Field(description="POSITIVE, NEUTRAL, 또는 CAUTION")
+
+
+class _InsightDigestSchema(BaseModel):
+    headline: str = Field(description="오늘 시장/발굴 종합 한 줄 요약")
+    themes: List[_ThemeItem] = Field(description="오늘 주목할 핵심 테마 목록 (최대 5개)")
+    notable_symbols: List[_NotableSymbolItem] = Field(description="가장 주목할 종목 목록 (최대 8개)")
+    risks: List[str] = Field(description="시장 및 업종 주요 경계 요인 (최대 4개)")
+    holdings_watch: List[str] = Field(description="현재 보유 종목과 관련된 관전 포인트 및 주의점")
+
+
+
 def _format_candidate(c: Dict[str, Any]) -> str:
     parts = []
     if c.get("angle_label"):
@@ -90,6 +160,12 @@ def _format_candidate(c: Dict[str, Any]) -> str:
         parts.append(f"RSI {c['rsi']:.0f}")
     if c.get("tech"):
         parts.append(f"기술적시그널 {c['tech'].get('direction')} {c['tech'].get('strength', 0):.2f}")
+    if c.get("semantic_score") is not None:
+        parts.append(f"AI시맨틱 {c['semantic_score']:+.2f}")
+    elif c.get("raw_components", {}).get("semantic") is not None:
+        parts.append(f"AI시맨틱 {c['raw_components']['semantic']:+.2f}")
+    if c.get("semantic_penalty"):
+        parts.append(f"시맨틱페널티 {c['semantic_penalty']:.2f}")
     line = f"- {c['symbol']} ({c.get('name', '')}): " + ", ".join(parts)
     for reason in c.get("thesis") or []:
         line += f"\n    · {reason}"
@@ -183,6 +259,7 @@ class GeminiProvider(LLMProvider):
         current_signals: Dict[str, Dict[str, Any]],
         candidate_pool: List[Dict[str, Any]],
         macro_context: Optional[str],
+        insight_digest: Optional[Dict[str, Any]] = None,
         max_symbols: int,
         min_weight: float,
         max_weight: float,
@@ -246,6 +323,19 @@ class GeminiProvider(LLMProvider):
         if macro_context:
             lines.append("")
             lines.append(f"[참고 시장 맥락] {macro_context}")
+        if insight_digest:
+            lines.append("")
+            lines.append("[AI 시장 인텔리전스 다이제스트 (참고)]")
+            if insight_digest.get("headline"):
+                lines.append(f"- 시장 헤드라인: {insight_digest['headline']}")
+            if insight_digest.get("themes"):
+                th_strs = [f"{t.get('theme')}({t.get('evidence', '')})" for t in insight_digest['themes'] if isinstance(t, dict)]
+                if th_strs:
+                    lines.append(f"- 핵심 주도 테마: {', '.join(th_strs)}")
+            if insight_digest.get("risks"):
+                lines.append(f"- 주요 경계 리스크: {', '.join(insight_digest['risks'])}")
+            if insight_digest.get("holdings_watch"):
+                lines.append(f"- 보유종목 관전 포인트: {', '.join(insight_digest['holdings_watch'])}")
         lines.append("")
         lines.append(
             f"[제약] 최종 포트폴리오 종목 수는 최대 {max_symbols}개. weights의 키는 반드시 "
@@ -291,3 +381,283 @@ class GeminiProvider(LLMProvider):
                 "degraded": True,
                 "error_kind": "schema_violation" if isinstance(e, ValueError) else "llm_error",
             }
+
+    async def analyze_research_reports(
+        self, reports: List[Dict[str, Any]]
+    ) -> Dict[int, Dict[str, Any]]:
+        if not reports:
+            return {}
+
+        report_blocks = []
+        for r in reports:
+            rid = r.get("research_id") or r.get("id")
+            block = (
+                f"[리포트 ID: {rid}]\n"
+                f"- 종목: {r.get('symbol')} ({r.get('name', '')})\n"
+                f"- 증권사: {r.get('broker', '')}\n"
+                f"- 제목: {r.get('title', '')}\n"
+                f"- 투자의견: {r.get('opinion') or '미제시'}\n"
+                f"- 목표주가: {f'{r.get('target_price'):,.0f}원' if r.get('target_price') else '미제시'}\n"
+                f"- 작성일주가: {f'{r.get('price_at_write'):,.0f}원' if r.get('price_at_write') else '미제시'}\n"
+                f"- 본문 요약/발췌:\n{(r.get('content_text') or '')[:1200]}"
+            )
+            report_blocks.append(block)
+
+        prompt = (
+            "너는 주식 분석 리서치 센터의 냉철한 퀀트/애널리스트다. "
+            "아래 제공된 국내 증권사 리포트들을 각각 분석하라.\n\n"
+            "[주의 및 판정 지침]\n"
+            "1. 국내 증권사 리포트는 구조적으로 매수 편향(Buy Bias)이 강하다. 따라서 무조건 긍정적으로 보지 말고, "
+            "목표주가 하향, 이익 추정치 감소, 업황 둔화 우려, 불확실성 언급이 있다면 stance를 반드시 NEUTRAL 또는 NEGATIVE로 엄정히 판정하라.\n"
+            "2. 확실히 호실적 또는 구조적 성장 동력이 명확할 때만 POSITIVE를 부여하라.\n"
+            "3. 본문 내용에 근거하지 않은 사실을 지어내지 말라(환각 금지).\n"
+            "4. summary는 한국어 2문장으로 핵심을 요약하라.\n\n"
+            + "\n\n---\n\n".join(report_blocks)
+        )
+
+        try:
+            parsed = await self._generate(prompt, _ReportAnalysisBatchSchema, temperature=0.2)
+            results = {}
+            for item in parsed.items:
+                stance = item.stance.upper()
+                if stance not in ("POSITIVE", "NEUTRAL", "NEGATIVE"):
+                    stance = "NEUTRAL"
+                results[item.research_id] = {
+                    "stance": stance,
+                    "summary": item.summary,
+                    "key_points": item.key_points[:3],
+                    "catalysts": item.catalysts[:2],
+                    "risks": item.risks[:2],
+                }
+            return results
+        except Exception:
+            logger.exception("증권사 리포트 배치 LLM 분석 실패 - 빈 결과 반환")
+            return {}
+
+    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        valid_symbols = set()
+        for k in ("candidates", "holding_news", "new_reports", "holdings"):
+            for item in context.get(k) or []:
+                s = item.get("symbol")
+                if s:
+                    valid_symbols.add(s)
+
+        lines = [
+            "너는 전문 포트폴리오 매니저이자 시장 인텔리전스 분석가다. "
+            "오늘 수집·분석된 증권사 리포트, 시장 뉴스 헤드라인 표본, 보유종목 뉴스 감성, 종목 발굴 결과를 바탕으로 "
+            "투자자를 위한 일일 종합 다이제스트를 작성하라.\n",
+            "[작성 지침]",
+            "1. headline: 오늘의 시장/테마/발굴 흐름을 관통하는 명확하고 흥미로운 한 줄 요약 헤드라인을 작성하라.",
+            "2. themes: 오늘 리포트/뉴스/급등 종목들에서 강하게 포착된 핵심 테마를 최대 5개 도출하라.",
+            "3. notable_symbols: 제공된 종목들 중 오늘 특히 주목할 가치가 있는 종목을 최대 8개 엄선하라.",
+            "   (주의: 제공된 자료에 명시된 종목코드와 종목명만 사용해야 하며 절대 존재하지 않는 종목을 환각하지 마라)",
+            "4. risks: 시장 전반 또는 주요 섹터에서 포착되는 주의/경계 요인을 최대 4개 정리하라.",
+            "5. holdings_watch: 현재 보유 종목과 관련된 관전 포인트 및 주의점을 정리하라.\n",
+            "[제공 데이터]",
+        ]
+
+        if context.get("holdings"):
+            h_str = ", ".join(f"{h.get('symbol')}({h.get('name', '')})" for h in context["holdings"])
+            lines.append(f"- 현재 포트폴리오 보유종목: {h_str}")
+
+        if context.get("new_reports"):
+            lines.append("\n[오늘 신규/주요 증권사 리포트]")
+            for r in context["new_reports"][:15]:
+                lines.append(
+                    f"· [{r.get('broker')}] {r.get('symbol')}({r.get('name')}) - '{r.get('title')}' "
+                    f"(의견: {r.get('opinion') or '-'}, 목표가: {r.get('target_price') or '-'}, 판정: {r.get('stance') or '-'})"
+                )
+
+        if context.get("market_headlines"):
+            lines.append("\n[시장 전체 뉴스 다빈도 언급 종목 및 헤드라인]")
+            for h in context["market_headlines"][:12]:
+                lines.append(f"· {h.get('symbol')}({h.get('name')}): {h.get('title')} (언급 {h.get('mentions', 1)}회)")
+
+        if context.get("holding_news"):
+            lines.append("\n[보유 종목 최근 뉴스 및 감성 판정]")
+            for n in context["holding_news"][:10]:
+                lines.append(
+                    f"· {n.get('symbol')}: {n.get('title')} (점수: {n.get('score', 0):+.2f}, 사유: {n.get('reasoning', '')[:60]})"
+                )
+
+        if context.get("candidates"):
+            lines.append("\n[오늘 발굴 상위 후보 종목 (점수순)]")
+            for c in context["candidates"][:10]:
+                lines.append(
+                    f"· {c.get('symbol')}({c.get('name')}) [{c.get('angle_label')} {c.get('score', 0):.2f}점]: "
+                    + " / ".join(c.get("thesis") or [])
+                )
+
+        prompt = "\n".join(lines)
+
+        fallback = {
+            "headline": "오늘의 종목 발굴 및 리포트/뉴스 분석 요약",
+            "themes": [],
+            "notable_symbols": [],
+            "risks": [],
+            "holdings_watch": [],
+        }
+
+        try:
+            parsed = await self._generate(prompt, _InsightDigestSchema, temperature=0.3)
+            notables = []
+            for ns in parsed.notable_symbols:
+                if ns.symbol in valid_symbols or not valid_symbols:
+                    notables.append({
+                        "symbol": ns.symbol,
+                        "name": ns.name,
+                        "why": ns.why,
+                        "stance": ns.stance.upper() if ns.stance else "POSITIVE",
+                    })
+
+            return {
+                "headline": parsed.headline,
+                "themes": [t.model_dump() for t in parsed.themes[:5]],
+                "notable_symbols": notables[:8],
+                "risks": parsed.risks[:4],
+                "holdings_watch": parsed.holdings_watch[:4],
+            }
+        except Exception:
+            logger.exception("인사이트 다이제스트 LLM 생성 실패 - 기본 폴백 반환")
+            return fallback
+
+
+    async def analyze_research_reports(
+        self, reports: List[Dict[str, Any]]
+    ) -> Dict[int, Dict[str, Any]]:
+        if not reports:
+            return {}
+
+        report_blocks = []
+        for r in reports:
+            rid = r.get("research_id") or r.get("id")
+            block = (
+                f"[리포트 ID: {rid}]\n"
+                f"- 종목: {r.get('symbol')} ({r.get('name', '')})\n"
+                f"- 증권사: {r.get('broker', '')}\n"
+                f"- 제목: {r.get('title', '')}\n"
+                f"- 투자의견: {r.get('opinion') or '미제시'}\n"
+                f"- 목표주가: {f'{r.get('target_price'):,.0f}원' if r.get('target_price') else '미제시'}\n"
+                f"- 작성일주가: {f'{r.get('price_at_write'):,.0f}원' if r.get('price_at_write') else '미제시'}\n"
+                f"- 본문 요약/발췌:\n{(r.get('content_text') or '')[:1200]}"
+            )
+            report_blocks.append(block)
+
+        prompt = (
+            "너는 주식 분석 리서치 센터의 냉철한 퀀트/애널리스트다. "
+            "아래 제공된 국내 증권사 리포트들을 각각 분석하라.\n\n"
+            "[주의 및 판정 지침]\n"
+            "1. 국내 증권사 리포트는 구조적으로 매수 편향(Buy Bias)이 강하다. 따라서 무조건 긍정적으로 보지 말고, "
+            "목표주가 하향, 이익 추정치 감소, 업황 둔화 우려, 불확실성 언급이 있다면 stance를 반드시 NEUTRAL 또는 NEGATIVE로 엄정히 판정하라.\n"
+            "2. 확실히 호실적 또는 구조적 성장 동력이 명확할 때만 POSITIVE를 부여하라.\n"
+            "3. 본문 내용에 근거하지 않은 사실을 지어내지 말라(환각 금지).\n"
+            "4. summary는 한국어 2문장으로 핵심을 요약하라.\n\n"
+            + "\n\n---\n\n".join(report_blocks)
+        )
+
+        try:
+            parsed = await self._generate(prompt, _ReportAnalysisBatchSchema, temperature=0.2)
+            results = {}
+            for item in parsed.items:
+                stance = item.stance.upper()
+                if stance not in ("POSITIVE", "NEUTRAL", "NEGATIVE"):
+                    stance = "NEUTRAL"
+                results[item.research_id] = {
+                    "stance": stance,
+                    "summary": item.summary,
+                    "key_points": item.key_points[:3],
+                    "catalysts": item.catalysts[:2],
+                    "risks": item.risks[:2],
+                }
+            return results
+        except Exception:
+            logger.exception("증권사 리포트 배치 LLM 분석 실패 - 빈 결과 반환")
+            return {}
+
+    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        valid_symbols = set()
+        for k in ("candidates", "holding_news", "new_reports", "holdings"):
+            for item in context.get(k) or []:
+                s = item.get("symbol")
+                if s:
+                    valid_symbols.add(s)
+
+        lines = [
+            "너는 전문 포트폴리오 매니저이자 시장 인텔리전스 분석가다. "
+            "오늘 수집·분석된 증권사 리포트, 시장 뉴스 헤드라인 표본, 보유종목 뉴스 감성, 종목 발굴 결과를 바탕으로 "
+            "투자자를 위한 일일 종합 다이제스트를 작성하라.\n",
+            "[작성 지침]",
+            "1. headline: 오늘의 시장/테마/발굴 흐름을 관통하는 명확하고 흥미로운 한 줄 요약 헤드라인을 작성하라.",
+            "2. themes: 오늘 리포트/뉴스/급등 종목들에서 강하게 포착된 핵심 테마를 최대 5개 도출하라.",
+            "3. notable_symbols: 제공된 종목들 중 오늘 특히 주목할 가치가 있는 종목을 최대 8개 엄선하라.",
+            "   (주의: 제공된 자료에 명시된 종목코드와 종목명만 사용해야 하며 절대 존재하지 않는 종목을 환각하지 마라)",
+            "4. risks: 시장 전반 또는 주요 섹터에서 포착되는 주의/경계 요인을 최대 4개 정리하라.",
+            "5. holdings_watch: 현재 보유 종목과 관련된 관전 포인트 및 주의점을 정리하라.\n",
+            "[제공 데이터]",
+        ]
+
+        if context.get("holdings"):
+            h_str = ", ".join(f"{h.get('symbol')}({h.get('name', '')})" for h in context["holdings"])
+            lines.append(f"- 현재 포트폴리오 보유종목: {h_str}")
+
+        if context.get("new_reports"):
+            lines.append("\n[오늘 신규/주요 증권사 리포트]")
+            for r in context["new_reports"][:15]:
+                lines.append(
+                    f"· [{r.get('broker')}] {r.get('symbol')}({r.get('name')}) - '{r.get('title')}' "
+                    f"(의견: {r.get('opinion') or '-'}, 목표가: {r.get('target_price') or '-'}, 판정: {r.get('stance') or '-'})"
+                )
+
+        if context.get("market_headlines"):
+            lines.append("\n[시장 전체 뉴스 다빈도 언급 종목 및 헤드라인]")
+            for h in context["market_headlines"][:12]:
+                lines.append(f"· {h.get('symbol')}({h.get('name')}): {h.get('title')} (언급 {h.get('mentions', 1)}회)")
+
+        if context.get("holding_news"):
+            lines.append("\n[보유 종목 최근 뉴스 및 감성 판정]")
+            for n in context["holding_news"][:10]:
+                lines.append(
+                    f"· {n.get('symbol')}: {n.get('title')} (점수: {n.get('score', 0):+.2f}, 사유: {n.get('reasoning', '')[:60]})"
+                )
+
+        if context.get("candidates"):
+            lines.append("\n[오늘 발굴 상위 후보 종목 (점수순)]")
+            for c in context["candidates"][:10]:
+                lines.append(
+                    f"· {c.get('symbol')}({c.get('name')}) [{c.get('angle_label')} {c.get('score', 0):.2f}점]: "
+                    + " / ".join(c.get("thesis") or [])
+                )
+
+        prompt = "\n".join(lines)
+
+        fallback = {
+            "headline": "오늘의 종목 발굴 및 리포트/뉴스 분석 요약",
+            "themes": [],
+            "notable_symbols": [],
+            "risks": [],
+            "holdings_watch": [],
+        }
+
+        try:
+            parsed = await self._generate(prompt, _InsightDigestSchema, temperature=0.3)
+            notables = []
+            for ns in parsed.notable_symbols:
+                if ns.symbol in valid_symbols or not valid_symbols:
+                    notables.append({
+                        "symbol": ns.symbol,
+                        "name": ns.name,
+                        "why": ns.why,
+                        "stance": ns.stance.upper() if ns.stance else "POSITIVE",
+                    })
+
+            return {
+                "headline": parsed.headline,
+                "themes": [t.model_dump() for t in parsed.themes[:5]],
+                "notable_symbols": notables[:8],
+                "risks": parsed.risks[:4],
+                "holdings_watch": parsed.holdings_watch[:4],
+            }
+        except Exception:
+            logger.exception("인사이트 다이제스트 LLM 생성 실패 - 기본 폴백 반환")
+            return fallback
+

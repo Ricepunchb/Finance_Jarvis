@@ -96,9 +96,13 @@ async def source_momentum(client: AsyncKISClient) -> Dict[str, Dict[str, Any]]:
     return found
 
 
-async def source_broker_research() -> Dict[str, Dict[str, Any]]:
+async def source_broker_research(
+    collector: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
     """리포트를 낸 증권사 수가 많고 많이 읽힌 순서로 정렬 (merge_sources가 이 순서로 자른다)."""
     reports = await asyncio.to_thread(fetch_company_research, 2)
+    if collector is not None:
+        collector.reports = list(reports)
     grouped = discovery_signals.group_research_reports(
         reports, settings.DISCOVERY_BROKER_LOOKBACK_DAYS, datetime.now(tz=KST),
     )
@@ -134,7 +138,36 @@ def count_headline_mentions(
     return counts
 
 
-async def source_news_buzz(client: AsyncKISClient, names: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+def extract_matched_headlines(
+    headlines: List[Dict[str, Any]], names: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """인사이트 묶음 저장용: 종목이 매칭된 헤드라인들을 추출한다."""
+    name_items = [(n, s) for s, n in names.items() if len(n) >= NEWS_MIN_NAME_LEN]
+    matched_list = []
+    for h in headlines:
+        title = h.get("hts_pbnt_titl_cntt") or ""
+        symbols = {h.get(f"iscd{i}") for i in range(1, 6)} - {None, ""}
+        matched = [n for n, _ in name_items if n in title]
+        matched = [n for n in matched if not any(n != other and n in other for other in matched)]
+        symbols |= {s for n, s in name_items if n in matched}
+        valid_symbols = [s for s in symbols if s in names]
+        if valid_symbols:
+            primary_s = valid_symbols[0]
+            matched_list.append({
+                "title": title,
+                "symbol": primary_s,
+                "name": names.get(primary_s),
+                "matched_symbols": valid_symbols,
+                "published_at": None,
+            })
+    return matched_list
+
+
+async def source_news_buzz(
+    client: AsyncKISClient,
+    names: Dict[str, str],
+    collector: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
     """KIS 뉴스 제목 API는 한 번에 40건(수 분~수십 분 분량)만 주므로 최근 며칠의 여러 시각을
     표본으로 찍는다 — 전수 집계가 아니라 '표본에 자주 보이는 종목'이다."""
     headlines: List[Dict[str, Any]] = []
@@ -153,12 +186,18 @@ async def source_news_buzz(client: AsyncKISClient, names: Dict[str, str]) -> Dic
                 if key and key not in seen:
                     seen.add(key)
                     headlines.append(row)
+
+    if collector is not None:
+        collector.sampled_headline_count = len(headlines)
+        collector.headline_matches = extract_matched_headlines(headlines, names)
+
     counts = await asyncio.to_thread(count_headline_mentions, headlines, names)
     top = sorted(
         ((s, ev) for s, ev in counts.items() if ev["mentions"] >= NEWS_MIN_MENTIONS),
         key=lambda item: item[1]["mentions"], reverse=True,
     )[:NEWS_MAX_SYMBOLS]
     return {s: {**ev, "sampled_headlines": len(headlines)} for s, ev in top}
+
 
 
 async def source_undervalued(eligible: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -230,14 +269,21 @@ def merge_sources(
     return {s: merged[s] for s in chosen}
 
 
-async def refresh_dynamic_universe(conn: aiosqlite.Connection, client: AsyncKISClient) -> Dict[str, Any]:
+async def refresh_dynamic_universe(
+    conn: aiosqlite.Connection, client: AsyncKISClient, trigger_type: str = "SCHEDULED"
+) -> Dict[str, Any]:
     if _refresh_lock.locked():
         raise RefreshInProgressError("종목 발굴 갱신이 이미 진행 중")
     async with _refresh_lock:
-        return await _refresh(conn, client)
+        return await _refresh(conn, client, trigger_type=trigger_type)
 
 
-async def _refresh(conn: aiosqlite.Connection, client: AsyncKISClient) -> Dict[str, Any]:
+async def _refresh(
+    conn: aiosqlite.Connection, client: AsyncKISClient, trigger_type: str = "SCHEDULED"
+) -> Dict[str, Any]:
+    from core.insights import InsightCollector, build_batch
+
+    collector = InsightCollector()
     summary: Dict[str, Any] = {"started_at": time.time(), "sources": {}, "errors": {}}
 
     master_ts = await db.get_stock_master_refreshed_at(conn)
@@ -264,8 +310,8 @@ async def _refresh(conn: aiosqlite.Connection, client: AsyncKISClient) -> Dict[s
         summary["sources"][name] = len(by_source[name])
 
     await run("momentum", source_momentum(client))
-    await run("broker", source_broker_research())
-    await run("news", source_news_buzz(client, {s: r["name"] for s, r in eligible.items()}))
+    await run("broker", source_broker_research(collector))
+    await run("news", source_news_buzz(client, {s: r["name"] for s, r in eligible.items()}, collector))
     await run("value", source_undervalued(eligible))
     movers = {s: ev.get("rise_pct", 0) for s, ev in by_source["momentum"].items()
               if (ev.get("rise_pct") or 0) >= MOMENTUM_MIN_RISE_PCT}
@@ -291,4 +337,15 @@ async def _refresh(conn: aiosqlite.Connection, client: AsyncKISClient) -> Dict[s
     await db.set_state(conn, STATE_REFRESHED_AT, str(summary["finished_at"]))
     await db.set_state(conn, STATE_REFRESH_SUMMARY, json.dumps(summary, ensure_ascii=False))
     logger.info(f"동적 종목 발굴 갱신 완료: {summary}")
+
+    # 인사이트 묶음 생성 및 영속화 (실패해도 발굴 결과 자체는 유지)
+    try:
+        insight_res = await build_batch(
+            conn, collector, scored, summary, trigger_type=trigger_type
+        )
+        summary["insight_batch_id"] = insight_res.get("batch_id")
+    except Exception:
+        logger.exception("인사이트 묶음 생성 실패 - 발굴 갱신은 정상 완료")
+
     return summary
+
