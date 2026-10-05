@@ -72,7 +72,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             start_date = d_col1.date_input("시작일", value=start_default, max_value=today)
             end_date = d_col2.date_input("종료일", value=end_default, max_value=today)
 
-        col_c1, col_c2, col_c3 = st.columns(3)
+        col_c1, col_c2, col_c3, col_c4 = st.columns(4)
         with col_c1:
             initial_cash = st.number_input(
                 "초기 자본금 (원)",
@@ -83,18 +83,42 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
         with col_c2:
             stop_loss_pct = st.number_input(
                 "손절 기준 (STOP_LOSS)",
-                value=0.07,
+                value=0.06,
                 step=0.01,
                 format="%.2f",
-                help="평단가 대비 -7% 도달 시 즉시 전량 매도",
+                help="평단가 대비 -6% 도달 시 즉시 전량 매도 (최적화값)",
             )
         with col_c3:
-            slippage_pct = st.number_input(
-                "슬리피지 가정",
-                value=0.0005,
-                step=0.0001,
-                format="%.4f",
-                help="체결 시 불리한 호가 체결 가정 (기본: 0.05%)",
+            cooldown_days = st.number_input(
+                "손절 후 쿨다운 (일)",
+                value=5,
+                step=1,
+                min_value=0,
+                max_value=30,
+                help="손절 발생 후 동일 종목 재진입 방지 쿨다운 기간 (역추세 연속 손절 차단, 기본 5일)",
+            )
+        with col_c4:
+            onboard_days = st.number_input(
+                "분할 온보딩 (일)",
+                value=3,
+                step=1,
+                min_value=1,
+                max_value=10,
+                help="신규/저비중 종목 편입 시 목표비중 분할 매수 일수 (기본 3일)",
+            )
+
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            require_uptrend = st.checkbox(
+                "중기 상승 추세 필터 (SMA20 >= SMA60 시에만 온보딩)",
+                value=True,
+                help="하락 추세 종목의 기계적 물타기를 차단하고 상승 추세 종목에만 자본을 배분합니다.",
+            )
+        with col_f2:
+            require_sma20 = st.checkbox(
+                "단기 이평선 필터 (현재가 >= SMA20 시에만 매수)",
+                value=True,
+                help="단기 급락 중인 종목의 칼날잡기를 차단합니다.",
             )
 
         run_btn = st.button("🚀 백테스트 실행", type="primary", use_container_width=True)
@@ -113,8 +137,12 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             "benchmark_symbol": bench_input.strip() or "360750",
             "fee_rate": 0.00015,
             "tax_rate": 0.0018,
-            "slippage_pct": float(slippage_pct),
+            "slippage_pct": 0.0005,
             "stop_loss_pct": float(stop_loss_pct),
+            "stop_loss_cooldown_days": int(cooldown_days),
+            "onboarding_days": int(onboard_days),
+            "require_uptrend_for_onboarding": bool(require_uptrend),
+            "require_sma20_for_buy": bool(require_sma20),
         }
 
         with st.spinner("과거 데이터 수집 및 퀀트 백테스트 시뮬레이션 중..."):

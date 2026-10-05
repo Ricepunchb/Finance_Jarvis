@@ -49,6 +49,24 @@ def parse_args():
         help="초기 자본금 (원, 기본: 10,000,000)",
     )
     parser.add_argument(
+        "--stop-loss",
+        type=float,
+        default=settings.STOP_LOSS_PCT,
+        help=f"손절 기준 (기본: {settings.STOP_LOSS_PCT})",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=int,
+        default=settings.STOP_LOSS_COOLDOWN_DAYS,
+        help=f"손절 후 재진입 쿨다운 일수 (기본: {settings.STOP_LOSS_COOLDOWN_DAYS})",
+    )
+    parser.add_argument(
+        "--onboarding-days",
+        type=int,
+        default=settings.ONBOARDING_DAYS,
+        help=f"분할 온보딩 일수 (기본: {settings.ONBOARDING_DAYS})",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="",
@@ -78,6 +96,9 @@ async def main():
         end_date=end_date,
         initial_cash=args.cash,
         benchmark_symbol=args.benchmark,
+        stop_loss_pct=args.stop_loss,
+        stop_loss_cooldown_days=args.cooldown,
+        onboarding_days=args.onboarding_days,
     )
 
     print(f"\n=======================================================")

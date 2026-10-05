@@ -31,6 +31,10 @@ class BacktestConfig(BaseModel):
     tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT
     slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT
     stop_loss_pct: float = settings.STOP_LOSS_PCT
+    stop_loss_cooldown_days: int = settings.STOP_LOSS_COOLDOWN_DAYS
+    onboarding_days: int = settings.ONBOARDING_DAYS
+    require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING
+    require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY
 
 
 class BacktestRunner:
@@ -69,6 +73,10 @@ class BacktestRunner:
             tax_rate=config.tax_rate,
             slippage_pct=config.slippage_pct,
             stop_loss_pct=config.stop_loss_pct,
+            stop_loss_cooldown_days=config.stop_loss_cooldown_days,
+            onboarding_days=config.onboarding_days,
+            require_uptrend_for_onboarding=config.require_uptrend_for_onboarding,
+            require_sma20_for_buy=config.require_sma20_for_buy,
         )
         result: BacktestResult = engine.run(config.start_date, config.end_date)
 

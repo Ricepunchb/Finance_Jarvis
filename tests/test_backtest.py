@@ -276,3 +276,53 @@ def test_partial_trailing_take_profit_uptrend():
     assert len(tp_trades) >= 1
     # 50% 분할 매도(50주) 확인
     assert tp_trades[0].qty == 50.0
+
+
+def test_expensive_stock_single_share_allowed():
+    """1주 가격(150만원)이 1회 예산(100만원)보다 비싸도 단일 주 매수가 정상 집행되는지 검증."""
+    dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(70)]
+    df = _create_synthetic_ohlcv(dates, start_price=1_500_000.0, trend=0.005)
+    data = {"000660": df}
+
+    engine = BacktestEngine(
+        symbols=["000660"],
+        data_by_symbol=data,
+        initial_cash=10_000_000.0,
+        allow_expensive_stock_single_share=True,
+    )
+    res = engine.run("2025-01-01", dates[-1])
+    buys = [t for t in res.trades if t.side == "buy"]
+    assert len(buys) >= 1
+    assert buys[0].qty >= 1.0
+
+
+def test_stop_loss_cooldown_prevents_immediate_rebuy():
+    """손절(-7%) 발생 후 쿨다운 기간(5일) 동안은 동일 종목 재진입이 차단되는지 검증."""
+    dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30)]
+    df = _create_synthetic_ohlcv(dates, start_price=100000.0, drop_on_day=5)
+    data = {"006800": df}
+
+    engine = BacktestEngine(
+        symbols=["006800"],
+        data_by_symbol=data,
+        initial_cash=10_000_000.0,
+        stop_loss_cooldown_days=5,
+    )
+    engine.positions["006800"] = Position(
+        symbol="006800",
+        qty=10.0,
+        avg_price=100000.0,
+        peak_price=100000.0,
+        entry_date="2025-01-01",
+        entry_avg_price=100000.0,
+    )
+    res = engine.run("2025-01-01", dates[-1])
+    sl_trades = [t for t in res.trades if t.side == "sell" and t.reason == "STOP_LOSS"]
+    assert len(sl_trades) == 1
+    sl_date = pd.to_datetime(sl_trades[0].date)
+
+    subsequent_buys = [
+        t for t in res.trades
+        if t.side == "buy" and (pd.to_datetime(t.date) - sl_date).days <= 5 and pd.to_datetime(t.date) > sl_date
+    ]
+    assert len(subsequent_buys) == 0

@@ -74,9 +74,13 @@ class BacktestEngine:
         tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT,
         slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT,
         stop_loss_pct: float = settings.STOP_LOSS_PCT,
+        stop_loss_cooldown_days: int = settings.STOP_LOSS_COOLDOWN_DAYS,
         onboarding_days: int = settings.ONBOARDING_DAYS,
         max_position_pct: float = settings.MAX_POSITION_PCT,
         max_order_notional: float = float(settings.MAX_ORDER_NOTIONAL_KRW),
+        require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING,
+        require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY,
+        allow_expensive_stock_single_share: bool = True,
     ):
         self.symbols = symbols
         self.data = data_by_symbol
@@ -86,9 +90,13 @@ class BacktestEngine:
         self.tax_rate = tax_rate
         self.slippage_pct = slippage_pct
         self.stop_loss_pct = stop_loss_pct
+        self.stop_loss_cooldown_days = stop_loss_cooldown_days
         self.onboarding_days = onboarding_days
         self.max_position_pct = max_position_pct
         self.max_order_notional = max_order_notional
+        self.require_uptrend_for_onboarding = require_uptrend_for_onboarding
+        self.require_sma20_for_buy = require_sma20_for_buy
+        self.allow_expensive_stock_single_share = allow_expensive_stock_single_share
 
         # 균등 비중 기본값
         if target_weights is None or not target_weights:
@@ -100,6 +108,7 @@ class BacktestEngine:
         self.positions: Dict[str, Position] = {}
         self.trades: List[TradeRecord] = []
         self.snapshots: List[DailySnapshot] = []
+        self.last_sl_date: Dict[str, str] = {}
 
     def run(self, start_date: str, end_date: str) -> BacktestResult:
         # 거래일 집합 생성 (지표 콜드스타트 이후 구간 대상)
@@ -207,11 +216,12 @@ class BacktestEngine:
             # 고점 갱신 (당일 장중 고가 반영)
             pos.peak_price = max(pos.peak_price, high)
 
-            # 1. 손절 체크: 장중 최저가가 평단 대비 -7% 도달 여부 (전량 청산)
+            # 1. 손절 체크: 장중 최저가가 평단 대비 -6%/-7% 도달 여부 (전량 청산)
             if (low - pos.avg_price) / pos.avg_price <= -self.stop_loss_pct:
                 exec_price = min(open_p, pos.avg_price * (1.0 - self.stop_loss_pct))
                 exec_price = max(exec_price, low)
                 self._execute_sell(symbol, pos.qty, exec_price, cur_date, "STOP_LOSS")
+                self.last_sl_date[symbol] = cur_date
                 continue
 
             # 2. 트레일링 익절 체크
@@ -255,13 +265,35 @@ class BacktestEngine:
                 continue
 
             if len(hist) >= 60:
-                sma20 = hist["close"].rolling(20).mean().iloc[-1]
-                sma60 = hist["close"].rolling(60).mean().iloc[-1]
+                sma20 = float(hist["close"].rolling(20).mean().iloc[-1])
+                sma60 = float(hist["close"].rolling(60).mean().iloc[-1])
                 is_uptrend = (sma20 >= sma60)
                 is_downtrend = (sma20 < sma60) and (close_p < sma20)
+                is_structural_downtrend = (sma20 < sma60)
             else:
+                sma20 = close_p
+                sma60 = close_p
                 is_uptrend = False
                 is_downtrend = False
+                is_structural_downtrend = False
+
+            # 손절 후 재진입 쿨다운 (역추세 연속 손절 방지)
+            if self.stop_loss_cooldown_days > 0 and symbol in self.last_sl_date:
+                last_d = pd.to_datetime(self.last_sl_date[symbol])
+                cur_d = pd.to_datetime(cur_date)
+                days_since_sl = (cur_d - last_d).days
+                if days_since_sl < self.stop_loss_cooldown_days:
+                    continue
+                # 쿨다운 일수가 지났더라도 최소 단기 이평선(SMA20) 회복 전까지는 매수 보류
+                if close_p < sma20:
+                    continue
+
+            # 매수 필터 (하락 추세 및 단기 역추세 시 진입 차단)
+            allow_buy = True
+            if self.require_sma20_for_buy and close_p < sma20:
+                allow_buy = False
+            if self.require_uptrend_for_onboarding and is_structural_downtrend:
+                allow_buy = False
 
             # 1. 밴드 상한 강제 축소 (상승 추세 시 버퍼 여유 부여)
             buffer_pct = signal_engine.BAND_CEILING_BUFFER_PCT * (2.0 if is_uptrend else 1.0)
@@ -281,7 +313,7 @@ class BacktestEngine:
 
             # 3. 분할 온보딩 매수 (하락 추세 종목은 물타기 방지를 위해 유예)
             if settings.ONBOARDING_ENABLED and target_weight > 0 and cur_weight < (target_weight - settings.REBALANCE_BAND_PCT):
-                if direction != "SELL" and not is_downtrend:
+                if direction != "SELL" and not is_downtrend and allow_buy:
                     gap_val = (target_weight - cur_weight) * cur_total_equity
                     daily_budget = (target_weight * cur_total_equity) / max(1, self.onboarding_days)
                     buy_val = min(gap_val, daily_budget, self.max_order_notional)
@@ -290,13 +322,19 @@ class BacktestEngine:
                     buy_val = min(buy_val, max_allowed_val, self.cash)
 
                     buy_qty = float(int(buy_val / close_p))
+                    # 1주가 1회 주문한도나 일일예산보다 비싼 고가주(예: SK하이닉스) 편입 보장
+                    if buy_qty <= 0 and self.allow_expensive_stock_single_share:
+                        if self.cash >= close_p and (cur_pos_val + close_p) <= (self.max_position_pct * cur_total_equity):
+                            if gap_val >= close_p * 0.5:
+                                buy_qty = 1.0
+
                     if buy_qty > 0:
                         self._execute_buy(symbol, buy_qty, close_p, cur_date, "onboarding_tranche")
                         continue
 
             # 4. 스윙 시그널 매수/매도
             if strength >= signal_engine.SWING_SIGNAL_THRESHOLD:
-                if direction == "BUY":
+                if direction == "BUY" and allow_buy:
                     # 신호 강도에 비례한 매수 금액 (최대 자산의 15%)
                     swing_budget = cur_total_equity * signal_engine.SWING_TRADE_MAX_EQUITY_FRACTION * strength
                     swing_budget = min(swing_budget, self.max_order_notional)
@@ -305,6 +343,11 @@ class BacktestEngine:
                     buy_val = min(swing_budget, max_allowed_val, self.cash)
 
                     buy_qty = float(int(buy_val / close_p))
+                    if buy_qty <= 0 and self.allow_expensive_stock_single_share:
+                        if self.cash >= close_p and (cur_pos_val + close_p) <= (self.max_position_pct * cur_total_equity):
+                            if swing_budget >= close_p * 0.5:
+                                buy_qty = 1.0
+
                     if buy_qty > 0:
                         self._execute_buy(symbol, buy_qty, close_p, cur_date, f"swing_signal_buy (str={strength:.2f})")
                 elif direction == "SELL" and cur_qty > 0:

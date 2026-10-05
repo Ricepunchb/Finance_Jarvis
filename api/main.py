@@ -592,6 +592,10 @@ class RunBacktestRequest(BaseModel):
     tax_rate: float = settings.BACKTEST_DEFAULT_TAX_PCT
     slippage_pct: float = settings.BACKTEST_DEFAULT_SLIPPAGE_PCT
     stop_loss_pct: float = settings.STOP_LOSS_PCT
+    stop_loss_cooldown_days: int = settings.STOP_LOSS_COOLDOWN_DAYS
+    onboarding_days: int = settings.ONBOARDING_DAYS
+    require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING
+    require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY
 
 
 @app.post("/backtest/run")
@@ -613,6 +617,10 @@ async def run_backtest_endpoint(req: RunBacktestRequest):
         tax_rate=req.tax_rate,
         slippage_pct=req.slippage_pct,
         stop_loss_pct=req.stop_loss_pct,
+        stop_loss_cooldown_days=req.stop_loss_cooldown_days,
+        onboarding_days=req.onboarding_days,
+        require_uptrend_for_onboarding=req.require_uptrend_for_onboarding,
+        require_sma20_for_buy=req.require_sma20_for_buy,
     )
     conn = await db.get_connection()
     try:

@@ -3,6 +3,7 @@ import asyncio
 import aiosqlite
 
 from core import db, signal_engine
+from core.config import settings
 from core.risk import RiskManager
 
 
@@ -122,7 +123,8 @@ def test_onboarding_buys_underweight_symbol_on_hold_signal_within_order_cap():
 def test_onboarding_skipped_on_sell_signal_in_band_or_when_daily_budget_used():
     assert _decide_onboard(0.0, direction="SELL", strength=0.4) is None
     assert _decide_onboard(0.07) is None                       # 밴드 안
-    assert _decide_onboard(0.0, prior_notional=5_700_000) is None  # 일일 예산(0.08*352M/5=5.6M) 소진
+    daily_budget = 0.08 * 352_000_000 / settings.ONBOARDING_DAYS
+    assert _decide_onboard(0.0, prior_notional=daily_budget + 100_000) is None  # 일일 예산 소진
 
 
 def test_onboarding_allows_one_share_when_price_exceeds_order_cap():

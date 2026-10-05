@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     WS_STALENESS_THRESHOLD_SEC: int = 120  # 체결통보 웹소켓 무응답 허용 시간
 
     # --- 손절/트레일링익절 ---
-    STOP_LOSS_PCT: float = 0.07             # 평단가 대비 -7% 시 전량 강제매도 (쿨다운/일일손실한도 우회)
+    STOP_LOSS_PCT: float = 0.06             # 평단가 대비 -6% 시 전량 강제매도 (최적화 그리드 서치 검증값)
+    STOP_LOSS_COOLDOWN_DAYS: int = 5        # 손절 후 재진입 쿨다운 (달력일 기준, 역추세 연속 손절 방지)
     TRAILING_TAKE_PROFIT_PCT: float = 0.05  # 진입 후 고점 대비 -5% 하락 시 전량매도 (ATR 산출 불가 시 폴백)
     # ATR 기반 트레일링: 종목 변동성에 맞춰 폭/무장 조건을 정한다 (ATR% = ATR(일봉) / 현재가)
     ATR_LENGTH: int = 14
@@ -41,7 +42,9 @@ class Settings(BaseSettings):
 
     # --- 분할 온보딩 매수 (신규 편입/저비중 종목을 시그널 문턱 없이 며칠에 걸쳐 목표비중까지 채움) ---
     ONBOARDING_ENABLED: bool = True
-    ONBOARDING_DAYS: int = 5                     # 목표금액을 이 일수로 나눈 만큼을 하루 매수 예산으로 사용
+    ONBOARDING_DAYS: int = 3                     # 목표금액을 이 일수로 나눈 만큼을 하루 매수 예산으로 사용 (최적화값)
+    REQUIRE_UPTREND_FOR_ONBOARDING: bool = True  # 온보딩 매수 시 중기 상승 추세(SMA20 >= SMA60) 필수 (역추세 물타기 방지)
+    REQUIRE_SMA20_FOR_BUY: bool = True           # 모든 신규 매수 시 단기 이평선(Close >= SMA20) 상회 필수 (칼날잡기 방지)
 
     # --- 포트폴리오 종목 삭제(정리 대기): 신규매수 중단 + 매도 신호 때 전량 매도, 기한 내 신호가 없으면 강제 청산 ---
     WINDDOWN_MAX_DAYS: int = 5                   # 삭제 후 이 일수(달력일)가 지나면 신호와 무관하게 전량 청산
