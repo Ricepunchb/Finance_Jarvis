@@ -1,8 +1,8 @@
 # core/master_files.py
 """KIS 정적 마스터 파일(전종목/테마) 다운로드·파싱. KIS REST에는 전종목 목록 TR이 없어서
 종목 발굴의 모집단은 이 파일에서만 얻는다. 보통주와 ETF(레버리지·인버스·파생 기반 제외)를 후보로 허용하고
-ETN·SPAC·관리/거래정지 등은 제외한다. 필드 위치는 Hantu-api/open-trading-api/stocks_info의
-공식 파서(kis_kospi_code_mst.py 등)와 같고, 실제 파일로 검증했다.
+ETN·SPAC·관리/거래정지 등은 제외한다. 필드 위치는 KIS 공식 마스터 스펙(kis_kospi_code_mst 등)과 같고,
+실제 파일로 검증했다.
 
 행 구조: [단축코드 9][표준코드 12][한글명 가변] + 고정폭 꼬리(KOSPI 227자, KOSDAQ 221자) + 개행.
 꼬리는 전부 ASCII라 디코딩된 문자열을 뒤에서부터 잘라도 안전하다.

@@ -60,8 +60,6 @@ uv run streamlit run app.py
 
 실전투자로 바꾸려면 `IS_MOCK=False`만으로는 안 되고 `I_UNDERSTAND_REAL_MONEY_RISK=true`도 같이 있어야 한다. 하나만 바꿔서 실수로 실거래가 시작되는 걸 막으려는 장치다. 처음에는 모의투자로 며칠 돌려 보는 걸 권한다.
 
-`Hantu-api/open-trading-api`는 KIS 공식 예제 저장소(git submodule)다. TR ID나 마스터 파일 형식을 확인할 때 참고했고, 실행 중에는 쓰지 않는다.
-
 ## 페이지
 
 좌측 메뉴에 두 페이지가 있다. 둘 다 8800번 포트의 API 서버에 붙으므로 서버가 꺼져 있으면 안내 메시지가 뜬다.
@@ -147,7 +145,7 @@ KIS 국내 분봉 API는 1분봉만 준다. 09:00 기준으로 묶어서 30분�
 - 수수료와 세금을 매매 판단에도, 손익 계산에도 반영하지 않는다. 신호가 자주 뒤집히면 잔 매매로 비용이 쌓일 수 있다.
 - 스윙 1회 최대치(15%)가 작지 않다. 실전 전에 모의투자로 매매 빈도와 크기를 충분히 지켜볼 것.
 - 개별 기능은 모의투자로 확인했지만, 엔진을 여러 날 연속으로 돌려 본 기간은 짧다.
-- 미국 주식(`DOMESTIC_ONLY=False`)은 정규장 실주문 전체 사이클을 검증하지 못했다. 예전 해외 보유분은 `scripts/liquidate_overseas_once.py`로 정리할 수 있다(`--dry-run` 지원).
+- 해외 유망 종목은 직접 해외 실주문 대신 국내 상장 대체 ETF를 통한 프록시 대리 매매(`OVERSEAS_PROXY_TRADING_ENABLED=True`)로 환전·해외수수료 부담 없이 매매한다.
 - 네이버(뉴스, 컨센서스, 리포트)와 CNN은 비공식 API라 언제든 바뀔 수 있다. 실패하면 해당 입력만 빠지고 나머지는 계속 돈다.
 
 ## 자주 보는 오류
@@ -183,10 +181,10 @@ core/
   portfolio_scheduler.py AI 제안 자동 트리거
   analytics.py, pnl.py, daily_prices.py   복기 대시보드용 계산
   kis_*.py, tr_ids.py, websocket_client.py   KIS API 연동
-  db.py, config.py, lock.py
+pages/                  대시보드 서브 페이지 (계좌 마스터 허브, 자동매매, AI 인사이트)
 data/                   발굴 후보 시드(커밋) + 실행 중 생기는 DB(git 제외)
-scripts/                일회성 스크립트
-tests/
+scripts/                운영/관리 CLI (manage_profile.py, service.sh, run_backtest.py)
+tests/                  단위 및 통합 테스트
 ```
 
 ## 아키텍처
