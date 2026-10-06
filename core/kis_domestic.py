@@ -448,7 +448,7 @@ async def get_period_rights(
         if isinstance(rows, list):
             all_rows.extend(rows)
 
-        resp_headers = response.headers or {}
+        resp_headers = response.get("_resp_headers") or {}
         tr_cont = resp_headers.get("tr_cont", "")
         if tr_cont not in ("M", "F"):
             break

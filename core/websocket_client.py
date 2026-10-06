@@ -28,7 +28,11 @@ from core.tr_ids import ccnl_notice_overseas_tr_id, ccnl_notice_tr_id
 
 logger = logging.getLogger(__name__)
 
-WS_URL = "ws://ops.koreainvestment.com:31000" if settings.IS_MOCK else "ws://ops.koreainvestment.com:21000"
+WS_URL = (
+    "ws://ops.koreainvestment.com:31000/tryitout"
+    if settings.IS_MOCK
+    else "ws://ops.koreainvestment.com:21000/tryitout"
+)
 
 _DOMESTIC_CCNL_COLUMNS = [
     "CUST_ID", "ACNT_NO", "ODER_NO", "OODER_NO", "SELN_BYOV_CLS", "RCTF_CLS",
@@ -93,7 +97,18 @@ class KISWebSocketClient:
         self._stopping = False
 
     async def start(self) -> None:
-        await self._connect_and_subscribe()
+        self._stopping = False
+        # 첫 연결 시도 — 모의투자 서버의 일시적 핸드셰이크 거부 시에도 최대 3회 즉시 재시도
+        for attempt in range(1, 4):
+            try:
+                await self._connect_and_subscribe()
+                logger.info("KIS 실시간 체결통보 웹소켓 연결 성공")
+                break
+            except Exception as e:
+                logger.warning(f"KIS 웹소켓 초기 연결 시도 {attempt}/3 실패: {e}")
+                if attempt < 3:
+                    await asyncio.sleep(1.0)
+        # 초기 연결이 일시 실패하더라도 _run 태스크가 지수 백오프로 재연결을 지속 시도함
         self._task = asyncio.create_task(self._run())
 
     async def _connect_and_subscribe(self) -> None:
@@ -131,7 +146,13 @@ class KISWebSocketClient:
                     return
                 except Exception:
                     logger.exception("KIS 웹소켓 연결이 끊겼습니다")
-                self._ws = None
+                finally:
+                    if self._ws is not None:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                        self._ws = None
 
             if self._stopping:
                 return
@@ -193,5 +214,10 @@ class KISWebSocketClient:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
         if self._ws is not None:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None

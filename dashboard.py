@@ -5,6 +5,7 @@
 """
 import streamlit as st
 
+from core.config import settings
 from ui import backtest_tab, calendar_tab, dividend_tab, overview, rebalance, replay
 from ui.common import API_BASE, api_get, cached_get, clear_cache, fmt_kst
 
@@ -21,6 +22,7 @@ st.markdown(
 
 with st.sidebar:
     st.title("📈 Finance Jarvis")
+    st.caption(f"📌 **{settings.PROFILE_DISPLAY_NAME}** (`{settings.KIS_ACCOUNT_NO}`)")
     st.caption("매매 복기·분석 (읽기 전용)")
     days = st.selectbox("분석 기간", [7, 14, 30, 60, 90], index=2, format_func=lambda d: f"최근 {d}일")
     st.toggle("상승=빨강 · 하락=파랑 (한국식)", value=True, key="korean_colors",

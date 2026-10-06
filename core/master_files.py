@@ -139,7 +139,10 @@ async def refresh_stock_master(conn) -> Dict[str, int]:
         try:
             payload = await _download(session, "theme_code.mst.zip")
             text = await asyncio.to_thread(_unzip_text, payload, "theme_code.mst")
-            themes = await asyncio.to_thread(_parse_themes, text)
+            raw_themes = await asyncio.to_thread(_parse_themes, text)
+            # 상장폐지/미상장 고아 종목 제외: 현재 상장 종목 마스터(stocks)에 존재하는 심볼만 테마 매핑 유지
+            stock_symbols = {s["symbol"] for s in stocks}
+            themes = [t for t in raw_themes if t["symbol"] in stock_symbols]
         except Exception:
             logger.warning("테마 마스터 다운로드/파싱 실패 - 기존 테마 데이터 유지", exc_info=True)
 

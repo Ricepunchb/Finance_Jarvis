@@ -12,7 +12,9 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-API_BASE = os.environ.get("JARVIS_API_BASE", "http://127.0.0.1:8800")
+from core.config import settings
+
+API_BASE = os.environ.get("JARVIS_API_BASE", f"http://127.0.0.1:{settings.API_PORT}")
 KST = timezone(timedelta(hours=9))
 
 REASON_LABELS = {
@@ -39,12 +41,25 @@ def api_get(path: str, timeout: float = 20, **params) -> Optional[Any]:
     return resp.json()
 
 
-def api_post(path: str, json_body: Optional[Dict[str, Any]] = None, timeout: float = 60) -> Optional[Any]:
+def api_post(
+    path: str,
+    json_body: Optional[Any] = None,
+    timeout: float = 60,
+    **kwargs: Any,
+) -> Optional[Any]:
     try:
-        resp = requests.post(f"{API_BASE}{path}", json=json_body, timeout=timeout)
-    except requests.RequestException:
+        if json_body is not None and "json" not in kwargs:
+            kwargs["json"] = json_body
+        resp = requests.post(f"{API_BASE}{path}", timeout=timeout, **kwargs)
+    except requests.RequestException as e:
+        st.error(f"서버 요청 실패: {e}")
         return None
     if resp.status_code >= 400:
+        try:
+            err_detail = resp.json().get("detail", resp.text)
+        except Exception:
+            err_detail = resp.text
+        st.error(f"오류: {err_detail}")
         return None
     return resp.json()
 
@@ -97,8 +112,14 @@ def fmt_pct(v: Optional[float], signed: bool = False, digits: int = 2) -> str:
 
 
 def symbol_label(symbol: str, names: Optional[Dict[str, str]]) -> str:
-    name = (names or {}).get(symbol)
-    return f"{name}({symbol})" if name else symbol
+    cleaned = symbol
+    if cleaned.startswith("00000A"):
+        cleaned = cleaned[6:]
+    elif cleaned.startswith("A") and len(cleaned) == 7 and cleaned[1:].isdigit():
+        cleaned = cleaned[1:]
+
+    name = (names or {}).get(cleaned) or (names or {}).get(symbol)
+    return f"{name}({cleaned})" if name else symbol
 
 
 def today_kst() -> str:

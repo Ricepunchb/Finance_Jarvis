@@ -19,10 +19,10 @@ def _kpis(summary: Dict[str, Any]) -> None:
     by_symbol = summary.get("by_symbol", [])
 
     this_month_str = today_kst()[:7]
-    this_month_net = next((m["net_amount_krw"] for m in by_month if m["month"] == this_month_str), 0.0)
+    this_month_net = next((m.get("net_amount_krw") or m.get("total_net_krw", 0.0) for m in by_month if m.get("month") == this_month_str), 0.0)
 
     top_sym = by_symbol[0]["symbol"] if by_symbol else "-"
-    top_sym_amt = by_symbol[0]["net_amount_krw"] if by_symbol else 0.0
+    top_sym_amt = (by_symbol[0].get("net_amount_krw") or by_symbol[0].get("total_net_krw", 0.0)) if by_symbol else 0.0
 
     c = st.columns(5)
     c[0].metric("총 배당금(세후)", fmt_krw(totals.get("total_net_krw", 0)), help="수령 완료된 순 배당/분배금 합계 (KRW)")
@@ -34,8 +34,8 @@ def _kpis(summary: Dict[str, Any]) -> None:
 
 def _chart_monthly(by_month: List[Dict[str, Any]]) -> go.Figure:
     colors = theme.gain_loss()
-    months = [m["month"] for m in by_month]
-    amounts = [m["net_amount_krw"] for m in by_month]
+    months = [m.get("month", "") for m in by_month]
+    amounts = [m.get("net_amount_krw") or m.get("total_net_krw", 0.0) for m in by_month]
 
     fig = go.Figure(go.Bar(
         x=months, y=amounts,
@@ -53,7 +53,7 @@ def _chart_monthly(by_month: List[Dict[str, Any]]) -> go.Figure:
 
 def _chart_by_symbol(by_symbol: List[Dict[str, Any]], names: Dict[str, str]) -> go.Figure:
     labels = [symbol_label(s["symbol"], names) for s in by_symbol]
-    values = [s["net_amount_krw"] for s in by_symbol]
+    values = [s.get("net_amount_krw") or s.get("total_net_krw", 0.0) for s in by_symbol]
 
     fig = px.pie(
         names=labels, values=values,
@@ -160,9 +160,11 @@ def render(names: Dict[str, str]) -> None:
                 with st.spinner("KIS API로부터 배당 내역을 수집하는 중..."):
                     res = api_post("/dividends/sync", params={"start_date": sync_start.replace("-", ""), "end_date": sync_end.replace("-", "")})
                     if res:
-                        st.success(f"동기화 완료: 총 {res.get('total_fetched', 0)}건 조회 중 {res.get('inserted_count', 0)}건 신규 반영")
+                        st.success(f"동기화 완료: 총 {res.get('total_fetched', 0)}건 조회 중 {res.get('inserted_count', 0)}건 신규 반영 (중복 {res.get('skipped_count', 0)}건 건너뜀)")
                         clear_cache()
                         st.rerun()
+                    else:
+                        st.error("동기화에 실패했습니다. 백엔드 API 서버 상태 및 계좌 연동을 확인하세요 (모의투자는 권리조회를 지원하지 않을 수 있습니다).")
 
         with t3:
             st.markdown("##### 📁 CSV 파일 일괄 등록")
@@ -184,6 +186,8 @@ def render(names: Dict[str, str]) -> None:
                             st.success(f"CSV 등록 완료: {res.get('inserted_count', 0)}건 추가되었습니다.")
                             clear_cache()
                             st.rerun()
+                        else:
+                            st.error("CSV 일괄 등록에 실패했습니다. 데이터 형식 및 API 서버 상태를 확인하세요.")
                 except Exception as e:
                     st.error(f"CSV 파싱 오류: {e}")
 

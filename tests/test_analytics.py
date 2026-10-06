@@ -214,3 +214,36 @@ def test_rebalance_history_builds_timeline_stats_and_post_decision_returns():
         assert abs(r["excess"] - (r["proposed_return"] - r["prior_return"])) < 1e-12
         await conn.close()
     asyncio.run(run())
+
+
+def test_overview_uses_positions_as_ground_truth_and_suppresses_overseas_mismatch():
+    async def run():
+        conn = await _conn()
+        now = datetime.now(KST).timestamp()
+        # 해외 종목 NFLX 매수 체결이 있으나 현재 positions는 0주
+        await conn.execute("INSERT INTO cycles(cycle_id, started_at) VALUES (1, ?)", (now - 86400,))
+        await conn.execute("INSERT INTO portfolio_symbols(symbol, market, added_at, enabled) VALUES ('NFLX','overseas',0,0)")
+        await conn.execute(
+            "INSERT INTO order_intents(intent_id, cycle_id, symbol, market, side, qty, order_type, price, status, client_match_key, created_at, updated_at)"
+            " VALUES ('nflx_b',1,'NFLX','overseas','buy',31,'limit',70.0,'FILLED','k_nflx',?,?)", (now - 86400, now - 86400)
+        )
+        await conn.execute("INSERT INTO fills(intent_id, qty, price, filled_at, source) VALUES ('nflx_b',31,70.0,?,'REST_POLL')", (now - 86400,))
+        await conn.execute("INSERT INTO positions(symbol, qty, avg_price, currency, last_synced_at) VALUES ('NFLX',0,0,'USD',?)", (now,))
+
+        # 국내 종목 017670 (SKT) 잔고 17주
+        await conn.execute("INSERT INTO portfolio_symbols(symbol, market, added_at, enabled) VALUES ('017670','domestic',0,1)")
+        await conn.execute("INSERT INTO positions(symbol, qty, avg_price, currency, last_synced_at) VALUES ('017670',17,85000,'KRW',?)", (now,))
+
+        data = await analytics.build_overview(conn, None, days=30, fetch_prices=False)
+
+        # 1. positions 잔고가 0인 NFLX의 수량(qty)은 0이어야 하고, 017670은 17이어야 한다
+        symbols_by_id = {s["symbol"]: s for s in data["symbols"]}
+        assert symbols_by_id["NFLX"]["qty"] == 0.0
+        assert symbols_by_id["017670"]["qty"] == 17.0
+
+        # 2. DOMESTIC_ONLY 모드이므로 해외 종목(NFLX)의 수량 불일치 경고는 warnings에 나타나지 않아야 한다
+        assert not any("잔고(positions)보다 체결 매수" in w and "NFLX" in w for w in data.get("warnings", []))
+        assert symbols_by_id["NFLX"]["mismatch_qty"] is None
+
+        await conn.close()
+    asyncio.run(run())

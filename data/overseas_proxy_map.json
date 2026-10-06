@@ -13,6 +13,20 @@
     "beta_estimate": 0.40,
     "description": "엔비디아 약 30% + 국내외 우량 국채 70% (변동성 제어형)"
   },
+  "AMD": {
+    "proxy_symbol": "381180",
+    "proxy_name": "TIGER 미국필라델피아반도체나스닥",
+    "type": "THEME",
+    "beta_estimate": 0.90,
+    "description": "AMD 등 글로벌 AI/반도체 대표 기업 지수 추종"
+  },
+  "AVGO": {
+    "proxy_symbol": "381180",
+    "proxy_name": "TIGER 미국필라델피아반도체나스닥",
+    "type": "THEME",
+    "beta_estimate": 0.85,
+    "description": "브로드컴 등 글로벌 AI/반도체 네트워킹 대표 기업"
+  },
   "TSLA": {
     "proxy_symbol": "494340",
     "proxy_name": "ACE 테슬라밸류체인액티브",

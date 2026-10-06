@@ -1,8 +1,52 @@
 # core/config.py
+import os
+from pathlib import Path
+from typing import Optional
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def get_active_profile_name() -> str:
+    """활성 프로필 이름을 반환. JARVIS_PROFILE 환경변수 우선, 그 다음 .active_profile 파일."""
+    env_prof = os.getenv("JARVIS_PROFILE")
+    if env_prof:
+        return env_prof.strip()
+    active_file = _ROOT / ".active_profile"
+    if active_file.exists():
+        try:
+            val = active_file.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except Exception:
+            pass
+    return "default"
+
+
+_ACTIVE_PROFILE = get_active_profile_name()
+_PROFILE_ENV_PATH = _ROOT / f".env.{_ACTIVE_PROFILE}"
+_TARGET_ENV_FILE = f".env.{_ACTIVE_PROFILE}" if _PROFILE_ENV_PATH.exists() else ".env"
+
+_DEFAULT_PROFILE_PORTS = {
+    "isa": (8800, 8501),
+    "real": (8801, 8502),
+    "mock": (8802, 8503),
+}
+_DEFAULT_PROFILE_NAMES = {
+    "isa": "ISA 절세 계좌",
+    "real": "실전 일반 계좌 (수수료 무료)",
+    "mock": "모의투자 계좌",
+    "default": "기본 계좌",
+}
 
 
 class Settings(BaseSettings):
+    PROFILE_NAME: str = _ACTIVE_PROFILE
+    PROFILE_DISPLAY_NAME: str = _DEFAULT_PROFILE_NAMES.get(_ACTIVE_PROFILE, "Finance Jarvis")
+    API_PORT: int = _DEFAULT_PROFILE_PORTS.get(_ACTIVE_PROFILE, (8800, 8501))[0]
+    FRONT_PORT: int = _DEFAULT_PROFILE_PORTS.get(_ACTIVE_PROFILE, (8800, 8501))[1]
+
     KIS_APP_KEY: str
     KIS_APP_SECRET: str
     KIS_ACCOUNT_NO: str    # 예: 12345678-01
@@ -59,8 +103,8 @@ class Settings(BaseSettings):
     VALUATION_CACHE_TTL_HOURS: int = 24
     DART_API_KEY: str = ""  # opendart.fss.or.kr 무료 가입 후 발급 (Phase 2, 현재 미사용)
 
-    DB_PATH: str = "data/jarvis.db"
-    ENGINE_LOCK_PATH: str = "data/engine.lock"
+    DB_PATH: str = f"data/jarvis_{_ACTIVE_PROFILE}.db" if _ACTIVE_PROFILE != "default" else "data/jarvis.db"
+    ENGINE_LOCK_PATH: str = f"data/engine_{_ACTIVE_PROFILE}.lock" if _ACTIVE_PROFILE != "default" else "data/engine.lock"
 
     # --- LLM (뉴스 감성분석 / 목표비중 제안) ---
     # provider-agnostic 설계: 이 값만 바꾸면 코드 변경 없이 다른 제공자로 교체 가능해야 한다.
@@ -156,7 +200,21 @@ class Settings(BaseSettings):
     # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
     OVERSEAS_PROXY_TRADING_ENABLED: bool = True  # 해외 종목 발굴 시 국장 대체 ETF로 매매
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    @model_validator(mode="after")
+    def _sync_profile_paths(self):
+        if self.PROFILE_NAME and self.PROFILE_NAME != "default":
+            # DB_PATH가 하드코딩 기본값이면 프로필별 DB로 자동 재할당
+            if self.DB_PATH == "data/jarvis.db":
+                self.DB_PATH = f"data/jarvis_{self.PROFILE_NAME}.db"
+            if self.ENGINE_LOCK_PATH == "data/engine.lock":
+                self.ENGINE_LOCK_PATH = f"data/engine_{self.PROFILE_NAME}.lock"
+            if not self.PROFILE_DISPLAY_NAME:
+                self.PROFILE_DISPLAY_NAME = _DEFAULT_PROFILE_NAMES.get(
+                    self.PROFILE_NAME, f"프로필: {self.PROFILE_NAME}"
+                )
+        return self
+
+    model_config = SettingsConfigDict(env_file=_TARGET_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
 
 settings = Settings()

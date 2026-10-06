@@ -85,39 +85,48 @@ class TradingEngine:
         self._intraday_backfill_budget = intraday.BackfillBudget(0)
         self._orders_submitted_in_cycle = 0
 
+    @property
+    def is_running(self) -> bool:
+        return self._loop_task is not None and not self._loop_task.done()
+
     async def start(self) -> None:
         settings.assert_trading_allowed()
         self.lock.acquire()  # 실패하면 EngineAlreadyRunningError -> 즉시 상위로 전파
 
-        await db.init_db()
-        self.conn = await db.get_connection()
-        self.risk = RiskManager(self.conn)
+        try:
+            await db.init_db()
+            self.conn = await db.get_connection()
+            self.risk = RiskManager(self.conn)
 
-        logger.info("시작 전 대조(reconciliation) 실행 중 — 완료 전까지 신규주문 없음")
-        await reconciliation.run_startup_reconciliation(self.client, self.conn)
+            logger.info("시작 전 대조(reconciliation) 실행 중 — 완료 전까지 신규주문 없음")
+            await reconciliation.run_startup_reconciliation(self.client, self.conn)
 
-        await db.set_state(self.conn, "engine_running", "1")
-        await db.set_state(self.conn, "pid", str(os.getpid()))
-        await db.set_state(self.conn, "lock_acquired_at", str(time.time()))
+            await db.set_state(self.conn, "engine_running", "1")
+            await db.set_state(self.conn, "pid", str(os.getpid()))
+            await db.set_state(self.conn, "lock_acquired_at", str(time.time()))
 
-        if settings.GEMINI_API_KEY:
-            from core.llm.factory import get_llm_provider
-            try:
-                self.llm_provider = get_llm_provider()
-            except Exception:
-                logger.exception("LLM provider 초기화 실패 - 이번 실행은 기술적 지표만으로 동작")
-                self.llm_provider = None
-        else:
-            logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
+            if settings.GEMINI_API_KEY:
+                from core.llm.factory import get_llm_provider
+                try:
+                    self.llm_provider = get_llm_provider()
+                except Exception:
+                    logger.exception("LLM provider 초기화 실패 - 이번 실행은 기술적 지표만으로 동작")
+                    self.llm_provider = None
+            else:
+                logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
 
-        self.ws_client = KISWebSocketClient(
-            hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
-            include_overseas=not settings.DOMESTIC_ONLY,
-        )
-        await self.ws_client.start()
+            self.ws_client = KISWebSocketClient(
+                hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
+                include_overseas=not settings.DOMESTIC_ONLY,
+            )
+            await self.ws_client.start()
 
-        self._stop_event.clear()
-        self._loop_task = asyncio.create_task(self._run_loop())
+            self._stop_event.clear()
+            self._loop_task = asyncio.create_task(self._run_loop())
+        except Exception:
+            logger.exception("엔진 시작 중 오류 발생 — 롤백 정리 수행")
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
         """정상 정지: 신규 사이클을 멈추지만 이미 체결된 포지션/미체결 주문은 그대로 둔다.

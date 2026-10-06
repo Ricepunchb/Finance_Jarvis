@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiosqlite
 
 from core import daily_prices, db, pnl
+from core.config import settings
 from core.kis_client import AsyncKISClient
 from core.pnl import KST, parse_context
 
@@ -118,12 +119,23 @@ async def build_overview(
     net = {s: 0.0 for s in symbols}
     for t in trades:
         net[t["symbol"]] = net.get(t["symbol"], 0.0) + (t["qty"] if t["side"] == "buy" else -t["qty"])
-    holdings_end = {s: max(0.0, opening_qty.get(s, 0.0) + net.get(s, 0.0)) for s in symbols}
+    # 브로커 실제 잔고(positions)가 있으면 이를 최우선으로 사용한다.
+    # 체결 역산값(opening_qty + net)은 잔고 테이블에 기록되지 않은 과거 종목의 폴백으로만 사용한다.
+    holdings_end = {
+        s: float(data["positions"][s].get("qty", 0.0))
+        if s in data["positions"]
+        else max(0.0, opening_qty.get(s, 0.0) + net.get(s, 0.0))
+        for s in symbols
+    }
     last_close = {s: series[max(series)] for s, series in closes.items() if series}
     fx_now = data["fx"](time.time())
+    active_mismatch = {
+        sym: miss for sym, miss in data["mismatch"].items()
+        if not (settings.DOMESTIC_ONLY and infos.get(sym, {}).get("market") == "overseas")
+    }
     summary = pnl.summarize_symbols(
         data["events"], trades, data["state"], data["opening"], holdings_end, last_close,
-        {s: infos[s]["market"] for s in infos}, mtm, data["mismatch"], fx_now,
+        {s: infos[s]["market"] for s in infos}, mtm, active_mismatch, fx_now,
     )
 
     matrix = [
@@ -139,7 +151,7 @@ async def build_overview(
     warnings: List[str] = []
     if data["unpriced"]:
         warnings.append(f"가격을 알 수 없어 제외한 체결 {len(data['unpriced'])}건")
-    for sym, missing in data["mismatch"].items():
+    for sym, missing in active_mismatch.items():
         warnings.append(f"{sym}: 잔고(positions)보다 체결 매수가 {missing:g}주 많음 — 체결 이력 기준으로 계산")
     if not data["has_fx"] and any(m == "overseas" for m in markets.values()):
         warnings.append("환율 기록이 없어 해외 종목을 1:1로 환산했습니다")

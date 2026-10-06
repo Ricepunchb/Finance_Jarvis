@@ -52,12 +52,13 @@ async def validate_candidate_symbol(
     symbol: str,
     market: str = "domestic",
     claimed_name: Optional[str] = None,
+    conn: Optional[aiosqlite.Connection] = None,
 ) -> ValidationOutcome:
     """후보가 candidate_universe에 들어가거나 ADD로 실제 채택되기 전 반드시 통과해야 한다.
 
     1) KIS 실재성 확인 (존재하지 않는/오타 종목코드 차단) - 가격이 정상 조회되면 실재로 간주
     2) VI(거래정지) 상태 확인 (국내 전용)
-    3) LLM이 주장한 종목명과 KIS 실제 종목명 대조
+    3) LLM이 주장한 종목명과 KIS/마스터 실제 종목명 대조 (환각 방지)
     """
     clean_sym = symbol.strip().upper()
     is_overseas = market == "overseas" or symbol_mapper.is_overseas_symbol(clean_sym)
@@ -100,7 +101,24 @@ async def validate_candidate_symbol(
 
     kis_name = price_info.get("hts_kor_isnm")
     if not kis_name:
-        logger.warning(f"'{clean_sym}' KIS 응답에 종목명 없음(모의투자 API 제약으로 추정) - 이름 대조 없이 가격만으로 실재성 인정")
+        # KIS 현재가 TR에 종목명이 없으면 로컬 stock_master 캐시에서 공식 종목명 조회
+        try:
+            if conn is not None:
+                cur = await conn.execute("SELECT name FROM stock_master WHERE symbol = ?", (clean_sym,))
+                row = await cur.fetchone()
+                if row and row[0]:
+                    kis_name = row[0]
+            else:
+                conn_local = await db.get_connection()
+                try:
+                    cur = await conn_local.execute("SELECT name FROM stock_master WHERE symbol = ?", (clean_sym,))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        kis_name = row[0]
+                finally:
+                    await conn_local.close()
+        except Exception:
+            pass
 
     try:
         vi_rows = await kis_domestic.get_vi_status(client, clean_sym)
@@ -114,7 +132,7 @@ async def validate_candidate_symbol(
         if claimed not in kis_name and kis_name not in claimed:
             return ValidationOutcome(
                 False,
-                f"종목명 불일치 (제안: '{claimed}', KIS 실제: '{kis_name}') - 환각 의심",
+                f"종목명 불일치 (제안: '{claimed}', 실제: '{kis_name}') - 환각 의심",
             )
 
     return ValidationOutcome(True, kis_name=kis_name)
@@ -139,7 +157,9 @@ async def seed_candidate_universe(
             skipped += 1
             continue
         market = entry.get("market", "domestic")
-        outcome = await validate_candidate_symbol(client, symbol, market=market, claimed_name=entry.get("name"))
+        outcome = await validate_candidate_symbol(
+            client, symbol, market=market, claimed_name=entry.get("name"), conn=conn
+        )
         if not outcome.ok:
             logger.warning(f"후보종목 시딩 반려: {symbol} ({entry.get('name', '')}) - {outcome.reason}")
             rejected += 1

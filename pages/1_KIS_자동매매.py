@@ -7,6 +7,7 @@
 import ast
 import json
 import time
+import os
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -14,7 +15,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-API_BASE = "http://127.0.0.1:8800"
+from core.config import settings
+
+API_BASE = os.environ.get("JARVIS_API_BASE", f"http://127.0.0.1:{settings.API_PORT}")
 KST = timezone(timedelta(hours=9))
 
 st.set_page_config(layout="wide", page_title="KIS 자동매매", page_icon="🤖")
@@ -82,9 +85,16 @@ def api_post(path: str, json_body: dict | None = None):
         )
         return None
     if resp.status_code >= 400:
-        st.error(resp.json().get("detail", resp.text))
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        st.error(detail)
         return None
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
 
 
 def api_delete(path: str):
@@ -94,9 +104,16 @@ def api_delete(path: str):
         st.error(str(e))
         return None
     if resp.status_code >= 400:
-        st.error(resp.json().get("detail", resp.text))
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        st.error(detail)
         return None
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
 
 
 SOURCE_LABELS = {"momentum": "급등/거래급증", "broker": "증권사 리포트", "news": "뉴스 언급", "value": "저평가", "theme": "테마 후발"}
@@ -154,6 +171,9 @@ def label(symbol: str) -> str:
     return f"{name}({symbol})" if name else symbol
 
 with st.sidebar:
+    prof_name = status.get("profile_display_name") or settings.PROFILE_DISPLAY_NAME
+    acnt_no = status.get("account_no") or settings.KIS_ACCOUNT_NO
+    st.caption(f"📌 **{prof_name}** (`{acnt_no}`)")
     mode_class = "badge-mock" if status["is_mock"] else "badge-live"
     mode_text = "모의투자" if status["is_mock"] else "⚠️ 실전투자"
     st.markdown(f'<span class="jarvis-badge {mode_class}">{mode_text}</span>', unsafe_allow_html=True)

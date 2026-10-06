@@ -10,7 +10,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from .config import settings
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-TOKEN_CACHE_FILE = ROOT_DIR / "data" / "kis_token.json"
+_profile_suffix = f"_{settings.PROFILE_NAME}" if getattr(settings, "PROFILE_NAME", None) and settings.PROFILE_NAME != "default" else ""
+TOKEN_CACHE_FILE = ROOT_DIR / "data" / f"kis_token{_profile_suffix}.json"
 
 # 발급된 토큰을 만료 임박(1일 유효기간) 전까지 재사용하기 위한 여유 시간.
 # 너무 늦게 갱신하면 만료된 토큰으로 요청을 보내다 401을 받을 수 있어 여유를 둔다.
@@ -74,7 +75,11 @@ class AsyncKISClient:
                         cached_data = json.load(f)
                     c_token = cached_data.get("access_token")
                     c_expires = float(cached_data.get("expires_at", 0.0))
-                    if c_token and now < c_expires - TOKEN_REFRESH_MARGIN_SEC:
+                    c_is_mock = cached_data.get("is_mock")
+                    # 모의/실전 모드가 변경되었으면 이전 토큰 캐시 무효화
+                    if c_is_mock is not None and c_is_mock != settings.IS_MOCK:
+                        logger.info("모의/실전 모드 변경 감지 - 기존 토큰 캐시 무효화")
+                    elif c_token and now < c_expires - TOKEN_REFRESH_MARGIN_SEC:
                         self.access_token = c_token
                         self.token_expires_at = c_expires
                         return self.access_token
@@ -99,7 +104,11 @@ class AsyncKISClient:
                         TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
                         with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
                             json.dump(
-                                {"access_token": self.access_token, "expires_at": self.token_expires_at},
+                                {
+                                    "access_token": self.access_token,
+                                    "expires_at": self.token_expires_at,
+                                    "is_mock": settings.IS_MOCK,
+                                },
                                 f,
                             )
                     except Exception:
@@ -122,30 +131,42 @@ class AsyncKISClient:
             data = await response.json()
             return data.get("HASH")
 
-    async def request(self, method: str, path: str, tr_id: str, data: Dict = None, params: Dict = None) -> Dict:
+    async def request(
+        self,
+        method: str,
+        path: str,
+        tr_id: str,
+        data: Dict = None,
+        params: Dict = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict:
         """모든 KIS API 호출을 담당하는 공통 비동기 메서드"""
         token = await self.issue_token()
         url = f"{self.domain}{path}"
 
-        headers = {
+        req_headers = {
             "authorization": f"Bearer {token}",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
             "tr_id": tr_id,
             "custtype": "P", # 개인
         }
+        if headers:
+            req_headers.update(headers)
 
         # POST 요청(주문 등)일 경우 Hashkey 추가
         if method.upper() == "POST" and data is not None:
-            headers["hashkey"] = await self.get_hashkey(data)
+            req_headers["hashkey"] = await self.get_hashkey(data)
 
         session = await self.get_session()
         # 한도 초과 거절은 조회(GET)만 재시도한다 - 주문(POST)은 재전송이 중복 주문이 될 수 있어 호출자에게 그대로 돌려준다.
         max_attempts = 1 + (RATE_LIMIT_RETRIES if method.upper() == "GET" else 0)
         for attempt in range(1, max_attempts + 1):
             await self._throttle()
-            async with session.request(method, url, headers=headers, json=data, params=params) as response:
+            async with session.request(method, url, headers=req_headers, json=data, params=params) as response:
                 result = await response.json()
+                if isinstance(result, dict):
+                    result["_resp_headers"] = dict(response.headers)
             if result.get("msg_cd") != RATE_LIMIT_MSG_CD or attempt == max_attempts:
                 return result
             await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC * attempt)

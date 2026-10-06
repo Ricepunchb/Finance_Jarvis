@@ -5,6 +5,7 @@
 실행: uvicorn api.main:app --port 8800
 """
 import asyncio
+from datetime import datetime
 import json
 import logging
 import time
@@ -127,9 +128,15 @@ async def engine_status():
     try:
         heartbeat_at = await db.get_state(conn, "heartbeat_at")
         last_ws = await db.get_state(conn, "last_ws_message_at")
+        db_running = (await db.get_state(conn, "engine_running")) == "1"
         return {
+            "profile_name": settings.PROFILE_NAME,
+            "profile_display_name": settings.PROFILE_DISPLAY_NAME,
+            "account_no": settings.KIS_ACCOUNT_NO,
+            "api_port": settings.API_PORT,
+            "front_port": settings.FRONT_PORT,
             "is_mock": settings.IS_MOCK,
-            "engine_running": (await db.get_state(conn, "engine_running")) == "1",
+            "engine_running": db_running and engine.is_running,
             "pid": await db.get_state(conn, "pid"),
             "heartbeat_age_sec": (time.time() - float(heartbeat_at)) if heartbeat_at else None,
             "ws_last_message_age_sec": (time.time() - float(last_ws)) if last_ws else None,
@@ -880,10 +887,13 @@ async def get_dividends_summary():
                 "count": total_count,
             },
             "by_symbol": [
-                {"symbol": s, **v}
+                {"symbol": s, "net_amount_krw": v["total_net_krw"], **v}
                 for s, v in sorted(by_sym.items(), key=lambda x: x[1]["total_net_krw"], reverse=True)
             ],
-            "by_month": monthly,
+            "by_month": [
+                {"net_amount_krw": m["total_net_krw"], **m}
+                for m in monthly
+            ],
         }
     finally:
         await conn.close()
@@ -962,6 +972,126 @@ async def import_dividends_csv(request: Request):
         return {"status": "ok", "inserted_count": inserted}
     finally:
         await conn.close()
+
+
+class DividendSyncRequest(BaseModel):
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    symbol: Optional[str] = None
+
+
+@app.post("/dividends/sync")
+async def sync_dividends_endpoint(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    symbol: Optional[str] = None,
+    req: Optional[DividendSyncRequest] = None,
+):
+    """KIS OpenAPI(CTRGA011R)를 통해 계좌의 기간별 권리(배당/분배금)를 조회하여 DB에 동기화합니다."""
+    s_date = (start_date or (req.start_date if req else None) or "").replace("-", "").strip()
+    e_date = (end_date or (req.end_date if req else None) or "").replace("-", "").strip()
+    sym = (symbol or (req.symbol if req else None) or "").strip()
+
+    if not s_date:
+        s_date = f"{datetime.now().year - 1}0101"
+    if not e_date:
+        e_date = datetime.now().strftime("%Y%m%d")
+
+    try:
+        rows = await kis_domestic.get_period_rights(
+            engine.client,
+            start_date=s_date,
+            end_date=e_date,
+            symbol=sym,
+        )
+    except kis_domestic.KisApiError as e:
+        logger.warning("KIS 권리조회 API 실패: %s", e)
+        msg = e.msg1 or str(e)
+        if "모의투자" in msg or settings.IS_MOCK:
+            detail_msg = f"모의투자 계좌에서는 KIS 계좌 권리조회(CTRGA011R)가 지원되지 않습니다 ({msg}). 실전투자 계좌를 이용하시거나 상단의 'CSV 파일 일괄 등록'을 이용해주세요."
+        else:
+            detail_msg = f"KIS API 오류: {msg}"
+        raise HTTPException(status_code=400, detail=detail_msg)
+    except Exception as e:
+        logger.error("KIS 권리조회 중 예외 발생: %s", e)
+        raise HTTPException(status_code=500, detail=f"KIS 권리조회 실패: {str(e)}")
+    parsed_items = []
+    for r in rows:
+        pdno = (r.get("shtn_pdno") or r.get("pdno") or "").strip()
+        if not pdno:
+            continue
+        if pdno.startswith("00000A"):
+            pdno = pdno[6:]
+        elif pdno.startswith("A") and len(pdno) == 7 and pdno[1:].isdigit():
+            pdno = pdno[1:]
+
+        cash_dfrm_dt = (r.get("cash_dfrm_dt") or "").strip().replace("-", "")
+        bass_dt = (r.get("bass_dt") or "").strip().replace("-", "")
+
+        # 지급일 (YYYY-MM-DD)
+        if len(cash_dfrm_dt) == 8 and cash_dfrm_dt.isdigit():
+            pay_date = f"{cash_dfrm_dt[:4]}-{cash_dfrm_dt[4:6]}-{cash_dfrm_dt[6:]}"
+        elif len(bass_dt) == 8 and bass_dt.isdigit():
+            pay_date = f"{bass_dt[:4]}-{bass_dt[4:6]}-{bass_dt[6:]}"
+        else:
+            pay_date = time.strftime("%Y-%m-%d")
+
+        # 기준일 (YYYY-MM-DD)
+        rec_date = f"{bass_dt[:4]}-{bass_dt[4:6]}-{bass_dt[6:]}" if len(bass_dt) == 8 and bass_dt.isdigit() else None
+
+        qty = float(r.get("cblc_qty") or r.get("tot_alct_qty") or r.get("last_alct_qty") or 0.0)
+        gross_amt = float(r.get("last_alct_amt") or 0.0)
+        tax_amt = float(r.get("tax_amt") or 0.0)
+        net_amt = gross_amt - tax_amt if gross_amt >= tax_amt else 0.0
+
+        dps = float(r.get("sbsc_unpr") or 0.0)
+        if dps <= 0 and qty > 0 and gross_amt > 0:
+            dps = round(gross_amt / qty, 2)
+
+        prdt_name = (r.get("prdt_name") or "").strip()
+        etf_keywords = ("TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KOSEF", "KBSTAR", "ETF")
+        if any(k in prdt_name.upper() for k in etf_keywords):
+            div_type = "ETF_DIST"
+        elif gross_amt == 0 and qty > 0 and (r.get("last_alct_qty") or r.get("tot_alct_qty")):
+            div_type = "STOCK"
+        else:
+            div_type = "CASH"
+
+        acno10 = (r.get("acno10") or "").strip()
+        rght_type_cd = (r.get("rght_type_cd") or "").strip()
+        mgmt_no = f"KIS_{acno10}_{pdno}_{pay_date}_{bass_dt}_{rght_type_cd}_{int(gross_amt)}"
+
+        parsed_items.append({
+            "symbol": pdno,
+            "market": "domestic",
+            "dividend_type": div_type,
+            "record_date": rec_date,
+            "payment_date": pay_date,
+            "qty": qty,
+            "dps": dps if dps > 0 else None,
+            "gross_amount": gross_amt,
+            "tax_amount": tax_amt,
+            "net_amount": net_amt,
+            "currency": "KRW",
+            "fx_rate": 1.0,
+            "net_amount_krw": net_amt,
+            "source": "AUTO_KIS",
+            "kis_mgmt_no": mgmt_no,
+            "notes": f"{prdt_name} (KIS 계좌 권리조회)" if prdt_name else "KIS 계좌 권리조회",
+        })
+
+    conn = await db.get_connection()
+    try:
+        inserted, skipped = await db.upsert_kis_dividends(conn, parsed_items)
+        return {
+            "status": "ok",
+            "total_fetched": len(rows),
+            "inserted_count": inserted,
+            "skipped_count": skipped,
+        }
+    finally:
+        await conn.close()
+
 
 
 
