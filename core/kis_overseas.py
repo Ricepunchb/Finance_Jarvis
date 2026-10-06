@@ -215,3 +215,59 @@ async def get_ccnl(
         },
     )
     return _ensure_ok(response).get("output", [])
+
+
+async def get_news_titles(
+    client: AsyncKISClient,
+    nation_cd: str = "US",
+    exchange_cd: str = "",
+    symbol: str = "",
+    data_dt: str = "",
+    data_tm: str = "",
+) -> List[Dict[str, Any]]:
+    """해외뉴스종합(제목) [HHPSTH60100C1].
+    nation_cd: US, CN, HK 등. symbol: 종목코드(AAPL, TSLA 등).
+    """
+    response = await client.request(
+        method="GET",
+        path="/uapi/overseas-price/v1/quotations/news-title",
+        tr_id=tr_ids.OVERSEAS_NEWS_TITLE_TR_ID,
+        params={
+            "INFO_GB": "",
+            "CLASS_CD": "",
+            "NATION_CD": nation_cd,
+            "EXCHANGE_CD": exchange_cd,
+            "SYMB": symbol,
+            "DATA_DT": data_dt,
+            "DATA_TM": data_tm,
+            "CTS": "",
+        },
+    )
+    body = _ensure_ok(response)
+    return body.get("outblock1") or body.get("output") or []
+
+
+async def get_breakout_news(
+    client: AsyncKISClient,
+    symbol: str = "",
+    title_query: str = "",
+) -> List[Dict[str, Any]]:
+    """해외속보(제목) [FHKST01011801]."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/overseas-price/v1/quotations/brknews-title",
+        tr_id=tr_ids.OVERSEAS_BREAKOUT_NEWS_TR_ID,
+        params={
+            "FID_NEWS_OFER_ENTP_CODE": "0",
+            "FID_COND_SCR_DIV_CODE": "11801",
+            "FID_COND_MRKT_CLS_CODE": "",
+            "FID_INPUT_ISCD": symbol,
+            "FID_TITL_CNTT": title_query,
+            "FID_INPUT_DATE_1": "",
+            "FID_INPUT_HOUR_1": "",
+            "FID_RANK_SORT_CLS_CODE": "",
+            "FID_INPUT_SRNO": "",
+        },
+    )
+    body = _ensure_ok(response)
+    return body.get("output") or []

@@ -21,12 +21,15 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, discovery, discovery_signals, kis_domestic, master_files, quant_metrics
-from core.config import settings
+from core import db, discovery, discovery_signals, kis_domestic, kis_overseas, master_files, quant_metrics
+from core.config import get_effective_domestic_only, settings
 from core.fundamentals.naver_consensus import fetch_consensus
 from core.fundamentals.naver_research import fetch_company_research
+from core.fundamentals.overseas_consensus import fetch_overseas_consensus, fetch_overseas_research
 from core.kis_client import AsyncKISClient
 from core.kis_common import KisApiError
+from core.utils import symbol_mapper
+
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -237,6 +240,78 @@ async def source_theme_laggards(
     return dict(sorted(laggards.items(), key=lambda item: len(item[1]["movers"]), reverse=True))
 
 
+async def source_overseas_news_buzz(
+    client: AsyncKISClient,
+    names: Dict[str, str],
+    collector: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """KIS 해외뉴스종합 API(HHPSTH60100C1)를 통해 미국 시장 헤드라인 표본을 수집하고 종목 언급량을 집계한다."""
+    try:
+        raw_rows = await _kis_retry(kis_overseas.get_news_titles, client, nation_cd="US")
+    except Exception:
+        logger.warning("KIS 해외 뉴스 헤드라인 표본 조회 실패", exc_info=True)
+        raw_rows = []
+
+    headlines = []
+    seen = set()
+    for row in raw_rows:
+        title = row.get("titl") or row.get("title") or row.get("hts_pbnt_titl_cntt") or ""
+        if title and title not in seen:
+            seen.add(title)
+            headlines.append({
+                "hts_pbnt_titl_cntt": title,
+                "iscd1": row.get("symb") or "",
+                "data_dt": row.get("data_dt"),
+                "data_tm": row.get("data_tm"),
+            })
+
+    if collector is not None:
+        collector.sampled_headline_count = (getattr(collector, "sampled_headline_count", 0) or 0) + len(headlines)
+        overseas_matches = extract_matched_headlines(headlines, names)
+        collector.headline_matches.extend(overseas_matches)
+
+    counts = await asyncio.to_thread(count_headline_mentions, headlines, names)
+    top = sorted(
+        ((s, ev) for s, ev in counts.items() if ev["mentions"] >= 1),
+        key=lambda item: item[1]["mentions"], reverse=True,
+    )[:NEWS_MAX_SYMBOLS]
+    return {s: {**ev, "sampled_headlines": len(headlines)} for s, ev in top}
+
+
+async def source_overseas_broker_research(
+    overseas_symbols: List[str],
+    collector: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """해외 후보종목들의 모닝스타/월가 리서치 목록을 수집하여 그룹화한다."""
+    all_reports: List[Dict[str, Any]] = []
+    for s in overseas_symbols:
+        try:
+            reports = await asyncio.to_thread(fetch_overseas_research, s)
+            for r in reports:
+                all_reports.append({
+                    "symbol": s,
+                    "name": s,
+                    "broker": r.get("broker", "Morningstar"),
+                    "title": r.get("title", ""),
+                    "date": r.get("date", datetime.now(tz=KST).strftime("%Y%m%d")),
+                    "write_date": r.get("date", datetime.now(tz=KST).strftime("%Y%m%d")),
+                    "read_count": 0,
+                    "research_id": r.get("research_id") or 0,
+                    "end_url": r.get("attach_url"),
+                })
+        except Exception:
+            continue
+
+    if collector is not None:
+        collector.reports.extend(all_reports)
+
+    grouped = discovery_signals.group_research_reports(
+        all_reports, settings.DISCOVERY_BROKER_LOOKBACK_DAYS, datetime.now(tz=KST),
+    )
+    return grouped
+
+
+
 def merge_sources(
     by_source: Dict[str, Dict[str, Dict[str, Any]]], eligible: Dict[str, Dict[str, Any]], limit: int,
 ) -> Dict[str, Dict[str, Any]]:
@@ -317,7 +392,24 @@ async def _refresh(
               if (ev.get("rise_pct") or 0) >= MOMENTUM_MIN_RISE_PCT}
     await run("theme", source_theme_laggards(conn, movers, eligible, {s: r["name"] for s, r in master.items()}))
 
+    domestic_only = await get_effective_domestic_only(conn)
+    if not domestic_only:
+        try:
+            candidates = await db.list_candidate_universe(conn)
+            ovrs_candidates = [c for c in candidates if symbol_mapper.is_overseas_symbol(c["symbol"])]
+            ovrs_names = {c["symbol"]: c["name"] for c in ovrs_candidates}
+            if ovrs_names:
+                ovrs_news = await source_overseas_news_buzz(client, ovrs_names, collector)
+                for s, ev in ovrs_news.items():
+                    by_source.setdefault("news", {})[s] = ev
+                ovrs_reports = await source_overseas_broker_research(list(ovrs_names.keys()), collector)
+                for s, ev in ovrs_reports.items():
+                    by_source.setdefault("broker", {})[s] = ev
+        except Exception:
+            logger.exception("해외 종목 발굴 소스 수집 실패 - 국내 소스로만 진행")
+
     merged = merge_sources(by_source, eligible, settings.DISCOVERY_MAX_DYNAMIC)
+
     expires_at = time.time() + settings.DISCOVERY_DYNAMIC_TTL_DAYS * 86400
     for symbol, sources in merged.items():
         await db.upsert_dynamic_candidate(

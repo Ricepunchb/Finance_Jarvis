@@ -13,6 +13,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from core.fundamentals import yfinance_client
+from core.utils import symbol_mapper
+
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -30,36 +33,45 @@ def _parse_datetime(raw: str) -> float:
 def fetch_recent_news(symbol: str, max_items: int = 5) -> List[Dict[str, Any]]:
     """동기 함수 — 호출자가 asyncio.to_thread로 감싸서 이벤트 루프를 막지 않게 해야 한다.
 
-    실패해도 예외를 올리지 않고 빈 리스트를 반환한다 (뉴스가 없다고 해서 매매를
-    막을 이유는 없고, 단지 sentiment_signal이 없는 것으로 처리되면 된다).
+    국내 6자리 종목코드 및 해외 티커(AAPL, VST 등)를 모두 지원한다.
+    해외 티커는 로이터 코드(AAPL.O)로 자동 변환하여 네이버 한국어 뉴스를 조회하며,
+    네이버 기사가 부족하거나 실패할 경우 yfinance로 자동 폴백한다.
     """
+    clean_sym = symbol.strip().upper()
+    is_overseas = symbol_mapper.is_overseas_symbol(clean_sym)
+    query_code = symbol_mapper.ticker_to_reuters_code(clean_sym) if is_overseas else clean_sym
+
+    items = []
     try:
         response = requests.get(
-            API_URL.format(symbol=symbol),
+            API_URL.format(symbol=query_code),
             params={"pageSize": max_items, "page": 1},
             headers=_HEADERS,
             timeout=_TIMEOUT_SEC,
         )
-        response.raise_for_status()
-        data = response.json()
-        # 응답은 유사 기사 묶음(group)의 리스트이고 각 group에 대표 기사 1건이 들어있다 -
-        # 첫 group만 읽으면 max_items와 무관하게 항상 1건만 남는다.
-        items = [item for group in (data or []) for item in (group.get("items") or [])]
+        if response.status_code == 200 and response.text.strip():
+            data = response.json()
+            items = [item for group in (data or []) for item in (group.get("items") or [])]
     except Exception:
-        logger.warning(f"'{symbol}' 뉴스 조회 실패 - 이번 사이클은 뉴스 없이 진행", exc_info=True)
-        return []
+        logger.warning(f"'{symbol}' (code={query_code}) 네이버 뉴스 조회 실패", exc_info=True)
 
     articles = []
     for item in items[:max_items]:
         try:
             articles.append({
-                "symbol": symbol,
-                "source": "naver_finance",
+                "symbol": clean_sym,
+                "source": "naver_finance_overseas" if is_overseas else "naver_finance",
                 "url": item["mobileNewsUrl"],
                 "title": html.unescape(item.get("titleFull") or item.get("title") or ""),
                 "summary": html.unescape(item.get("body") or ""),
                 "published_at": _parse_datetime(item["datetime"]),
             })
         except (KeyError, ValueError):
-            continue  # 형식이 안 맞는 항목 하나는 건너뛰고 나머지는 계속 사용
+            continue
+
+    # 해외 종목인데 네이버 뉴스가 없으면 yfinance 뉴스로 폴백
+    if is_overseas and not articles:
+        articles = yfinance_client.fetch_recent_news_yfinance(clean_sym, max_items=max_items)
+
     return articles
+

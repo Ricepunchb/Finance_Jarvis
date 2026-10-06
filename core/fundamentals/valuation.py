@@ -24,7 +24,9 @@ import pandas as pd
 from core import db, indicators, kis_domestic
 from core.config import settings
 from core.fundamentals.naver_consensus import fetch_consensus
+from core.fundamentals.overseas_consensus import fetch_overseas_consensus
 from core.kis_client import AsyncKISClient
+from core.utils import symbol_mapper
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -112,11 +114,71 @@ def _quality_gate_multiplier(financial_ratio_rows: list) -> float:
     return 1.0
 
 
-async def get_valuation_signal(
-    conn: aiosqlite.Connection, client: AsyncKISClient, symbol: str
+async def get_valuation_signal_overseas(
+    conn: aiosqlite.Connection,
+    symbol: str,
+    exchange: Optional[str] = None,
+    current_price: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """국내 종목 전용. 하루에 한 번만 재계산(캐시 TTL) — 밸류에이션은 분기 단위로만
-    바뀌므로 30분 사이클마다 다시 계산할 이유가 없다."""
+    """해외 종목 밸류에이션 시그널 계산 (컨센서스 목표가 괴리율 60% + 52주 레인지 40%)."""
+    clean_sym = symbol.strip().upper()
+    cached = await db.get_cached_valuation(conn, clean_sym, settings.VALUATION_CACHE_TTL_HOURS)
+    if cached is not None:
+        return _cached_row_to_signal(cached)
+
+    try:
+        consensus = await asyncio.to_thread(fetch_overseas_consensus, clean_sym, exchange)
+        price = current_price or consensus.get("last_close") or 0.0
+        if price <= 0:
+            return None
+
+        target_gap_score = _target_gap_score(consensus.get("target_price_mean"), price)
+        w52_score = _w52_position_score(consensus.get("w52_high"), consensus.get("w52_low"), price)
+
+        parts = []
+        if target_gap_score is not None:
+            parts.append((target_gap_score, 0.60))
+        if w52_score is not None:
+            parts.append((w52_score, 0.40))
+
+        if not parts:
+            return None
+
+        total_weight = sum(w for _, w in parts)
+        score = sum(s * w for s, w in parts) / total_weight
+
+        await db.cache_valuation(
+            conn, clean_sym,
+            per=consensus.get("per"), pbr=consensus.get("pbr"),
+            per_percentile=None, pbr_percentile=None,
+            target_price_mean=consensus.get("target_price_mean"),
+            target_gap_pct=target_gap_score, recomm_mean=consensus.get("recomm_mean"),
+            w52_position_pct=w52_score, roe=None, debt_ratio=None,
+            raw_json=None,
+        )
+        return _score_to_signal(score)
+    except Exception:
+        logger.exception(f"'{symbol}' 해외 밸류에이션 시그널 계산 실패 - 밸류에이션 없이 진행")
+        return None
+
+
+async def get_valuation_signal(
+    conn: aiosqlite.Connection,
+    client: Optional[AsyncKISClient] = None,
+    symbol: str = "",
+    market: str = "domestic",
+    exchange: Optional[str] = None,
+    current_price: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """종목 밸류에이션 시그널 계산. 국내/해외 종목 모두 지원."""
+    if market == "overseas" or symbol_mapper.is_overseas_symbol(symbol):
+        return await get_valuation_signal_overseas(
+            conn, symbol, exchange=exchange, current_price=current_price
+        )
+
+    if client is None:
+        return None
+
     cached = await db.get_cached_valuation(conn, symbol, settings.VALUATION_CACHE_TTL_HOURS)
     if cached is not None:
         return _cached_row_to_signal(cached)

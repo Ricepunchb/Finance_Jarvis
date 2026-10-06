@@ -166,7 +166,10 @@ def _format_candidate(c: Dict[str, Any]) -> str:
         parts.append(f"AI시맨틱 {c['raw_components']['semantic']:+.2f}")
     if c.get("semantic_penalty"):
         parts.append(f"시맨틱페널티 {c['semantic_penalty']:.2f}")
-    line = f"- {c['symbol']} ({c.get('name', '')}): " + ", ".join(parts)
+    proxy_str = ""
+    if c.get("proxy_symbol") and c.get("proxy_name"):
+        proxy_str = f" [국장대체ETF: {c['proxy_name']}({c['proxy_symbol']})]"
+    line = f"- {c['symbol']} ({c.get('name', '')}){proxy_str}: " + ", ".join(parts)
     for reason in c.get("thesis") or []:
         line += f"\n    · {reason}"
     return line

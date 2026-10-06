@@ -43,11 +43,20 @@ async def _enrich_and_analyze_reports(
     if not reports:
         return {}
 
-    # 1. 메타데이터 기본 upsert
+    # 1. 메타데이터 기본 upsert (해외 리포트 문자열 ID는 안전 정수로 변환)
+    for r in reports:
+        raw_id = r.get("research_id")
+        if raw_id is not None and not isinstance(raw_id, int):
+            try:
+                r["research_id"] = int(raw_id)
+            except (ValueError, TypeError):
+                r["research_id"] = abs(hash(str(raw_id))) % 2_000_000_000
+
     await db.upsert_research_reports(conn, reports)
 
     r_ids = [int(r["research_id"]) for r in reports if r.get("research_id")]
     existing = await db.get_research_reports(conn, r_ids)
+
 
     # 2. 본문 텍스트가 없는 리포트 상세 수집 (최신순 최대 N건)
     need_detail = [

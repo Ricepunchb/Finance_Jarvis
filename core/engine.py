@@ -18,8 +18,11 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, exit_guard, indicators, intraday, kis_domestic, kis_overseas, reconciliation, signal_engine
-from core.config import settings
+from core import (
+    db, exit_guard, indicators, intraday, kis_domestic, kis_overseas, proxy_mapping,
+    reconciliation, signal_engine,
+)
+from core.config import get_effective_domestic_only, get_effective_proxy_trading, settings
 from core.fundamentals import valuation as fundamental_valuation
 from core.kis_client import AsyncKISClient
 from core.kis_common import KisApiError
@@ -284,9 +287,10 @@ class TradingEngine:
 
         # 관리 중인 종목 중 해외가 하나라도 있을 때만 해외 잔고를 조회한다 (국내전용 사용자는
         # Phase 1/2 때와 동일하게 이 호출이 아예 발생하지 않는다).
+        domestic_only = await get_effective_domestic_only(self.conn)
         overseas_holdings_by_symbol: dict = {}
         overseas_balance_ok = False
-        if not settings.DOMESTIC_ONLY and any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
+        if not domestic_only and any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
             try:
                 present = await kis_overseas.get_present_balance_krw(self.client)
                 overseas_holdings_by_symbol = {h["pdno"]: h for h in present["holdings"] if h.get("pdno")}
@@ -308,8 +312,9 @@ class TradingEngine:
             market = info.get("market") or "domestic"
             exchange = info.get("exchange")
 
-            if settings.DOMESTIC_ONLY and market == "overseas":
+            if domestic_only and market == "overseas":
                 continue  # 국내 전용: 해외 종목은 매매·정리 모두 건너뛴다 (DB의 종목/이력은 그대로 둔다)
+
             if not _is_market_open(market, exchange):
                 continue  # 이 종목이 속한 시장이 지금 닫혀있음 - 매 사이클 로그가 쌓이지 않게 조용히 스킵
 
@@ -761,8 +766,14 @@ class TradingEngine:
                 logger.exception(f"'{symbol}' 뉴스 감성분석 파이프라인 오류 - 기술적 지표만 사용")
         context["sentiment_signal"] = sentiment_signal
 
-        # 밸류에이션(PER/PBR/목표주가 컨센서스)은 국내 데이터 소스 기반이라 해외 종목은 미지원.
-        context["valuation_signal"] = None
+        valuation_signal = None
+        try:
+            valuation_signal = await fundamental_valuation.get_valuation_signal_overseas(
+                self.conn, symbol, exchange=exchange, current_price=price_foreign
+            )
+        except Exception:
+            logger.exception(f"'{symbol}' 해외 밸류에이션 시그널 계산 오류 - 기술적 지표만 사용")
+        context["valuation_signal"] = valuation_signal
 
         action = await signal_engine.decide(
             symbol=symbol,
@@ -772,7 +783,7 @@ class TradingEngine:
             tech_signal=tech_signal,
             intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
-            valuation_signal=None,
+            valuation_signal=valuation_signal,
             price=price_krw,  # signal_engine의 qty 계산은 KRW 기준 total_equity와 일관되어야 함
             current_position_qty=qty,
             current_position_value=position_value,
@@ -781,6 +792,7 @@ class TradingEngine:
             winding_down=winddown_liquidating is not None,
             winddown_liquidating=bool(winddown_liquidating),
         )
+
 
         if action is None:
             await self._log_no_op(
@@ -793,8 +805,88 @@ class TradingEngine:
 
         context["action_before_recheck"] = {"side": action.side, "qty": action.qty, "reason": action.reason}
 
+        # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
+        proxy_enabled = await get_effective_proxy_trading(self.conn)
+        proxy_info = proxy_mapping.get_proxy_etf(symbol) if proxy_enabled else None
+        if proxy_info:
+            proxy_symbol = proxy_info["proxy_symbol"]
+            proxy_name = proxy_info["proxy_name"]
+            context["proxy_trading"] = {
+                "original_symbol": symbol,
+                "proxy_symbol": proxy_symbol,
+                "proxy_name": proxy_name,
+            }
+            logger.info(
+                f"'{symbol}' {action.side.upper()} 신호 발생 ➔ "
+                f"국내 대체 ETF '{proxy_name}' ({proxy_symbol})로 대리 매매 집행"
+            )
+
+            # 국내 대체 ETF 현재가 조회
+            dom_price_info = await kis_domestic.get_price(self.client, proxy_symbol)
+            dom_price = float(dom_price_info.get("stck_prpr") or 0)
+            if dom_price <= 0:
+                await self._log_no_op(cycle_id, symbol, target_weight, f"대체 ETF({proxy_symbol}) 현재가 조회 실패", context)
+                return
+
+            if action.side == "buy":
+                target_notional_krw = action.qty * price_krw
+                proxy_qty = max(1.0, float(int(target_notional_krw / dom_price)))
+                psbl = await kis_domestic.get_buyable_cash(self.client, proxy_symbol, int(dom_price))
+                context["proxy_buyable_check"] = psbl
+                proxy_qty = min(proxy_qty, float(psbl.get("max_buy_qty") or 0))
+                proxy_qty = float(int(proxy_qty))
+            else:
+                dom_sellable = await kis_domestic.get_sellable_qty(self.client, proxy_symbol)
+                context["proxy_sellable_check"] = dom_sellable
+                proxy_qty = float(dom_sellable.get("ord_psbl_qty") or 0)
+                proxy_qty = float(int(proxy_qty))
+
+            if proxy_qty <= 0:
+                await self._log_no_op(
+                    cycle_id, symbol, target_weight,
+                    f"대체 ETF({proxy_symbol}) 주문가능수량 0", context
+                )
+                return
+
+            reason_str = f"[{symbol} ➔ {proxy_name} 대리매매] {action.reason}"
+            try:
+                intent_id = await db.create_order_intent(
+                    self.conn, cycle_id, proxy_symbol, action.side, proxy_qty, "limit", dom_price,
+                    reason_str, market="domestic",
+                )
+            except aiosqlite.IntegrityError:
+                logger.warning(f"'{proxy_symbol}' 이번 사이클에 이미 intent 존재 — 주문 스킵")
+                return
+
+            try:
+                result = await kis_domestic.order_cash(
+                    self.client, proxy_symbol, action.side, int(proxy_qty), int(dom_price),
+                )
+                kis_order_no = result.get("ODNO") or result.get("odno")
+                await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+                self._orders_submitted_in_cycle += 1
+                if winddown_liquidating is not None:
+                    await db.mark_winddown_sell_started(self.conn, proxy_symbol)
+            except KisApiError as e:
+                await db.update_order_intent(self.conn, intent_id, status="REJECTED")
+                await self.risk.record_order_rejection()
+                await db.log_decision(
+                    self.conn, cycle_id, proxy_symbol, current_weight, target_weight,
+                    current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
+                    action.side.upper(), proxy_qty, f"대리주문 거부: {e.msg1}", intent_id, context=context,
+                )
+                return
+
+            await db.log_decision(
+                self.conn, cycle_id, proxy_symbol, current_weight, target_weight,
+                current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
+                action.side.upper(), proxy_qty, reason_str, intent_id, context=context,
+            )
+            return
+
         # 주문 직전 항상 실시간으로 재확인 — 캐시/이전 조회 신뢰 금지.
         if action.side == "buy":
+
             psbl = await kis_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
             context["buyable_check"] = psbl
             action.qty = min(action.qty, float(psbl.get("max_ord_psbl_qty") or 0))

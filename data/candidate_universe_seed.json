@@ -18,5 +18,30 @@
   {"symbol": "096770", "name": "SK이노베이션", "universe_tag": "KOSPI_LARGE_CAP"},
   {"symbol": "086790", "name": "하나금융지주", "universe_tag": "KOSPI_LARGE_CAP"},
   {"symbol": "207940", "name": "삼성바이오로직스", "universe_tag": "KOSPI_LARGE_CAP"},
-  {"symbol": "068270", "name": "셀트리온", "universe_tag": "KOSPI_LARGE_CAP"}
+  {"symbol": "068270", "name": "셀트리온", "universe_tag": "KOSPI_LARGE_CAP"},
+
+  {"symbol": "AAPL", "name": "Apple Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "MSFT", "name": "Microsoft Corp.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "NVDA", "name": "NVIDIA Corp.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "GOOGL", "name": "Alphabet Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "AMZN", "name": "Amazon.com Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "TSLA", "name": "Tesla Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust", "universe_tag": "US_INDEX", "market": "overseas", "exchange": "AMEX"},
+  {"symbol": "QQQ", "name": "Invesco QQQ Trust", "universe_tag": "US_INDEX", "market": "overseas", "exchange": "NASD"},
+
+  {"symbol": "VST", "name": "Vistra Corp.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "CEG", "name": "Constellation Energy Corp.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NASD"},
+  {"symbol": "GEV", "name": "GE Vernova Inc.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "ETN", "name": "Eaton Corp. plc", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
+
+  {"symbol": "LLY", "name": "Eli Lilly and Co.", "universe_tag": "US_HEALTHCARE", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "NVO", "name": "Novo Nordisk A/S ADR", "universe_tag": "US_HEALTHCARE", "market": "overseas", "exchange": "NYSE"},
+
+  {"symbol": "GLD", "name": "SPDR Gold Shares", "universe_tag": "US_COMMODITY", "market": "overseas", "exchange": "AMEX"},
+
+  {"symbol": "KO", "name": "Coca-Cola Co.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "PG", "name": "Procter & Gamble Co.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "JNJ", "name": "Johnson & Johnson", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "NEE", "name": "NextEra Energy Inc.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
+  {"symbol": "XLU", "name": "Utilities Select Sector SPDR", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "AMEX"}
 ]

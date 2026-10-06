@@ -16,11 +16,15 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import pandas as pd
 
-from core import db, discovery, indicators, kis_domestic, macro, quant_metrics
+from core import (
+    db, discovery, indicators, kis_domestic, kis_overseas, macro, proxy_mapping, quant_metrics,
+)
 from core.ai_rebalance_guard import validate_proposal
-from core.config import settings
+from core.config import get_effective_proxy_trading, settings
 from core.kis_client import AsyncKISClient
 from core.llm.factory import get_llm_provider
+from core.utils import symbol_mapper
+
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -49,8 +53,19 @@ async def _build_current_positions(
         }
         if client is not None:
             try:
-                chart_rows = await kis_domestic.get_daily_chart(client, symbol, start_date, end_date)
-                df = indicators.chart_rows_to_dataframe(chart_rows)
+                if symbol_mapper.is_overseas_symbol(symbol):
+                    chart_rows = []
+                    for ex in ["NASD", "NYSE", "AMEX"]:
+                        try:
+                            chart_rows = await kis_overseas.get_daily_chart(client, ex, symbol)
+                            if chart_rows:
+                                break
+                        except Exception:
+                            continue
+                    df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+                else:
+                    chart_rows = await kis_domestic.get_daily_chart(client, symbol, start_date, end_date)
+                    df = indicators.chart_rows_to_dataframe(chart_rows)
                 entry.update(quant_metrics.compute_price_based_metrics(df, benchmark_returns))
                 entry.update(indicators.compute_technical_detail(df))
                 if not df.empty and avg_price > 0:
@@ -59,8 +74,8 @@ async def _build_current_positions(
                         quant_metrics.compute_position_return(avg_price, current_price, pos.get("entry_opened_at"))
                     )
             except Exception:
-                # 해외종목(시세 API가 다름) 등에서 실패해도 이 종목 하나만 지표 없이 넘어간다.
                 logger.exception(f"'{symbol}' 성과/리스크 지표 계산 실패 - 비중/평단만으로 계속")
+
         result.append(entry)
     return result
 
@@ -82,10 +97,16 @@ async def _validate_adds(
     """LLM이 제안한 adds를 다시 한 번 KIS로 검증한다 (candidate_pool에 있었어도 스크리닝과
     제안 사이에 VI가 새로 발동했을 수 있어 방어적으로 재확인). 통과분/반려분을 나눠 반환."""
     candidate_by_symbol = {c["symbol"]: c for c in candidate_pool}
+    proxy_by_symbol = {}
+    for c in candidate_pool:
+        if c.get("proxy_symbol"):
+            proxy_by_symbol[c["proxy_symbol"]] = c
+
     valid, rejected = [], []
     for add in adds:
         symbol = add.get("symbol")
-        if symbol not in candidate_by_symbol:
+        candidate = candidate_by_symbol.get(symbol) or proxy_by_symbol.get(symbol)
+        if not candidate:
             rejected.append({**add, "reject_reason": "candidate_pool 밖의 종목 - 채택 불가"})
             continue
         outcome = await discovery.validate_candidate_symbol(client, symbol, claimed_name=add.get("name"))
@@ -94,6 +115,7 @@ async def _validate_adds(
             continue
         valid.append(add)
     return valid, rejected
+
 
 
 async def propose_rebalance(
@@ -181,10 +203,39 @@ async def propose_rebalance(
         )
         return {"event_id": event_id, "status": "FAILED", "reason": result.get("rationale", "")}
 
+    proxy_enabled = await get_effective_proxy_trading(conn)
+    if proxy_enabled:
+        # LLM이 해외 원주(GOOGL, NVDA 등)를 제안한 경우 국장 대체 ETF로 자동 매핑
+        new_adds = []
+        for a in result.get("adds", []):
+            sym = a.get("symbol", "")
+            proxy_info = proxy_mapping.get_proxy_etf(sym)
+            if proxy_info:
+                p_sym = proxy_info["proxy_symbol"]
+                p_name = proxy_info["proxy_name"]
+                new_adds.append({
+                    "symbol": p_sym,
+                    "name": p_name,
+                    "rationale": f"[{sym} 원주 인사이트 ➔ 국장 대체ETF {p_name}] " + a.get("rationale", ""),
+                })
+            else:
+                new_adds.append(a)
+        result["adds"] = new_adds
+
+        new_weights = {}
+        for s, w in result.get("weights", {}).items():
+            proxy_info = proxy_mapping.get_proxy_etf(s)
+            if proxy_info:
+                new_weights[proxy_info["proxy_symbol"]] = w
+            else:
+                new_weights[s] = w
+        result["weights"] = new_weights
+
     valid_adds, rejected_adds = ([], result.get("adds", []))
     if client is not None and result.get("adds"):
         valid_adds, rejected_adds = await _validate_adds(client, result["adds"], candidate_pool)
     valid_add_symbols = [a["symbol"] for a in valid_adds]
+
 
     # removes는 candidate_pool 검증 대상이 아니라 "이미 보유 중인" 종목이어야 의미가 있다.
     valid_removes = [r for r in result.get("removes", []) if r.get("symbol") in active_weights]

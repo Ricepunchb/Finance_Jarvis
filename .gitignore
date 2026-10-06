@@ -13,6 +13,8 @@ __pycache__/
 data/*
 # 단, 종목 발굴 후보 유니버스 시드는 커밋 대상 (런타임 상태가 아니라 소스 데이터)
 !data/candidate_universe_seed.json
+!data/overseas_proxy_map.json
+
 
 # 엔진 실행 로그 (uvicorn stdout을 tee/리다이렉트로 남긴 것, 개인 실행 기록)
 logs_*.log

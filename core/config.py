@@ -153,7 +153,35 @@ class Settings(BaseSettings):
                 "설정되지 않았습니다. 실거래를 의도한 것이 맞다면 .env에 명시적으로 추가하세요."
             )
 
+    # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
+    OVERSEAS_PROXY_TRADING_ENABLED: bool = True  # 해외 종목 발굴 시 국장 대체 ETF로 매매
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 settings = Settings()
+
+
+async def get_effective_domestic_only(conn) -> bool:
+    """DB state('domestic_only')가 설정되어 있으면 그 값을 우선하고, 없으면 settings.DOMESTIC_ONLY를 사용한다."""
+    from core import db
+    val = await db.get_state(conn, "domestic_only")
+    if val is not None:
+        return val == "1"
+    return settings.DOMESTIC_ONLY
+
+
+async def get_effective_proxy_trading(conn) -> bool:
+    """DB state('proxy_domestic_trading')가 설정되어 있으면 그 값을 우선하고, 없으면 settings.OVERSEAS_PROXY_TRADING_ENABLED를 사용한다."""
+    from core import db
+    val = await db.get_state(conn, "proxy_domestic_trading")
+    if val is not None:
+        return val == "1"
+    return settings.OVERSEAS_PROXY_TRADING_ENABLED
+
+
+async def set_effective_proxy_trading(conn, enabled: bool) -> None:
+    """DB state에 해외 종목 프록시 매매 활성화 여부를 저장한다."""
+    from core import db
+    await db.set_state(conn, "proxy_domestic_trading", "1" if enabled else "0")
+

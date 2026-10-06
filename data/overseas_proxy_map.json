@@ -1,0 +1,143 @@
+{
+  "GOOGL": {
+    "proxy_symbol": "473460",
+    "proxy_name": "ACE 구글밸류체인액티브",
+    "type": "VALUE_CHAIN",
+    "beta_estimate": 0.85,
+    "description": "알파벳(구글) 약 25% + 글로벌 AI/클라우드 생태계 밸류체인"
+  },
+  "NVDA": {
+    "proxy_symbol": "465580",
+    "proxy_name": "ACE 엔비디아채권혼합블룸버그",
+    "type": "BOND_MIX",
+    "beta_estimate": 0.40,
+    "description": "엔비디아 약 30% + 국내외 우량 국채 70% (변동성 제어형)"
+  },
+  "TSLA": {
+    "proxy_symbol": "494340",
+    "proxy_name": "ACE 테슬라밸류체인액티브",
+    "type": "VALUE_CHAIN",
+    "beta_estimate": 0.80,
+    "description": "테슬라 약 25% + 자율주행/로보틱스 밸류체인"
+  },
+  "AAPL": {
+    "proxy_symbol": "381170",
+    "proxy_name": "TIGER 미국테크TOP10 INDXX",
+    "type": "TOP10",
+    "beta_estimate": 0.90,
+    "description": "애플, 마이크로소프트 등 미국 대표 빅테크 TOP10"
+  },
+  "MSFT": {
+    "proxy_symbol": "381170",
+    "proxy_name": "TIGER 미국테크TOP10 INDXX",
+    "type": "TOP10",
+    "beta_estimate": 0.90,
+    "description": "마이크로소프트 등 미국 대표 빅테크 TOP10"
+  },
+  "AMZN": {
+    "proxy_symbol": "381170",
+    "proxy_name": "TIGER 미국테크TOP10 INDXX",
+    "type": "TOP10",
+    "beta_estimate": 0.90,
+    "description": "아마존 등 미국 대표 빅테크 TOP10"
+  },
+  "SPY": {
+    "proxy_symbol": "360750",
+    "proxy_name": "TIGER 미국S&P500",
+    "type": "INDEX",
+    "beta_estimate": 1.00,
+    "description": "미국 S&P 500 대표 지수 추종 ETF"
+  },
+  "QQQ": {
+    "proxy_symbol": "379800",
+    "proxy_name": "TIGER 미국나스닥100",
+    "type": "INDEX",
+    "beta_estimate": 1.00,
+    "description": "미국 나스닥 100 기술주 대표 지수 추종 ETF"
+  },
+  "GLD": {
+    "proxy_symbol": "132030",
+    "proxy_name": "KODEX 골드선물(H)",
+    "type": "COMMODITY",
+    "beta_estimate": 1.00,
+    "description": "국제 금 선물 가격 추종 (환헤지형, 상관계수 0.97+)"
+  },
+  "LLY": {
+    "proxy_symbol": "475380",
+    "proxy_name": "KODEX 글로벌비만치료제TOP2Plus",
+    "type": "THEME",
+    "beta_estimate": 0.80,
+    "description": "일라이릴리 + 노보노디스크 약 50% 집중 투자"
+  },
+  "NVO": {
+    "proxy_symbol": "475380",
+    "proxy_name": "KODEX 글로벌비만치료제TOP2Plus",
+    "type": "THEME",
+    "beta_estimate": 0.80,
+    "description": "노보노디스크 + 일라이릴리 약 50% 집중 투자"
+  },
+  "VST": {
+    "proxy_symbol": "483320",
+    "proxy_name": "KODEX 미국AI전력핵심인프라",
+    "type": "THEME",
+    "beta_estimate": 0.85,
+    "description": "비스트라, 콘스텔레이션 등 AI 전력/원전 유틸리티 인프라"
+  },
+  "CEG": {
+    "proxy_symbol": "483320",
+    "proxy_name": "KODEX 미국AI전력핵심인프라",
+    "type": "THEME",
+    "beta_estimate": 0.85,
+    "description": "콘스텔레이션 등 AI 원자력 발전 핵심 인프라"
+  },
+  "GEV": {
+    "proxy_symbol": "483320",
+    "proxy_name": "KODEX 미국AI전력핵심인프라",
+    "type": "THEME",
+    "beta_estimate": 0.85,
+    "description": "GE베르노바 등 미국 전력 그리드/터빈 설비 인프라"
+  },
+  "ETN": {
+    "proxy_symbol": "483320",
+    "proxy_name": "KODEX 미국AI전력핵심인프라",
+    "type": "THEME",
+    "beta_estimate": 0.85,
+    "description": "이튼 등 데이터센터 전력 분배 핵심 인프라"
+  },
+  "KO": {
+    "proxy_symbol": "441640",
+    "proxy_name": "TIGER 미국배당다우존스",
+    "type": "DIVIDEND",
+    "beta_estimate": 0.80,
+    "description": "코카콜라 등 미국 대표 배당성장 및 경기방어주 포트폴리오"
+  },
+  "PG": {
+    "proxy_symbol": "441640",
+    "proxy_name": "TIGER 미국배당다우존스",
+    "type": "DIVIDEND",
+    "beta_estimate": 0.80,
+    "description": "P&G 등 글로벌 필수소비재/경기방어주 포트폴리오"
+  },
+  "JNJ": {
+    "proxy_symbol": "441640",
+    "proxy_name": "TIGER 미국배당다우존스",
+    "type": "DIVIDEND",
+    "beta_estimate": 0.80,
+    "description": "존슨앤드존슨 등 헬스케어 방어주 포트폴리오"
+  },
+  "NEE": {
+    "proxy_symbol": "441640",
+    "proxy_name": "TIGER 미국배당다우존스",
+    "type": "DIVIDEND",
+    "beta_estimate": 0.80,
+    "description": "넥스트에라 등 재생에너지 및 유틸리티 방어주"
+  },
+  "XLU": {
+    "proxy_symbol": "441640",
+    "proxy_name": "TIGER 미국배당다우존스",
+    "type": "DIVIDEND",
+    "beta_estimate": 0.80,
+    "description": "미국 유틸리티 대표 방어 섹터 ETF 대체"
+  }
+}
+

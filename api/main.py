@@ -18,7 +18,9 @@ from core import (
     analytics, db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent,
     reconciliation, signal_engine,
 )
-from core.config import settings
+from core.config import (
+    get_effective_domestic_only, get_effective_proxy_trading, set_effective_proxy_trading, settings,
+)
 from core.engine import CYCLE_INTERVAL_SEC, TradingEngine
 from core.lock import EngineAlreadyRunningError
 from core.portfolio_scheduler import PortfolioScheduler
@@ -73,6 +75,15 @@ class AddCandidateRequest(BaseModel):
 class SchedulerToggleRequest(BaseModel):
     enabled: Optional[bool] = None
     auto_apply: Optional[bool] = None
+
+
+class DomesticOnlyRequest(BaseModel):
+    domestic_only: bool
+
+
+class ProxyTradingRequest(BaseModel):
+    enabled: bool
+
 
 
 @app.post("/engine/start")
@@ -132,9 +143,17 @@ async def engine_status():
 @app.get("/engine/config")
 async def get_config():
     """UI가 리스크/LLM 설정값을 보여주기 위한 읽기전용 엔드포인트. 비밀값(API 키 원문)은 노출하지 않는다."""
+    conn = await db.get_connection()
+    try:
+        is_domestic = await get_effective_domestic_only(conn)
+        is_proxy = await get_effective_proxy_trading(conn)
+    finally:
+        await conn.close()
+
     return {
         "is_mock": settings.IS_MOCK,
-        "domestic_only": settings.DOMESTIC_ONLY,
+        "domestic_only": is_domestic,
+        "proxy_trading_enabled": is_proxy,
         "cycle_interval_sec": CYCLE_INTERVAL_SEC,
         "rebalance_band_pct": settings.REBALANCE_BAND_PCT,
         "max_position_pct": settings.MAX_POSITION_PCT,
@@ -173,16 +192,48 @@ async def get_config():
     }
 
 
-@app.post("/portfolio/symbols")
-async def add_symbol(req: AddSymbolRequest):
-    if settings.DOMESTIC_ONLY and req.market != "domestic":
-        raise HTTPException(status_code=400, detail="국내 전용 모드(DOMESTIC_ONLY)라 해외 종목은 등록할 수 없습니다")
+@app.post("/engine/domestic-only")
+async def set_domestic_only(req: DomesticOnlyRequest):
+    """국내 전용 모드를 켜거나 끈다 (Streamlit 프론트 토글 연동)."""
     conn = await db.get_connection()
     try:
+        await db.set_state(conn, "domestic_only", "1" if req.domestic_only else "0")
+    finally:
+        await conn.close()
+    return {"status": "ok", "domestic_only": req.domestic_only}
+
+
+@app.post("/engine/proxy-trading")
+async def set_proxy_trading(req: ProxyTradingRequest):
+    """해외 종목 발굴 ➔ 국내 대체 ETF 대리 매매 모드를 켜거나 끈다 (Streamlit 토글 연동)."""
+    conn = await db.get_connection()
+    try:
+        await set_effective_proxy_trading(conn, req.enabled)
+    finally:
+        await conn.close()
+    return {"status": "ok", "proxy_trading_enabled": req.enabled}
+
+
+@app.get("/engine/proxy-mappings")
+async def get_proxy_mappings_api():
+    """현재 정의된 해외 종목 ↔ 국내 대체 ETF 매핑 정보 조회."""
+    from core import proxy_mapping
+    return proxy_mapping.load_proxy_mappings()
+
+
+
+@app.post("/portfolio/symbols")
+async def add_symbol(req: AddSymbolRequest):
+    conn = await db.get_connection()
+    try:
+        is_domestic = await get_effective_domestic_only(conn)
+        if is_domestic and req.market != "domestic":
+            raise HTTPException(status_code=400, detail="국내 전용 모드(DOMESTIC_ONLY)라 해외 종목은 등록할 수 없습니다")
         await db.add_portfolio_symbol(conn, req.symbol, req.market, req.exchange)
     finally:
         await conn.close()
     return {"status": "added", "symbol": req.symbol}
+
 
 
 @app.get("/portfolio/symbols")

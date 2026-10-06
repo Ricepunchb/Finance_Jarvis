@@ -19,12 +19,17 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import pandas as pd
 
-from core import db, discovery_signals, indicators, kis_domestic, quant_metrics
+from core import (
+    db, discovery_signals, indicators, kis_domestic, kis_overseas, proxy_mapping, quant_metrics,
+)
 from core.config import settings
+from core.fundamentals import yfinance_client
 from core.fundamentals.naver_research import fetch_company_research
 from core.fundamentals.valuation import get_valuation_signal
 from core.kis_client import AsyncKISClient
 from core.news.naver_finance import fetch_recent_news
+from core.utils import symbol_mapper
+
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -51,17 +56,41 @@ async def validate_candidate_symbol(
     """후보가 candidate_universe에 들어가거나 ADD로 실제 채택되기 전 반드시 통과해야 한다.
 
     1) KIS 실재성 확인 (존재하지 않는/오타 종목코드 차단) - 가격이 정상 조회되면 실재로 간주
-    2) VI(거래정지) 상태 확인
-    3) LLM이 주장한 종목명과 KIS 실제 종목명 대조 (코드가 우연히 존재해도 이름이 다르면
-       환각 의심으로 반려) - 단, 모의투자 시세조회는 종목명(hts_kor_isnm)을 아예 비워서
-       주는 경우가 있어 그럴 땐 이름 대조를 건너뛰고 가격 조회 성공만으로 통과시킨다
-       (그렇지 않으면 실전 종목코드가 모의투자에서 전부 반려되는 사고가 남).
+    2) VI(거래정지) 상태 확인 (국내 전용)
+    3) LLM이 주장한 종목명과 KIS 실제 종목명 대조
     """
-    if market != "domestic":
-        return ValidationOutcome(False, "해외 후보종목은 아직 지원하지 않음 (Phase 5.1 범위 밖)")
+    clean_sym = symbol.strip().upper()
+    is_overseas = market == "overseas" or symbol_mapper.is_overseas_symbol(clean_sym)
+
+    if is_overseas:
+        # 해외 종목 검증
+        try:
+            price = 0.0
+            kis_name = claimed_name or clean_sym
+            for ex in ["NASD", "NYSE", "AMEX"]:
+                try:
+                    price_info = await kis_overseas.get_price(client, ex, clean_sym)
+                    p = float(price_info.get("last") or price_info.get("ovrs_nmix_prpr") or 0)
+                    if p > 0:
+                        price = p
+                        kis_name = price_info.get("hts_kor_isnm") or claimed_name or clean_sym
+                        break
+                except Exception:
+                    continue
+
+            if price <= 0:
+                # KIS 모의투자 해외 시세 일시 오류 시 yfinance 검증
+                yf_targets = await asyncio.to_thread(yfinance_client.fetch_analyst_targets, clean_sym)
+                if yf_targets and yf_targets.get("last_close"):
+                    return ValidationOutcome(True, kis_name=claimed_name or clean_sym)
+                return ValidationOutcome(False, "해외 시세조회 실패 (존재하지 않는 해외 티커일 가능성)")
+
+            return ValidationOutcome(True, kis_name=kis_name)
+        except Exception as e:
+            return ValidationOutcome(False, f"해외 종목 검증 중 예외: {e}")
 
     try:
-        price_info = await kis_domestic.get_price(client, symbol)
+        price_info = await kis_domestic.get_price(client, clean_sym)
     except Exception:
         return ValidationOutcome(False, "KIS 시세조회 실패 (존재하지 않는 종목코드일 가능성)")
 
@@ -71,14 +100,14 @@ async def validate_candidate_symbol(
 
     kis_name = price_info.get("hts_kor_isnm")
     if not kis_name:
-        logger.warning(f"'{symbol}' KIS 응답에 종목명 없음(모의투자 API 제약으로 추정) - 이름 대조 없이 가격만으로 실재성 인정")
+        logger.warning(f"'{clean_sym}' KIS 응답에 종목명 없음(모의투자 API 제약으로 추정) - 이름 대조 없이 가격만으로 실재성 인정")
 
     try:
-        vi_rows = await kis_domestic.get_vi_status(client, symbol)
+        vi_rows = await kis_domestic.get_vi_status(client, clean_sym)
         if vi_rows:
             return ValidationOutcome(False, "VI(거래정지) 발동 중 - 편입 후보에서 제외")
     except Exception:
-        logger.exception(f"'{symbol}' VI 상태 조회 실패 - 검증은 계속 진행")
+        logger.exception(f"'{clean_sym}' VI 상태 조회 실패 - 검증은 계속 진행")
 
     if kis_name and claimed_name and claimed_name.strip():
         claimed = claimed_name.strip()
@@ -109,7 +138,8 @@ async def seed_candidate_universe(
         if symbol in existing:
             skipped += 1
             continue
-        outcome = await validate_candidate_symbol(client, symbol, claimed_name=entry.get("name"))
+        market = entry.get("market", "domestic")
+        outcome = await validate_candidate_symbol(client, symbol, market=market, claimed_name=entry.get("name"))
         if not outcome.ok:
             logger.warning(f"후보종목 시딩 반려: {symbol} ({entry.get('name', '')}) - {outcome.reason}")
             rejected += 1
@@ -122,6 +152,7 @@ async def seed_candidate_universe(
     return {"added": added, "rejected": rejected, "skipped": skipped}
 
 
+
 async def _score_one(
     conn: aiosqlite.Connection,
     client: AsyncKISClient,
@@ -132,9 +163,21 @@ async def _score_one(
     end_date: str,
 ) -> Optional[Dict[str, Any]]:
     symbol = candidate["symbol"]
+    is_overseas = symbol_mapper.is_overseas_symbol(symbol)
     try:
-        chart_rows = await kis_domestic.get_daily_chart(client, symbol, start_date, end_date)
-        df = indicators.chart_rows_to_dataframe(chart_rows)
+        if is_overseas:
+            chart_rows = []
+            for ex in ["NASD", "NYSE", "AMEX"]:
+                try:
+                    chart_rows = await kis_overseas.get_daily_chart(client, ex, symbol)
+                    if chart_rows:
+                        break
+                except Exception:
+                    continue
+            df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+        else:
+            chart_rows = await kis_domestic.get_daily_chart(client, symbol, start_date, end_date)
+            df = indicators.chart_rows_to_dataframe(chart_rows)
         tech_signal = indicators.compute_technical_signal(df)
     except Exception:
         logger.exception(f"'{symbol}' 스크리닝 시그널 계산 실패 - 이번 스크리닝에서 제외")
@@ -148,12 +191,21 @@ async def _score_one(
         "symbol": symbol, "name": candidate["name"], "universe_tag": candidate["universe_tag"],
         "tech": tech_signal, "sources": sources,
     }
+    proxy_info = proxy_mapping.get_proxy_etf(symbol)
+    if proxy_info:
+        entry["proxy_symbol"] = proxy_info["proxy_symbol"]
+        entry["proxy_name"] = proxy_info["proxy_name"]
+        entry["proxy_type"] = proxy_info.get("type")
+        entry["proxy_desc"] = proxy_info.get("description")
+
     entry.update(quant_metrics.compute_price_based_metrics(df, benchmark_returns))
     entry.update(indicators.compute_technical_detail(df))
     entry.update(discovery_signals.volume_accumulation(df))
 
     value_strength = 0.0
-    valuation = await get_valuation_signal(conn, client, symbol)
+    valuation = await get_valuation_signal(
+        conn, client, symbol, market="overseas" if is_overseas else "domestic"
+    )
     if valuation and valuation["direction"] == "BUY":
         value_strength = valuation["strength"]
     cached = await db.get_cached_valuation(conn, symbol, settings.VALUATION_CACHE_TTL_HOURS)
@@ -163,6 +215,7 @@ async def _score_one(
         target = cached.get("target_price_mean")
         if target and last_close > 0:
             entry["target_gap_pct"] = round((target - last_close) / last_close, 3)
+
 
     articles = await asyncio.to_thread(fetch_recent_news, symbol, NEWS_FETCH_COUNT)
     entry.update(discovery_signals.news_acceleration(
