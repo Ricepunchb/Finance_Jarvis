@@ -1,0 +1,230 @@
+{
+  "TSLW": {
+    "type": "SINGLE_STOCK",
+    "underlying": "TSLA",
+    "name": "YieldMax TSLA Option Income Strategy"
+  },
+  "TSLY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "TSLA",
+    "name": "YieldMax TSLA Option Income Strategy"
+  },
+  "NFLW": {
+    "type": "SINGLE_STOCK",
+    "underlying": "NFLX",
+    "name": "YieldMax NFLX Option Income Strategy"
+  },
+  "NVDY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "NVDA",
+    "name": "YieldMax NVDA Option Income Strategy"
+  },
+  "CONY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "COIN",
+    "name": "YieldMax COIN Option Income Strategy"
+  },
+  "MSTY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "MSTR",
+    "name": "YieldMax MSTR Option Income Strategy"
+  },
+  "AMZY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "AMZN",
+    "name": "YieldMax AMZN Option Income Strategy"
+  },
+  "GOOY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "GOOGL",
+    "name": "YieldMax GOOGL Option Income Strategy"
+  },
+  "AAPY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "AAPL",
+    "name": "YieldMax AAPL Option Income Strategy"
+  },
+  "MSFO": {
+    "type": "SINGLE_STOCK",
+    "underlying": "MSFT",
+    "name": "YieldMax MSFT Option Income Strategy"
+  },
+  "PLTY": {
+    "type": "SINGLE_STOCK",
+    "underlying": "PLTR",
+    "name": "YieldMax PLTR Option Income Strategy"
+  },
+  "494340": {
+    "type": "SINGLE_STOCK",
+    "underlying": "TSLA",
+    "name": "ACE 테슬라밸류체인액티브"
+  },
+  "465580": {
+    "type": "SINGLE_STOCK",
+    "underlying": "NVDA",
+    "name": "ACE 엔비디아채권혼합블룸버그"
+  },
+  "473460": {
+    "type": "SINGLE_STOCK",
+    "underlying": "GOOGL",
+    "name": "ACE 구글밸류체인액티브"
+  },
+  "OZEM": {
+    "type": "THEMATIC",
+    "anchors": ["LLY", "NVO"],
+    "theme": "비만치료제/GLP-1",
+    "name": "Roundhill GLP-1 & Weight Loss ETF"
+  },
+  "SMH": {
+    "type": "THEMATIC",
+    "anchors": ["NVDA", "TSM", "AVGO"],
+    "theme": "반도체/AI하드웨어",
+    "name": "VanEck Semiconductor ETF"
+  },
+  "SOXX": {
+    "type": "THEMATIC",
+    "anchors": ["NVDA", "AVGO", "AMD"],
+    "theme": "필라델피아반도체",
+    "name": "iShares Semiconductor ETF"
+  },
+  "XLE": {
+    "type": "THEMATIC",
+    "anchors": ["XOM", "CVX"],
+    "theme": "에너지/원유",
+    "name": "Energy Select Sector SPDR"
+  },
+  "XLK": {
+    "type": "THEMATIC",
+    "anchors": ["AAPL", "MSFT", "NVDA"],
+    "theme": "기술/빅테크",
+    "name": "Technology Select Sector SPDR"
+  },
+  "XLU": {
+    "type": "THEMATIC",
+    "anchors": ["NEE", "SO"],
+    "theme": "유틸리티/전력",
+    "name": "Utilities Select Sector SPDR"
+  },
+  "XLV": {
+    "type": "THEMATIC",
+    "anchors": ["UNH", "LLY", "JNJ"],
+    "theme": "헬스케어/제약",
+    "name": "Health Care Select Sector SPDR"
+  },
+  "XLF": {
+    "type": "THEMATIC",
+    "anchors": ["JPM", "BAC"],
+    "theme": "금융/은행",
+    "name": "Financial Select Sector SPDR"
+  },
+  "LIT": {
+    "type": "THEMATIC",
+    "anchors": ["ALB", "006400"],
+    "theme": "2차전지/리튬",
+    "name": "Global X Lithium & Battery Tech ETF"
+  },
+  "381180": {
+    "type": "THEMATIC",
+    "anchors": ["NVDA", "TSM", "AVGO", "AMD"],
+    "theme": "미국필라델피아반도체",
+    "name": "TIGER 미국필라델피아반도체나스닥"
+  },
+  "381170": {
+    "type": "THEMATIC",
+    "anchors": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
+    "theme": "미국빅테크TOP10",
+    "name": "TIGER 미국테크TOP10 INDXX"
+  },
+  "305720": {
+    "type": "THEMATIC",
+    "anchors": ["006400", "373220", "051910"],
+    "theme": "2차전지산업",
+    "name": "KODEX 2차전지산업"
+  },
+  "SCHD": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "Schwab U.S. Dividend Equity ETF"
+  },
+  "SPY": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "SPDR S&P 500 ETF Trust"
+  },
+  "QQQ": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "Invesco QQQ Trust"
+  },
+  "VOO": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "Vanguard S&P 500 ETF"
+  },
+  "IVV": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "iShares Core S&P 500 ETF"
+  },
+  "IWM": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "iShares Russell 2000 ETF"
+  },
+  "DIA": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "SPDR Dow Jones Industrial Average ETF"
+  },
+  "VTI": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "Vanguard Total Stock Market ETF"
+  },
+  "GLD": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "SPDR Gold Shares"
+  },
+  "TLT": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "iShares 20+ Year Treasury Bond ETF"
+  },
+  "446720": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "SOL 미국배당다우존스"
+  },
+  "458760": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER 미국배당다우존스타겟커버드콜2호"
+  },
+  "466940": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER 은행고배당플러스TOP10"
+  },
+  "069500": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "KODEX 200"
+  },
+  "229200": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "KODEX 코스닥150"
+  },
+  "360750": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER 미국S&P500"
+  },
+  "133690": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER 미국나스닥100"
+  }
+}
+

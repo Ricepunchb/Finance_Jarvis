@@ -585,8 +585,26 @@ async def cache_valuation(conn: aiosqlite.Connection, symbol: str, **fields: Any
 
 # --- news_cache ---
 
-async def get_cached_news_sentiment(conn: aiosqlite.Connection, url: str) -> Optional[Dict[str, Any]]:
-    # 1. 현재 계좌 DB 조회
+def _news_title_tokens(title: str) -> set:
+    import re
+    return set(re.findall(r"[\w가-힣]+", title.lower()))
+
+
+def _news_titles_similar(a: str, b: str, threshold: float = 0.65) -> bool:
+    ta, tb = _news_title_tokens(a), _news_title_tokens(b)
+    if len(ta) < 3 or len(tb) < 3:
+        return False
+    return len(ta & tb) / len(ta | tb) >= threshold
+
+
+async def get_cached_news_sentiment(
+    conn: aiosqlite.Connection,
+    url: str,
+    title: Optional[str] = None,
+    symbol: Optional[str] = None,
+    published_at: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    # 1. 현재 계좌 DB 정확한 URL 조회
     cur = await conn.execute(
         "SELECT sentiment_score, sentiment_reasoning FROM news_cache WHERE url = ? "
         "AND sentiment_score IS NOT NULL",
@@ -596,9 +614,9 @@ async def get_cached_news_sentiment(conn: aiosqlite.Connection, url: str) -> Opt
     if row:
         return dict(row)
 
-    # 2. 다른 계좌(피어 프로필) DB 교차 확인 - 중복 LLM API 호출 원천 방지
+    # 2. 다른 계좌(피어 프로필) DB 정확한 URL 교차 확인
+    db_dir = Path(settings.DB_PATH).parent
     try:
-        db_dir = Path(settings.DB_PATH).parent
         for peer_path in db_dir.glob("jarvis_*.db"):
             if peer_path.resolve() == Path(settings.DB_PATH).resolve():
                 continue
@@ -629,6 +647,65 @@ async def get_cached_news_sentiment(conn: aiosqlite.Connection, url: str) -> Opt
                 continue
     except Exception:
         pass
+
+    # 3. URL이 다르더라도 동일 종목 + 유사 제목(동일 사건 다수 언론사 보도) 캐시 확인 (Gemini API 낭비 방지)
+    if title and symbol:
+        lookback_ts = (published_at or time.time()) - 48 * 3600
+        # 3-1. 현재 DB에서 최근 48시간 내 동일 종목 기사 비교
+        try:
+            cur = await conn.execute(
+                "SELECT source, published_at, raw_text, sentiment_score, sentiment_reasoning "
+                "FROM news_cache WHERE symbol = ? AND sentiment_score IS NOT NULL "
+                "AND published_at >= ? ORDER BY published_at DESC LIMIT 30",
+                (symbol, lookback_ts),
+            )
+            for r in await cur.fetchall():
+                c_title = r["raw_text"] or ""
+                if _news_titles_similar(title, c_title):
+                    reasoning = f"[유사보도 재사용: {c_title[:25]}...] " + (r["sentiment_reasoning"] or "")
+                    await conn.execute(
+                        "INSERT INTO news_cache(symbol, source, url, published_at, raw_text, fetched_at, "
+                        "sentiment_score, sentiment_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(url) DO UPDATE SET sentiment_score=excluded.sentiment_score, "
+                        "sentiment_reasoning=excluded.sentiment_reasoning",
+                        (symbol, r["source"], url, published_at or r["published_at"], title, time.time(), r["sentiment_score"], reasoning),
+                    )
+                    await conn.commit()
+                    return {"sentiment_score": r["sentiment_score"], "sentiment_reasoning": reasoning}
+        except Exception:
+            pass
+
+        # 3-2. 피어 DB에서 동일 종목 유사 제목 기사 비교
+        try:
+            for peer_path in db_dir.glob("jarvis_*.db"):
+                if peer_path.resolve() == Path(settings.DB_PATH).resolve():
+                    continue
+                try:
+                    async with aiosqlite.connect(peer_path) as peer_conn:
+                        peer_conn.row_factory = aiosqlite.Row
+                        p_cur = await peer_conn.execute(
+                            "SELECT source, published_at, raw_text, sentiment_score, sentiment_reasoning "
+                            "FROM news_cache WHERE symbol = ? AND sentiment_score IS NOT NULL "
+                            "AND published_at >= ? ORDER BY published_at DESC LIMIT 30",
+                            (symbol, lookback_ts),
+                        )
+                        for r in await p_cur.fetchall():
+                            c_title = r["raw_text"] or ""
+                            if _news_titles_similar(title, c_title):
+                                reasoning = f"[피어 유사보도 재사용: {c_title[:25]}...] " + (r["sentiment_reasoning"] or "")
+                                await conn.execute(
+                                    "INSERT INTO news_cache(symbol, source, url, published_at, raw_text, fetched_at, "
+                                    "sentiment_score, sentiment_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                                    "ON CONFLICT(url) DO UPDATE SET sentiment_score=excluded.sentiment_score, "
+                                    "sentiment_reasoning=excluded.sentiment_reasoning",
+                                    (symbol, r["source"], url, published_at or r["published_at"], title, time.time(), r["sentiment_score"], reasoning),
+                                )
+                                await conn.commit()
+                                return {"sentiment_score": r["sentiment_score"], "sentiment_reasoning": reasoning}
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return None
 
