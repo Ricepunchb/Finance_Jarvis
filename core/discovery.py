@@ -167,6 +167,8 @@ async def seed_candidate_universe(
         await db.add_candidate_symbol(
             conn, symbol, name=outcome.kis_name or entry.get("name", ""),
             universe_tag=entry.get("universe_tag", "KOSPI_LARGE_CAP"),
+            market=market,
+            exchange=entry.get("exchange"),
         )
         added += 1
     return {"added": added, "rejected": rejected, "skipped": skipped}

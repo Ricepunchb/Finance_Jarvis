@@ -298,6 +298,10 @@ async def source_overseas_broker_research(
                     "read_count": 0,
                     "research_id": r.get("research_id") or 0,
                     "end_url": r.get("attach_url"),
+                    "attach_url": r.get("attach_url"),
+                    "opinion": r.get("opinion") or (f"적정가치 ${r['fair_value']:.2f}" if r.get("fair_value") else None),
+                    "target_price": r.get("fair_value"),
+                    "content_text": r.get("content_text") or r.get("title", ""),
                 })
         except Exception:
             continue

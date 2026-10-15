@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -32,6 +33,8 @@ engine = TradingEngine()
 # engine.client를 그대로 공유한다 (KIS 토큰 재발급마다 카카오톡 알림이 가므로, 별도
 # 클라이언트를 새로 만들어 불필요한 토큰을 추가 발급받지 않기 위함).
 portfolio_scheduler = PortfolioScheduler(engine.client)
+from core.us_market.service import USMarketMonitorScheduler
+us_scheduler = USMarketMonitorScheduler()
 
 # 국내 종목 한글명 캐시. 이름은 사실상 불변이므로 프로세스 수명 동안 재조회하지 않는다
 # (엔진의 KIS 클라이언트를 그대로 재사용 — 대시보드 표시용으로 별도 토큰을 새로 발급하지 않기 위함).
@@ -46,7 +49,9 @@ _discovery_refresh_task: Optional[asyncio.Task] = None
 async def lifespan(app: FastAPI):
     await db.init_db()
     portfolio_scheduler.start()
+    us_scheduler.start()
     yield
+    await us_scheduler.stop()
     await portfolio_scheduler.stop()
 
 
@@ -1091,6 +1096,259 @@ async def sync_dividends_endpoint(
         }
     finally:
         await conn.close()
+
+
+# =========================================================================
+# 미국장 전용 30분 모니터링 & 시그널 API 엔드포인트
+# =========================================================================
+
+from core.us_market.client import (
+    get_us_market_status,
+    get_us_quote,
+    get_us_30m_bars,
+    get_us_daily_bars,
+    get_us_consensus_and_news,
+)
+from core.us_market.service import scan_all_us_watchlist, scan_single_symbol
+from core.us_market.notifier import send_telegram_message_async, get_telegram_config
+
+
+class USWatchlistUpsertRequest(BaseModel):
+    symbol: str
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    avg_entry_price: Optional[float] = None
+    held_qty: Optional[float] = 0.0
+    target_weight: Optional[float] = None
+    alert_enabled: int = 1
+    notes: Optional[str] = None
+
+
+class USScanRequest(BaseModel):
+    symbols: Optional[list[str]] = None
+    send_notifications: bool = False
+
+
+class USTelegramTestRequest(BaseModel):
+    token: Optional[str] = None
+    chat_id: Optional[str] = None
+
+
+class USTelegramSaveRequest(BaseModel):
+    token: str
+    chat_id: str
+
+
+@app.get("/us-market/status")
+async def get_us_status():
+    """미국 정규장/프리마켓/휴장 상태 및 백그라운드 스케줄러 상태 반환."""
+    mkt = get_us_market_status()
+    mkt["scheduler_running"] = us_scheduler.is_running
+    mkt["scheduler_last_scan_at"] = us_scheduler.last_scan_at
+    mkt["scheduler_last_scan_count"] = us_scheduler.last_scan_count
+    return mkt
+
+
+@app.get("/us-market/watchlist")
+async def get_us_watchlist():
+    """모니터링 대상 종목 목록 및 각 종목의 최신 시그널 조회."""
+    conn = await db.get_connection()
+    try:
+        items = await db.list_us_watchlist(conn)
+        latest_signals = await db.get_latest_us_signals(conn)
+
+        # 종목 정보와 최신 시그널 매핑
+        enriched = []
+        for it in items:
+            sym = it["symbol"]
+            it_copy = dict(it)
+            it_copy["latest_signal"] = latest_signals.get(sym)
+            enriched.append(it_copy)
+        return enriched
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/watchlist")
+async def upsert_us_watchlist(req: USWatchlistUpsertRequest):
+    """모니터링 종목 추가 또는 보유 정보 수정."""
+    clean_sym = req.symbol.strip().upper()
+    if not clean_sym:
+        raise HTTPException(status_code=400, detail="유효한 티커를 입력하세요.")
+
+    conn = await db.get_connection()
+    try:
+        # 이름이 없는 경우 실시간 호가에서 자동 조회
+        name = req.name
+        sector = req.sector
+        if not name or name == clean_sym:
+            q = await get_us_quote(clean_sym)
+            name = q.get("name") or clean_sym
+            sector = sector or q.get("sector")
+
+        await db.upsert_us_watchlist_item(
+            conn=conn,
+            symbol=clean_sym,
+            name=name,
+            sector=sector,
+            avg_entry_price=req.avg_entry_price,
+            held_qty=req.held_qty,
+            target_weight=req.target_weight,
+            alert_enabled=req.alert_enabled,
+            notes=req.notes,
+        )
+
+        # 등록 즉시 초기 스캔 수행 (실시간 시세 및 30분봉 시그널 즉시 산출)
+        try:
+            await scan_single_symbol(conn, clean_sym, send_notification=False)
+        except Exception as e:
+            logger.warning(f"'{clean_sym}' 초기 스캔 오류: {e}")
+
+        return {"status": "ok", "symbol": clean_sym, "name": name}
+    finally:
+        await conn.close()
+
+
+@app.delete("/us-market/watchlist/{symbol}")
+async def delete_us_watchlist(symbol: str):
+    """모니터링 종목 삭제."""
+    conn = await db.get_connection()
+    try:
+        deleted = await db.delete_us_watchlist_item(conn, symbol)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="해당 종목을 찾을 수 없습니다.")
+        return {"status": "deleted", "symbol": symbol.upper()}
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/scan")
+async def trigger_us_scan(req: USScanRequest):
+    """모니터링 종목 30분 시그널 전체(또는 지정) 즉시 스캔."""
+    results = await scan_all_us_watchlist(
+        send_notifications=req.send_notifications,
+        target_symbols=req.symbols,
+    )
+    return {
+        "status": "ok",
+        "scanned_count": len(results),
+        "items": results,
+    }
+
+
+@app.get("/us-market/history/{symbol}")
+async def get_us_history(symbol: str, limit: int = 50):
+    """특정 종목의 30분 시그널 판정 이력 조회."""
+    conn = await db.get_connection()
+    try:
+        sym_arg = None if symbol.upper() == "ALL" else symbol.upper()
+        history = await db.list_us_signal_history(conn, symbol=sym_arg, limit=limit)
+        return history
+    finally:
+        await conn.close()
+
+
+@app.get("/us-market/chart/{symbol}")
+async def get_us_chart(symbol: str):
+    """특정 종목의 30분봉 및 일봉 캔들스틱 데이터 조회."""
+    clean_sym = symbol.strip().upper()
+    df_30m = await get_us_30m_bars(clean_sym, period="1mo")
+    df_daily = await get_us_daily_bars(clean_sym, period="3mo")
+
+    # JSON 호환 변환
+    def df_to_json(df):
+        if df.empty:
+            return []
+        df_copy = df.copy()
+        if "date" in df_copy.columns:
+            df_copy["date"] = df_copy["date"].astype(str)
+        return df_copy.to_dict(orient="records")
+
+    return {
+        "symbol": clean_sym,
+        "bars_30m": df_to_json(df_30m),
+        "bars_daily": df_to_json(df_daily),
+    }
+
+
+@app.post("/us-market/scheduler/toggle")
+async def toggle_us_scheduler(enable: bool):
+    """미국장 30분 백그라운드 스케줄러 켜기/끄기."""
+    if enable:
+        us_scheduler.start()
+    else:
+        await us_scheduler.stop()
+    return {"status": "ok", "scheduler_running": us_scheduler.is_running}
+
+
+@app.post("/us-market/telegram/test")
+async def test_us_telegram(req: USTelegramTestRequest):
+    """텔레그램 알림 발송 테스트."""
+    env_token, env_chat_id = get_telegram_config()
+    token = req.token or env_token
+    chat_id = req.chat_id or env_chat_id
+
+    if not token or not chat_id:
+        raise HTTPException(status_code=400, detail="텔레그램 토큰 및 채팅 ID가 설정되지 않았습니다.")
+
+    test_msg = (
+        "[Finance Jarvis] 텔레그램 연동 테스트\n\n"
+        "• 상태: 정상 연결 완료\n"
+        "• 안내: 30분 주기 모니터링 시그널(매수, 매도, 손절, 익절)이 이 방으로 전달됩니다."
+    )
+    ok, err_desc = await send_telegram_message_async(token, chat_id, test_msg)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"텔레그램 발송 실패: {err_desc}")
+    return {"status": "ok", "message": "텔레그램 테스트 메시지가 성공적으로 발송되었습니다."}
+
+
+@app.post("/us-market/telegram/save")
+async def save_us_telegram(req: USTelegramSaveRequest):
+    """텔레그램 토큰 및 채팅 ID를 설정 파일(.env 및 현재 프로필)에 저장."""
+    from pathlib import Path
+    token = req.token.strip()
+    chat_id = req.chat_id.strip()
+
+    try:
+        # 메모리 및 환경변수 즉시 반영
+        settings.TELEGRAM_BOT_TOKEN = token
+        settings.TELEGRAM_CHAT_ID = chat_id
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+        os.environ["TELEGRAM_CHAT_ID"] = chat_id
+
+        # .env 파일 영구 저장 헬퍼
+        def update_env_file(filepath: Path):
+            if not filepath.exists():
+                return
+            lines = filepath.read_text(encoding="utf-8").splitlines()
+            token_found = False
+            chat_found = False
+            new_lines = []
+            for line in lines:
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    new_lines.append(f'TELEGRAM_BOT_TOKEN="{token}"')
+                    token_found = True
+                elif line.startswith("TELEGRAM_CHAT_ID="):
+                    new_lines.append(f'TELEGRAM_CHAT_ID="{chat_id}"')
+                    chat_found = True
+                else:
+                    new_lines.append(line)
+            if not token_found:
+                new_lines.append(f'TELEGRAM_BOT_TOKEN="{token}"')
+            if not chat_found:
+                new_lines.append(f'TELEGRAM_CHAT_ID="{chat_id}"')
+            filepath.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+        root = Path(__file__).resolve().parent.parent
+        update_env_file(root / ".env")
+        if settings.PROFILE_NAME:
+            update_env_file(root / f".env.{settings.PROFILE_NAME}")
+
+        return {"status": "ok", "message": "텔레그램 설정이 .env에 성공적으로 저장되었습니다."}
+    except Exception as e:
+        logger.exception("텔레그램 설정 저장 중 오류")
+        raise HTTPException(status_code=500, detail=f"설정 저장 실패: {e}")
+
 
 
 

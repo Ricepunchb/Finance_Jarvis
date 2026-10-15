@@ -43,14 +43,15 @@ async def _enrich_and_analyze_reports(
     if not reports:
         return {}
 
-    # 1. 메타데이터 기본 upsert (해외 리포트 문자열 ID는 안전 정수로 변환)
+    # 1. 메타데이터 기본 upsert (해외 리포트 문자열 ID는 안전 정수로 결정론적 변환)
+    import zlib
     for r in reports:
         raw_id = r.get("research_id")
         if raw_id is not None and not isinstance(raw_id, int):
             try:
                 r["research_id"] = int(raw_id)
             except (ValueError, TypeError):
-                r["research_id"] = abs(hash(str(raw_id))) % 2_000_000_000
+                r["research_id"] = zlib.crc32(str(raw_id).encode("utf-8")) % 2_000_000_000
 
     await db.upsert_research_reports(conn, reports)
 
@@ -87,13 +88,45 @@ async def _enrich_and_analyze_reports(
                     attach_url=d.get("attach_url"),
                 )
 
-    # 3. LLM 분석이 아직 없는 리포트 선별
+    # 3. LLM 분석이 아직 없는 리포트 선별 (피어 계좌 DB 교차 확인 포함)
     need_analysis = [
         existing[rid] for rid in r_ids
         if rid in existing
         and not (existing[rid].get("analysis_json") or "").strip()
         and (existing[rid].get("content_text") or "").strip()
     ]
+
+    if need_analysis:
+        from pathlib import Path
+        import aiosqlite
+        db_dir = Path(settings.DB_PATH).parent
+        still_needed = []
+        for item in need_analysis:
+            rid = item.get("research_id")
+            found_analysis = None
+            for peer_path in db_dir.glob("jarvis_*.db"):
+                if peer_path.resolve() == Path(settings.DB_PATH).resolve():
+                    continue
+                try:
+                    async with aiosqlite.connect(peer_path) as peer_conn:
+                        peer_conn.row_factory = aiosqlite.Row
+                        p_cur = await peer_conn.execute(
+                            "SELECT analysis_json FROM research_reports WHERE research_id = ? AND analysis_json IS NOT NULL",
+                            (rid,),
+                        )
+                        p_row = await p_cur.fetchone()
+                        if p_row and (p_row["analysis_json"] or "").strip():
+                            found_analysis = p_row["analysis_json"]
+                            break
+                except Exception:
+                    continue
+            if found_analysis:
+                await db.save_report_analysis(conn, rid, found_analysis)
+                if rid in existing:
+                    existing[rid]["analysis_json"] = found_analysis
+            else:
+                still_needed.append(item)
+        need_analysis = still_needed
 
     if need_analysis:
         try:

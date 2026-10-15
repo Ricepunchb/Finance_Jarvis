@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import html
 import os
 import time
 from datetime import datetime
@@ -35,7 +36,7 @@ from core.profile_manager import (
 st.set_page_config(layout="wide", page_title="계좌 마스터 허브", page_icon="🏢")
 
 # --- 커스텀 스타일 ---
-st.markdown(
+st.html(
     """
     <style>
     .block-container { padding-top: 2rem; max-width: 1300px; }
@@ -90,8 +91,7 @@ st.markdown(
         word-break: break-all;
     }
     </style>
-    """,
-    unsafe_allow_html=True,
+    """
 )
 
 # --- 헤더 영역 ---
@@ -210,31 +210,30 @@ for p in profiles:
     # 테두리 및 뱃지 스타일
     card_border = "#10b981" if status_code == "running" else ("#f59e0b" if status_code != "stopped" else "rgba(127,127,127,0.25)")
     type_badge_html = '<span class="badge-mock">모의</span>' if is_mock else '<span class="badge-live">실전</span>'
-    active_badge_html = '<span class="badge-active">⭐ 기본 프로필</span>' if is_active else ''
-    current_badge_html = '<span style="background:#6366f1; color:white; padding:3px 8px; border-radius:6px; font-size:0.76rem; font-weight:bold; margin-left:6px;">📍 현재 접속 중</span>' if is_current_view else ''
+    active_badge_html = ' <span class="badge-active">⭐ 기본 프로필</span>' if is_active else ''
+    current_badge_html = ' <span style="background:#6366f1; color:white; padding:3px 8px; border-radius:6px; font-size:0.76rem; font-weight:bold; margin-left:6px;">📍 현재 접속 중</span>' if is_current_view else ''
 
     status_pill_class = "pill-running" if status_code == "running" else ("pill-partial" if status_code != "stopped" else "pill-stopped")
 
+    card_header_html = (
+        f'<div class="profile-card" style="border-left: 6px solid {card_border};">'
+        f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">'
+        f'<div>'
+        f'{type_badge_html} '
+        f'<strong style="font-size: 1.18rem; margin-right: 8px;">{display}</strong> '
+        f'<code style="font-size: 0.88rem; color: #888;">({name})</code>'
+        f'{active_badge_html}'
+        f'{current_badge_html}'
+        f'</div>'
+        f'<div>'
+        f'<span class="status-pill {status_pill_class}">{p["status_desc"]}</span>'
+        f'</div>'
+        f'</div>'
+        f'</div>'
+    )
+
     with st.container():
-        st.markdown(
-            f"""
-            <div class="profile-card" style="border-left: 6px solid {card_border};">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <div>
-                        {type_badge_html}
-                        <strong style="font-size: 1.18rem; margin-right: 8px;">{display}</strong>
-                        <code style="font-size: 0.88rem; color: #888;">({name})</code>
-                        {active_badge_html}
-                        {current_badge_html}
-                    </div>
-                    <div>
-                        <span class="status-pill {status_pill_class}">{p["status_desc"]}</span>
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.html(card_header_html)
 
         col_info, col_actions = st.columns([3, 2])
 
@@ -423,10 +422,8 @@ if tmux_sessions:
         refresh_logs = st.button("🔄 로그 새로고침", use_container_width=True)
 
     session_log_content = get_session_output(selected_session, lines=log_lines)
-    st.markdown(
-        f'<div class="log-terminal">{session_log_content}</div>',
-        unsafe_allow_html=True,
-    )
+    escaped_log = html.escape(session_log_content)
+    st.html(f'<div class="log-terminal">{escaped_log}</div>')
 else:
     st.info("현재 실행 중인 tmux 세션이 없습니다.")
 

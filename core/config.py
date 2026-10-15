@@ -200,6 +200,10 @@ class Settings(BaseSettings):
     # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
     OVERSEAS_PROXY_TRADING_ENABLED: bool = True  # 해외 종목 발굴 시 국장 대체 ETF로 매매
 
+    # --- 텔레그램 모바일 푸시 알림 ---
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
     @model_validator(mode="after")
     def _sync_profile_paths(self):
         if self.PROFILE_NAME and self.PROFILE_NAME != "default":

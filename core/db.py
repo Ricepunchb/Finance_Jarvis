@@ -320,6 +320,41 @@ CREATE TABLE IF NOT EXISTS dividends (
 CREATE INDEX IF NOT EXISTS idx_dividends_symbol ON dividends(symbol);
 CREATE INDEX IF NOT EXISTS idx_dividends_payment_date ON dividends(payment_date);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_dividends_kis_mgmt ON dividends(kis_mgmt_no) WHERE kis_mgmt_no IS NOT NULL;
+
+-- 미국장 전용 모니터링 및 보유 포지션 관리 테이블
+CREATE TABLE IF NOT EXISTS us_watchlist (
+    symbol TEXT PRIMARY KEY,
+    name TEXT,
+    sector TEXT,
+    avg_entry_price REAL,             -- 사용자 보유 평단가 ($), 미보유 시 NULL
+    held_qty REAL DEFAULT 0,          -- 사용자 보유 수량, 미보유 시 0
+    target_weight REAL,               -- 목표 비중 (선택)
+    alert_enabled INTEGER NOT NULL DEFAULT 1,
+    peak_price REAL,                  -- 진입 이후 관측된 최고가 ($) - 트레일링 익절용
+    notes TEXT,                       -- 메모/투자아이디어
+    last_alert_key TEXT,              -- 최근 발송된 알림 시그널 키 (중복 발송 방지용)
+    last_alert_ts REAL,               -- 최근 알림 발송 시각 (epoch seconds)
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- 미국장 30분 단위 시그널 판정 이력 (매 사이클 기록)
+CREATE TABLE IF NOT EXISTS us_signal_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    ts REAL NOT NULL,                 -- 판정 시각 (epoch seconds)
+    price REAL NOT NULL,              -- 당시 주가 ($)
+    change_pct REAL,                  -- 당일 등락률 (%)
+    daily_signal TEXT,                -- BUY/SELL/HOLD 및 점수
+    intraday_signal TEXT,             -- 30분봉 BUY/SELL/HOLD 및 점수
+    combined_action TEXT NOT NULL,    -- BUY | SELL | HOLD
+    strength REAL NOT NULL,           -- 시그널 강도 (0.0 ~ 1.0)
+    exit_trigger TEXT,                -- STOP_LOSS | TRAILING_TP | NONE
+    reason TEXT,                      -- 한국어 판정 요약 근거
+    indicators_json TEXT              -- 원시 기술 지표 스냅샷 JSON
+);
+CREATE INDEX IF NOT EXISTS idx_us_signal_history_symbol_ts ON us_signal_history(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_us_signal_history_ts ON us_signal_history(ts DESC);
 """
 
 
@@ -385,6 +420,13 @@ async def _migrate_add_missing_columns(conn: aiosqlite.Connection) -> None:
     for col, col_type in (("sources_json", "TEXT"), ("last_seen_at", "REAL"), ("expires_at", "REAL")):
         if col not in columns:
             await conn.execute(f"ALTER TABLE candidate_universe ADD COLUMN {col} {col_type}")
+
+    cur = await conn.execute("PRAGMA table_info(us_watchlist)")
+    columns = {row["name"] for row in await cur.fetchall()}
+    if "last_alert_key" not in columns:
+        await conn.execute("ALTER TABLE us_watchlist ADD COLUMN last_alert_key TEXT")
+    if "last_alert_ts" not in columns:
+        await conn.execute("ALTER TABLE us_watchlist ADD COLUMN last_alert_ts REAL")
 
 
 # --- engine_state (singleton key-value) ---
@@ -544,13 +586,51 @@ async def cache_valuation(conn: aiosqlite.Connection, symbol: str, **fields: Any
 # --- news_cache ---
 
 async def get_cached_news_sentiment(conn: aiosqlite.Connection, url: str) -> Optional[Dict[str, Any]]:
+    # 1. 현재 계좌 DB 조회
     cur = await conn.execute(
         "SELECT sentiment_score, sentiment_reasoning FROM news_cache WHERE url = ? "
         "AND sentiment_score IS NOT NULL",
         (url,),
     )
     row = await cur.fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+
+    # 2. 다른 계좌(피어 프로필) DB 교차 확인 - 중복 LLM API 호출 원천 방지
+    try:
+        db_dir = Path(settings.DB_PATH).parent
+        for peer_path in db_dir.glob("jarvis_*.db"):
+            if peer_path.resolve() == Path(settings.DB_PATH).resolve():
+                continue
+            try:
+                async with aiosqlite.connect(peer_path) as peer_conn:
+                    peer_conn.row_factory = aiosqlite.Row
+                    p_cur = await peer_conn.execute(
+                        "SELECT symbol, source, url, published_at, raw_text, sentiment_score, sentiment_reasoning "
+                        "FROM news_cache WHERE url = ? AND sentiment_score IS NOT NULL",
+                        (url,),
+                    )
+                    p_row = await p_cur.fetchone()
+                    if p_row:
+                        p_dict = dict(p_row)
+                        await conn.execute(
+                            "INSERT INTO news_cache(symbol, source, url, published_at, raw_text, fetched_at, "
+                            "sentiment_score, sentiment_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                            "ON CONFLICT(url) DO UPDATE SET sentiment_score=excluded.sentiment_score, "
+                            "sentiment_reasoning=excluded.sentiment_reasoning",
+                            (
+                                p_dict["symbol"], p_dict["source"], p_dict["url"], p_dict["published_at"],
+                                p_dict.get("raw_text"), time.time(), p_dict["sentiment_score"], p_dict["sentiment_reasoning"],
+                            ),
+                        )
+                        await conn.commit()
+                        return {"sentiment_score": p_dict["sentiment_score"], "sentiment_reasoning": p_dict["sentiment_reasoning"]}
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
 
 
 async def cache_news_sentiment(
@@ -1729,5 +1809,225 @@ async def upsert_kis_dividends(conn: aiosqlite.Connection, items: List[Dict[str,
         inserted += 1
     await conn.commit()
     return inserted, skipped
+
+
+# =========================================================================
+# 미국장 모니터링 & 시그널 영속성 헬퍼 함수
+# =========================================================================
+
+async def list_us_watchlist(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
+    """미국장 모니터링 종목 전체 목록 조회."""
+    cur = await conn.execute(
+        """
+        SELECT symbol, name, sector, avg_entry_price, held_qty, target_weight,
+               alert_enabled, peak_price, notes, created_at, updated_at,
+               last_alert_key, last_alert_ts
+        FROM us_watchlist
+        ORDER BY symbol ASC
+        """
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_us_watchlist_item(conn: aiosqlite.Connection, symbol: str) -> Optional[Dict[str, Any]]:
+    """미국장 특정 종목 정보 조회."""
+    cur = await conn.execute(
+        """
+        SELECT symbol, name, sector, avg_entry_price, held_qty, target_weight,
+               alert_enabled, peak_price, notes, created_at, updated_at,
+               last_alert_key, last_alert_ts
+        FROM us_watchlist
+        WHERE symbol = ?
+        """,
+        (symbol.strip().upper(),),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_us_watchlist_item(
+    conn: aiosqlite.Connection,
+    symbol: str,
+    name: Optional[str] = None,
+    sector: Optional[str] = None,
+    avg_entry_price: Optional[float] = None,
+    held_qty: Optional[float] = None,
+    target_weight: Optional[float] = None,
+    alert_enabled: int = 1,
+    peak_price: Optional[float] = None,
+    notes: Optional[str] = None,
+) -> None:
+    """미국장 모니터링 종목 추가 또는 갱신."""
+    clean_sym = symbol.strip().upper()
+    now = time.time()
+    existing = await get_us_watchlist_item(conn, clean_sym)
+
+    if existing:
+        final_name = name if name is not None else existing.get("name")
+        final_sector = sector if sector is not None else existing.get("sector")
+        final_price = avg_entry_price if avg_entry_price is not None else existing.get("avg_entry_price")
+        final_qty = held_qty if held_qty is not None else existing.get("held_qty", 0.0)
+        final_weight = target_weight if target_weight is not None else existing.get("target_weight")
+        final_peak = peak_price if peak_price is not None else existing.get("peak_price")
+        final_notes = notes if notes is not None else existing.get("notes")
+
+        # 평단가가 새로 입력되었는데 peak_price가 없으면 평단가를 초기 peak로 설정
+        if final_price and (final_peak is None or final_peak < final_price):
+            final_peak = final_price
+
+        await conn.execute(
+            """
+            UPDATE us_watchlist
+            SET name = ?, sector = ?, avg_entry_price = ?, held_qty = ?,
+                target_weight = ?, alert_enabled = ?, peak_price = ?, notes = ?, updated_at = ?
+            WHERE symbol = ?
+            """,
+            (
+                final_name, final_sector, final_price, final_qty,
+                final_weight, alert_enabled, final_peak, final_notes, now, clean_sym
+            ),
+        )
+    else:
+        init_peak = peak_price or avg_entry_price
+        await conn.execute(
+            """
+            INSERT INTO us_watchlist (
+                symbol, name, sector, avg_entry_price, held_qty, target_weight,
+                alert_enabled, peak_price, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_sym, name or clean_sym, sector or "US Equity", avg_entry_price,
+                held_qty or 0.0, target_weight, alert_enabled, init_peak, notes or "", now, now
+            ),
+        )
+    await conn.commit()
+
+
+async def delete_us_watchlist_item(conn: aiosqlite.Connection, symbol: str) -> bool:
+    """미국장 모니터링 종목 삭제."""
+    clean_sym = symbol.strip().upper()
+    cur = await conn.execute("DELETE FROM us_watchlist WHERE symbol = ?", (clean_sym,))
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def update_us_watchlist_peak(conn: aiosqlite.Connection, symbol: str, current_price: float) -> None:
+    """트레일링 익절을 위한 포지션 최고가(peak_price) 갱신."""
+    clean_sym = symbol.strip().upper()
+    cur = await conn.execute(
+        "SELECT peak_price, avg_entry_price FROM us_watchlist WHERE symbol = ?", (clean_sym,)
+    )
+    row = await cur.fetchone()
+    if not row:
+        return
+    cur_peak = row["peak_price"] or row["avg_entry_price"] or 0.0
+    if current_price > cur_peak:
+        await conn.execute(
+            "UPDATE us_watchlist SET peak_price = ?, updated_at = ? WHERE symbol = ?",
+            (current_price, time.time(), clean_sym),
+        )
+        await conn.commit()
+
+
+async def update_us_watchlist_alert_state(
+    conn: aiosqlite.Connection,
+    symbol: str,
+    alert_key: str,
+) -> None:
+    """종목의 최근 발송된 알림 시그널 상태 키 및 발송 시각 갱신."""
+    clean_sym = symbol.strip().upper()
+    now = time.time()
+    await conn.execute(
+        "UPDATE us_watchlist SET last_alert_key = ?, last_alert_ts = ?, updated_at = ? WHERE symbol = ?",
+        (alert_key, now, now, clean_sym),
+    )
+    await conn.commit()
+
+
+async def record_us_signal(
+    conn: aiosqlite.Connection,
+    symbol: str,
+    price: float,
+    change_pct: Optional[float],
+    daily_signal: Optional[str],
+    intraday_signal: Optional[str],
+    combined_action: str,
+    strength: float,
+    exit_trigger: Optional[str] = None,
+    reason: Optional[str] = None,
+    indicators_json: Optional[str] = None,
+    ts: Optional[float] = None,
+) -> int:
+    """30분 단위 시그널 기록 추가."""
+    clean_sym = symbol.strip().upper()
+    now = ts if ts is not None else time.time()
+    cur = await conn.execute(
+        """
+        INSERT INTO us_signal_history (
+            symbol, ts, price, change_pct, daily_signal, intraday_signal,
+            combined_action, strength, exit_trigger, reason, indicators_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            clean_sym, now, float(price), change_pct, daily_signal, intraday_signal,
+            combined_action, float(strength), exit_trigger or "NONE", reason or "", indicators_json
+        ),
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def get_latest_us_signals(conn: aiosqlite.Connection) -> Dict[str, Dict[str, Any]]:
+    """모든 종목의 가장 최근 30분 시그널 조회 (symbol -> signal dict)."""
+    cur = await conn.execute(
+        """
+        SELECT h.symbol, h.ts, h.price, h.change_pct, h.daily_signal, h.intraday_signal,
+               h.combined_action, h.strength, h.exit_trigger, h.reason, h.indicators_json
+        FROM us_signal_history h
+        INNER JOIN (
+            SELECT symbol, MAX(ts) as max_ts
+            FROM us_signal_history
+            GROUP BY symbol
+        ) latest ON h.symbol = latest.symbol AND h.ts = latest.max_ts
+        """
+    )
+    rows = await cur.fetchall()
+    return {r["symbol"]: dict(r) for r in rows}
+
+
+async def list_us_signal_history(
+    conn: aiosqlite.Connection,
+    symbol: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """30분 시그널 타임라인 이력 조회."""
+    if symbol:
+        cur = await conn.execute(
+            """
+            SELECT id, symbol, ts, price, change_pct, daily_signal, intraday_signal,
+                   combined_action, strength, exit_trigger, reason, indicators_json
+            FROM us_signal_history
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (symbol.strip().upper(), limit),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT id, symbol, ts, price, change_pct, daily_signal, intraday_signal,
+                   combined_action, strength, exit_trigger, reason, indicators_json
+            FROM us_signal_history
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
 
 

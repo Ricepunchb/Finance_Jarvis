@@ -45,7 +45,7 @@ PROFILE_DEFAULTS = {
 }
 
 MASTER_FRONT_PORT = 8500
-MASTER_SESSION_NAME = "front-master"
+MASTER_SESSION_NAME = "master-page"
 
 
 def get_active_profile() -> str:
@@ -194,10 +194,15 @@ def get_all_profiles_info() -> List[Dict[str, Any]]:
         engine_sess = f"engine-{name}"
         front_sess = f"front-{name}"
 
-        # 레거시 단일 이름 호환
-        if is_active and "engine" in tmux_sessions:
+        # 레거시 및 sparrow 호환
+        if is_active and "engine-sparrow" in tmux_sessions:
+            engine_sess = "engine-sparrow"
+        elif is_active and "engine" in tmux_sessions:
             engine_sess = "engine"
-        if is_active and "front" in tmux_sessions:
+
+        if is_active and "front-sparrow" in tmux_sessions:
+            front_sess = "front-sparrow"
+        elif is_active and "front" in tmux_sessions:
             front_sess = "front"
 
         engine_running = engine_sess in tmux_sessions
@@ -322,11 +327,17 @@ def stop_component(name: str, component: str = "both") -> Tuple[bool, str]:
     active = get_active_profile()
     tmux_sessions = get_tmux_sessions()
 
-    # 레거시 호환
-    if name == active and "engine" in tmux_sessions:
-        engine_sess = "engine"
-    if name == active and "front" in tmux_sessions:
-        front_sess = "front"
+    # 레거시 및 sparrow 호환
+    if name == active:
+        if "engine-sparrow" in tmux_sessions:
+            engine_sess = "engine-sparrow"
+        elif "engine" in tmux_sessions:
+            engine_sess = "engine"
+
+        if "front-sparrow" in tmux_sessions:
+            front_sess = "front-sparrow"
+        elif "front" in tmux_sessions:
+            front_sess = "front"
 
     messages = []
 
