@@ -156,10 +156,26 @@ def test_notify_signal_only_on_change():
             "action_recommendation": "손절 경고",
         }
 
+        weak_buy_sig = {
+            "symbol": "DEDUP_TEST",
+            "price": 100.0,
+            "combined_action": "BUY",
+            "exit_trigger": "NONE",
+            "strength": 0.45,  # 45% (< 60% 임계치)
+            "action_recommendation": "매수 관심",
+        }
+
         with patch("core.us_market.notifier.send_telegram_message_async", new_callable=AsyncMock) as mock_send:
             mock_send.return_value = (True, "성공")
 
-            # 1. 이전 키가 HOLD 상태에서 BUY로 변경 -> 발송되어야 함
+            # 0. 60% 미만 약한 시그널(45%) -> 발송되지 않아야 함!
+            res0 = await notify_signal_if_needed(
+                weak_buy_sig, token="dummy", chat_id="123", last_alert_key="HOLD:NONE"
+            )
+            assert res0 is False
+            assert mock_send.call_count == 0
+
+            # 1. 60% 이상 강한 시그널(80%)로 BUY 변경 -> 발송되어야 함!
             res1 = await notify_signal_if_needed(
                 buy_sig, token="dummy", chat_id="123", last_alert_key="HOLD:NONE"
             )
@@ -173,7 +189,7 @@ def test_notify_signal_only_on_change():
             assert res2 is False
             assert mock_send.call_count == 1  # 발송 횟수 증가 없음!
 
-            # 3. 손절(STOP_LOSS)로 시그널 전환 -> 즉시 발송되어야 함!
+            # 3. 손절(STOP_LOSS)로 시그널 전환 -> 강도와 무관하게 즉시 발송되어야 함!
             res3 = await notify_signal_if_needed(
                 stop_sig, token="dummy", chat_id="123", last_alert_key="BUY:NONE"
             )

@@ -171,8 +171,9 @@ async def notify_signal_if_needed(
     chat_id: Optional[str] = None,
     market_status_str: str = "",
     last_alert_key: Optional[str] = None,
+    min_strength: Optional[float] = None,
 ) -> bool:
-    """시그널이 이전 상태에서 변경되었을 때만(예: HOLD -> BUY, BUY -> SELL, SELL -> STOP_LOSS 등) 텔레그램 알림을 발송한다."""
+    """시그널이 이전 상태에서 변경되었고, 시그널 강도가 60% 이상(또는 손절/익절)일 때만 텔레그램 알림을 발송한다."""
     effective_token, effective_chat_id = token, chat_id
     if not effective_token or not effective_chat_id:
         env_token, env_chat_id = get_telegram_config()
@@ -185,13 +186,24 @@ async def notify_signal_if_needed(
     action = signal_data.get("combined_action", "HOLD")
     exit_trigger = signal_data.get("exit_trigger", "NONE")
     sym = signal_data.get("symbol", "")
-    current_key = f"{action}:{exit_trigger}"
+    strength = float(signal_data.get("strength", 0.0))
+    threshold = min_strength if min_strength is not None else getattr(settings, "TELEGRAM_MIN_ALERT_STRENGTH", 0.60)
 
-    # 관망(HOLD)이고 Exit Guard도 없으면 발송 안 함
+    # 1. 관망(HOLD)이고 Exit Guard도 없으면 발송 안 함
     if action == "HOLD" and exit_trigger == "NONE":
         return False
 
-    # 직전 알림 키와 비교: DB의 last_alert_key 또는 메모리 _LAST_ALERT_SENT 기준
+    # 2. 강한 시그널 필터링: 손절/익절(Exit Guard)이 아닌 일반 매수/매도 시그널은 강도 60% 이상일 때만 발송
+    if exit_trigger == "NONE" and strength < threshold:
+        logger.info(
+            f"'{sym}' 시그널 강도({int(strength * 100)}% < {int(threshold * 100)}%) 미달 "
+            f"➔ 텔레그램 발송 생략 (60% 이상 강한 시그널만 발송)"
+        )
+        return False
+
+    current_key = f"{action}:{exit_trigger}"
+
+    # 3. 직전 알림 키와 비교: DB의 last_alert_key 또는 메모리 _LAST_ALERT_SENT 기준
     prev_key = last_alert_key
     if not prev_key and sym in _LAST_ALERT_SENT:
         prev_key, _ = _LAST_ALERT_SENT[sym]
@@ -207,3 +219,4 @@ async def notify_signal_if_needed(
     if ok:
         _LAST_ALERT_SENT[sym] = (current_key, time.time())
     return ok
+

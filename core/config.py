@@ -203,6 +203,7 @@ class Settings(BaseSettings):
     # --- 텔레그램 모바일 푸시 알림 ---
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    TELEGRAM_MIN_ALERT_STRENGTH: float = 0.60  # 60% 이상 강한 시그널일 때만 알림 발송 (손절/익절은 예외로 즉시 발송)
 
     @model_validator(mode="after")
     def _sync_profile_paths(self):

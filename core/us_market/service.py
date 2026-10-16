@@ -100,23 +100,28 @@ async def scan_single_symbol(
             indicators_json=json.dumps(snap),
         )
 
-        # 5. 알림 전송 (텔레그램: 시그널 변경 시에만 발송)
+        # 5. 알림 전송 (텔레그램: 60% 이상 강한 시그널 및 손절/익절 시에만 발송)
         action = sig_result.get("combined_action", "HOLD")
         exit_trigger = sig_result.get("exit_trigger", "NONE")
         current_alert_key = f"{action}:{exit_trigger}"
         last_alert_key = holding_info.get("last_alert_key") if holding_info else None
 
         mkt_status = get_us_market_status()
+        alert_sent = False
         if send_notification and holding_info and holding_info.get("alert_enabled", 1):
-            await notify_signal_if_needed(
+            alert_sent = await notify_signal_if_needed(
                 sig_result,
                 market_status_str=mkt_status["status_label"],
                 last_alert_key=last_alert_key,
             )
 
-        # 시그널 상태 변경 시 DB의 last_alert_key 갱신 (HOLD 전환도 상태 변경으로 기록하여 다음 BUY 전환 감지)
-        if holding_info and current_alert_key != last_alert_key:
-            await db.update_us_watchlist_alert_state(conn, clean_sym, current_alert_key)
+        # 알림이 실제로 발송되었거나, HOLD(관망) 상태로 복귀한 경우에만 DB의 last_alert_key 갱신
+        # (60% 미만 약한 시그널일 때 미리 키를 덮어써서 향후 60% 이상 강한 시그널 알림이 누락되는 현상 방지)
+        if holding_info:
+            if alert_sent:
+                await db.update_us_watchlist_alert_state(conn, clean_sym, current_alert_key)
+            elif action == "HOLD" and exit_trigger == "NONE" and last_alert_key != "HOLD:NONE":
+                await db.update_us_watchlist_alert_state(conn, clean_sym, "HOLD:NONE")
 
         # 응답 패키징
         return {
