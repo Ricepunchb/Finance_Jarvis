@@ -114,10 +114,31 @@ def build_trades(
         market = it.get("market") or "domestic"
         ts = it["created_at"]
         trade_fx = fx_for(market, ts, fx)
+        ctx = decision_ctx_by_intent.get(it["intent_id"], {})
+
+        basis_hint_local = None
+        basis_hint_krw = None
+        if it["side"] == "sell":
+            exit_check = ctx.get("exit_check") or {}
+            pos_ctx = ctx.get("position") or {}
+            if market == "overseas":
+                hint_krw = exit_check.get("avg_price_krw") or pos_ctx.get("avg_price_krw")
+                if hint_krw:
+                    basis_hint_krw = float(hint_krw)
+                    basis_hint_local = float(hint_krw) / trade_fx
+                elif exit_check.get("avg_price") or pos_ctx.get("avg_price"):
+                    hint_local = float(exit_check.get("avg_price") or pos_ctx.get("avg_price"))
+                    basis_hint_local = hint_local
+                    basis_hint_krw = hint_local * trade_fx
+            else:
+                hint = exit_check.get("avg_price") or pos_ctx.get("avg_price")
+                if hint:
+                    basis_hint_krw = basis_hint_local = float(hint)
+
         base = {
             "ts": ts, "date": local_date(market, ts), "symbol": it["symbol"], "market": market,
             "side": it["side"], "intent_id": it["intent_id"], "reason": it.get("reason"),
-            "fx": trade_fx, "basis_hint_local": None, "basis_hint_krw": None,
+            "fx": trade_fx, "basis_hint_local": basis_hint_local, "basis_hint_krw": basis_hint_krw,
         }
         own_fills = fills_by_intent.get(it["intent_id"])
         if own_fills:
@@ -126,7 +147,6 @@ def build_trades(
             continue
         if it["status"] != "FILLED":
             continue  # SUBMITTED/REJECTED/NOT_SUBMITTED 등은 체결이 아니다
-        ctx = decision_ctx_by_intent.get(it["intent_id"], {})
         price = it.get("price")
         if not price:
             price = ctx.get("price_foreign") if market == "overseas" else ctx.get("price")
@@ -134,15 +154,6 @@ def build_trades(
             unpriced.append(it["intent_id"])
             continue
         trade = {**base, "qty": float(it["qty"]), "price": float(price), "estimated": True}
-        if it["side"] == "sell":
-            exit_check = ctx.get("exit_check") or {}
-            if market == "overseas":
-                hint_krw = exit_check.get("avg_price_krw")
-                if hint_krw:
-                    trade["basis_hint_krw"] = float(hint_krw)
-                    trade["basis_hint_local"] = float(hint_krw) / trade_fx
-            elif exit_check.get("avg_price"):
-                trade["basis_hint_krw"] = trade["basis_hint_local"] = float(exit_check["avg_price"])
         trades.append(trade)
     for seq, t in enumerate(trades):
         t["seq"] = seq  # 이벤트/거래 매핑용 순번 (부분 체결로 intent_id가 겹쳐도 구분)
@@ -190,6 +201,12 @@ def compute_opening(
         buy_cost = sum(t["qty"] * t["price"] for t in sym_trades if t["side"] == "buy")
         implied = (avg_now * cur_qty - buy_cost) / raw_open if not has_sell and avg_now > 0 else 0.0
         avg_local = implied if implied > 0 else float(pos.get("entry_avg_price") or avg_now or 0.0)
+        if avg_local <= EPS:
+            # 잔고가 0이 되어 positions 평단가가 리셋된 경우: 매도 시점의 basis_hint에서 복원 시도
+            for t in sym_trades:
+                if t["side"] == "sell" and t.get("basis_hint_local") and t["basis_hint_local"] > EPS:
+                    avg_local = float(t["basis_hint_local"])
+                    break
         first_ts = sym_trades[0]["ts"] if sym_trades else float(pos.get("last_synced_at") or 0.0)
         opening[sym] = {"qty": raw_open, "avg_local": avg_local, "avg_krw": avg_local * fx_for(market, first_ts, fx)}
     return opening, mismatch
@@ -202,8 +219,8 @@ def realized_events(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, float]]]:
     """종목별 이동평균단가로 매도 시점의 실현손익을 계산한다.
 
-    원가 우선순위: 추정 매도의 exit_check 평단(엔진이 그 시점에 쓴 값) > 이동평균단가.
-    보유가 모자란 매도(조회 이전 매수분)는 estimated로 표시한다.
+    원가 우선순위: 매도 시점의 basis_hint(브로커 평단가) > 이동평균단가.
+    보유가 모자라거나 원가를 알 수 없는 매도는 estimated로 표시한다.
     반환: (events, 종료 시점 상태{sym:{qty,avg_local,avg_krw}}).
     """
     state: Dict[str, Dict[str, float]] = {
@@ -220,9 +237,9 @@ def realized_events(
             s["qty"] = new_qty
             continue
         estimated = t["estimated"]
-        if t["basis_hint_krw"] is not None:
+        if t.get("basis_hint_krw") is not None and t["basis_hint_krw"] > EPS:
             cost_local, cost_krw = t["basis_hint_local"], t["basis_hint_krw"]
-        elif s["qty"] > EPS:
+        elif s["qty"] > EPS and s["avg_local"] > EPS:
             cost_local, cost_krw = s["avg_local"], s["avg_krw"]
             if s["qty"] + EPS < q:
                 estimated = True
@@ -237,6 +254,7 @@ def realized_events(
         })
         s["qty"] = max(0.0, s["qty"] - q)
     return events, state
+
 
 
 # --- 일별 평가손익 (종목 x 날짜) ---
@@ -333,17 +351,41 @@ def daily_mtm(
     return result
 
 
-def portfolio_daily(mtm: Dict[str, Dict[str, Dict[str, Any]]], axis: List[str]) -> List[Dict[str, Any]]:
-    """종목별 일손익을 합쳐 포트폴리오 일별 시리즈(손익, 수익률, 누적수익률 지수, MDD)를 만든다."""
+def portfolio_daily(
+    mtm: Dict[str, Dict[str, Dict[str, Any]]],
+    axis: List[str],
+    equity_by_date: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """종목별 일손익을 합쳐 포트폴리오 일별 시리즈(손익, 수익률, 누적수익률 지수, MDD)를 만든다.
+
+    equity_by_date: 날짜별 계좌 총자산(KRW, 현금 포함). 제공되면 분모로 전일 총자산(TWR 방식)을
+    우선 사용하여, 현금 비중이 높을 때 주식 소액 손실로 하루 수익률이 -10%씩 폭락 왜곡되는 현상을 방지한다.
+    제공되지 않으면 종목 포지션 원가 합계(base)를 사용한다.
+    """
     out: List[Dict[str, Any]] = []
     index = 1.0
     peak = 1.0
     cum_pnl = 0.0
+    last_known_equity: Optional[float] = None
+
     for d in axis:
         pnl = sum(rows[d]["pnl_krw"] for rows in mtm.values() if d in rows)
         base = sum(rows[d]["base_krw"] for rows in mtm.values() if d in rows)
         value = sum(rows[d]["value_krw"] for rows in mtm.values() if d in rows)
-        ret = (pnl / base) if base > 1.0 else None
+
+        # 분모 선정: 계좌 총자산이 주어지면 전일 총자산을 우선 사용
+        denom = base
+        if equity_by_date:
+            eq_today = equity_by_date.get(d)
+            if last_known_equity and last_known_equity > 1.0:
+                denom = last_known_equity
+            elif eq_today and eq_today > 1.0:
+                # 첫날의 경우 당일 자산에서 당일 손익을 역산한 전일 추정 자산
+                denom = max(1.0, eq_today - pnl)
+            if eq_today and eq_today > 1.0:
+                last_known_equity = eq_today
+
+        ret = (pnl / denom) if denom > 1.0 else None
         if ret is not None:
             index *= 1.0 + ret
         peak = max(peak, index)

@@ -242,7 +242,13 @@ async def propose_rebalance(
     remove_symbols = [r["symbol"] for r in valid_removes]
 
     allowed_symbols = set(active_weights) | set(valid_add_symbols)
-    proposed_weights = {s: w for s, w in result.get("weights", {}).items() if s in allowed_symbols}
+    raw_weights = result.get("weights", {})
+    # LLM이 비중을 백분율(예: 15.0%, 65.0%)로 반환했을 때 0.0~1.0 소수점 단위로 자동 정규화
+    total_raw_w = sum(raw_weights.values()) if raw_weights else 0.0
+    scale = 100.0 if total_raw_w > 1.02 else 1.0
+    proposed_weights = {
+        s: round(w / scale, 4) for s, w in raw_weights.items() if s in allowed_symbols
+    }
     for symbol in remove_symbols:
         proposed_weights[symbol] = 0.0  # 제외 = 목표비중 0 (기존 ceiling 로직으로 점진 청산)
 

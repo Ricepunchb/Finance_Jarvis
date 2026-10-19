@@ -209,3 +209,43 @@ def test_anchor_first_day_excludes_price_move_before_recording_started():
     assert plain["2026-09-01"]["pnl_krw"] == 50.0      # 8/31 -> 9/1 변동 포함
     assert anchored["2026-09-01"]["pnl_krw"] == 0.0    # 기록 시작일엔 기준가=당일 종가
     assert anchored["2026-09-02"]["pnl_krw"] == 50.0
+
+
+def test_filled_sells_extract_basis_hint_from_decision_context():
+    # 체결(fills)이 있는 매도 주문이라도 컨텍스트의 exit_check 평단을 basis_hint로 추출해야 한다
+    intents = [_intent("s1", "0040X0", "sell", 10, 9230, _ts(10, 12))]
+    fills = [_fill("s1", 10, 9230)]
+    ctx = {"s1": {"exit_check": {"avg_price": 9055.0}}}
+    trades, _, _ = _trades(intents, fills, ctx=ctx)
+    assert trades[0]["basis_hint_krw"] == 9055.0
+    events, _ = pnl.realized_events(trades, {})
+    assert events[0]["cost_local"] == 9055.0
+    assert events[0]["pnl_krw"] == (9230 - 9055) * 10  # +1750원, 매도액 전액(92300)이 아님!
+
+
+def test_fully_liquidated_opening_restores_avg_price_from_basis_hint():
+    # 전량 매도되어 positions의 qty=0, avg_price=0이 된 종목도 매도 시점의 basis_hint에서 오프닝 평단가를 복원한다
+    intents = [_intent("s1", "466940", "sell", 2, 24485, _ts(10, 16))]
+    fills = [_fill("s1", 2, 24485)]
+    ctx = {"s1": {"exit_check": {"avg_price": 25710.0}}}
+    trades, _, fx = _trades(intents, fills, ctx=ctx)
+    positions = {"466940": {"qty": 0.0, "avg_price": 0.0}}
+    opening, mismatch = pnl.compute_opening(trades, positions, fx)
+    assert opening["466940"]["qty"] == 2.0
+    assert opening["466940"]["avg_local"] == 25710.0
+    events, _ = pnl.realized_events(trades, opening)
+    assert events[0]["cost_local"] == 25710.0
+    assert events[0]["pnl_krw"] == (24485 - 25710) * 2  # -2450원 (손실)
+
+
+def test_zero_cost_fallback_guards_against_zero_basis_pnl_blowup():
+    # 원가를 전혀 알 수 없고 basis_hint도 없는 경우, 원가 0(매도액 전액 이익)이 아닌 손익 0 + estimated=True로 안전 처리
+    intents = [_intent("s1", "UNKNOWN", "sell", 5, 10000, _ts(10, 19))]
+    fills = [_fill("s1", 5, 10000)]
+    trades, _, fx = _trades(intents, fills, ctx={})
+    opening = {"UNKNOWN": {"qty": 5.0, "avg_local": 0.0, "avg_krw": 0.0}}  # 평단가 0인 상태
+    events, _ = pnl.realized_events(trades, opening)
+    assert events[0]["estimated"] is True
+    assert events[0]["cost_local"] == 10000.0
+    assert events[0]["pnl_krw"] == 0.0  # 50,000원이 아님!
+

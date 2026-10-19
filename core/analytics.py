@@ -114,7 +114,12 @@ async def build_overview(
     opening_qty = {s: o["qty"] for s, o in data["opening"].items()}
     mtm = pnl.daily_mtm(trades, opening_qty, closes, {s: infos[s]["market"] for s in infos}, axis, data["fx"],
                         anchor_first_day=anchor)
-    daily = pnl.portfolio_daily(mtm, axis)
+
+    equity_points, equity_dropped = pnl.filter_equity_outliers(data["equity_points"])
+    equity = [e for e in pnl.equity_by_day(equity_points) if e["date"] >= start]
+    equity_map = {e["date"]: float(e["equity_krw"]) for e in equity}
+
+    daily = pnl.portfolio_daily(mtm, axis, equity_by_date=equity_map)
 
     net = {s: 0.0 for s in symbols}
     for t in trades:
@@ -142,8 +147,6 @@ async def build_overview(
         {"symbol": sym, "date": d, "pnl_krw": r["pnl_krw"], "ret": r["ret"], "qty": r["qty"], "close": r["close"]}
         for sym, rows in mtm.items() for d, r in rows.items()
     ]
-    equity_points, equity_dropped = pnl.filter_equity_outliers(data["equity_points"])
-    equity = [e for e in pnl.equity_by_day(equity_points) if e["date"] >= start]
     realized_total = sum(e["pnl_krw"] for e in data["events"])
     unrealized_total = sum(r["unrealized_krw"] for r in summary)
     wins = sum(1 for e in data["events"] if e["pnl_krw"] > 0)

@@ -66,6 +66,7 @@ def combine_signals(
 async def _onboarding_action(
     *, symbol: Optional[str], combined: Signal, drift, target_weight: float, price: float,
     current_position_value: float, total_equity: float, risk: RiskManager,
+    accumulation_mode: bool = False,
 ) -> Optional[Action]:
     """분할 온보딩 매수. 스윙 시그널 문턱(0.5)은 "언제 비중을 키우느냐"를 정하는 용도라, 신규
     편입/저비중 종목이 목표비중까지 가는 경로가 없었다. 퀀트의 통상 방식대로 목표비중과의 갭을
@@ -75,8 +76,12 @@ async def _onboarding_action(
         return None
     if drift.required_direction != "BUY":  # 밴드 안이면 이미 충분히 채워진 것
         return None
+
+    # 일반 스윙 모드는 단기 SELL 시 온보딩을 보류하지만,
+    # 적립식(ISA/DCA) 모드는 극단적 패닉셀(strength >= 0.85)이 아니면 저가 분할 적립(DCA)을 허용한다.
     if combined["direction"] == "SELL":
-        return None
+        if not accumulation_mode or combined["strength"] >= 0.85:
+            return None
 
     gap_value = (target_weight - drift.current_weight) * total_equity
     daily_budget = target_weight * total_equity / max(1, settings.ONBOARDING_DAYS)
@@ -114,9 +119,13 @@ async def decide(
     risk: RiskManager,
     winding_down: bool = False,
     winddown_liquidating: bool = False,
+    accumulation_mode: Optional[bool] = None,
 ) -> Optional[Action]:
     if price <= 0 or total_equity <= 0:
         return None
+
+    if accumulation_mode is None:
+        accumulation_mode = getattr(settings, "ACCUMULATION_MODE", False)
 
     if winding_down:
         # 사용자가 포트폴리오에서 삭제한 종목: 신규매수는 하지 않고 보유분만 정리한다. 즉시 청산이
@@ -157,10 +166,22 @@ async def decide(
         qty = (current_weight - drift.edge_weight()) * total_equity / price
         reason = "band_ceiling_forced_trim"
     else:
+        is_accumulation = bool(accumulation_mode)
+        # ISA/적립식 계좌: 단기 기술적 하락 시그널에 의한 분할 매도(swing_signal sell) 차단.
+        # 우량 자산을 모아가는 장기 계좌에서 바닥 털림을 방지한다.
+        # (단, 손절/익절/밴드상한초과/제외청산은 위와 exit_guard에서 정상 실행됨)
+        if is_accumulation and combined["direction"] == "SELL":
+            return await _onboarding_action(
+                symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
+                current_position_value=current_position_value, total_equity=total_equity, risk=risk,
+                accumulation_mode=is_accumulation,
+            )
+
         if combined["direction"] == "HOLD" or combined["strength"] < SWING_SIGNAL_THRESHOLD:
             return await _onboarding_action(
                 symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
                 current_position_value=current_position_value, total_equity=total_equity, risk=risk,
+                accumulation_mode=is_accumulation,
             )
         side = combined["direction"].lower()
         trade_value = combined["strength"] * SWING_TRADE_MAX_EQUITY_FRACTION * total_equity

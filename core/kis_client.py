@@ -9,21 +9,22 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from .config import settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
-_profile_suffix = f"_{settings.PROFILE_NAME}" if getattr(settings, "PROFILE_NAME", None) and settings.PROFILE_NAME != "default" else ""
-TOKEN_CACHE_FILE = ROOT_DIR / "data" / f"kis_token{_profile_suffix}.json"
 
 # 발급된 토큰을 만료 임박(1일 유효기간) 전까지 재사용하기 위한 여유 시간.
 # 너무 늦게 갱신하면 만료된 토큰으로 요청을 보내다 401을 받을 수 있어 여유를 둔다.
 TOKEN_REFRESH_MARGIN_SEC = 60 * 10
 
-# KIS 초당 호출 제한: 실전투자는 넉넉하지만 모의투자는 매우 낮아(초당 2건 수준),
-# 그대로 부딪히면 "EGW00201 초당 거래건수를 초과하였습니다" 오류가 난다. 여유를 두고 낮게 잡는다.
-MAX_REQUESTS_PER_SECOND = 15 if not settings.IS_MOCK else 1
+# KIS 초당 호출 제한: 실전투자는 초당 3~5건, 모의투자는 초당 1~2건 수준이므로
+# 여유를 두고 안전하게 제한하여 'EGW00201 초당 거래건수를 초과하였습니다' 오류를 원천 차단한다.
+MAX_REQUESTS_PER_SECOND = 3 if not settings.IS_MOCK else 1
 
-# 호출 시작 사이의 최소 간격. 모의투자는 서버 한도(약 2건/초)에 비해 1건/초도 지터(요청 지연 편차)로
-# 같은 초에 두 건이 도착해 넘칠 수 있어 1.0초에 여유(20%)를 더한다.
-MIN_REQUEST_INTERVAL_SEC = (1.0 / MAX_REQUESTS_PER_SECOND) * (1.2 if settings.IS_MOCK else 1.0)
+# 호출 시작 사이의 최소 간격 (초). 실전투자 0.35초(약 2.8 req/sec), 모의투자 1.2초(약 0.8 req/sec).
+MIN_REQUEST_INTERVAL_SEC = 0.35 if not settings.IS_MOCK else 1.2
 
 # 초당 거래건수 초과(EGW00201)는 서버가 요청을 처리하지 않고 거절한 것이라, 조회(GET)는 잠시 뒤 재시도해도 안전하다.
 RATE_LIMIT_MSG_CD = "EGW00201"
@@ -38,10 +39,15 @@ class AsyncKISClient:
         self.app_secret = settings.KIS_APP_SECRET
         self.session: Optional[aiohttp.ClientSession] = None
         self.access_token: Optional[str] = None
-        self.token_expires_at: float = 0.0  # time.monotonic() 기준 만료 시각
+        self.token_expires_at: float = 0.0  # time.time() 기준 만료 시각
         self._token_lock = asyncio.Lock()
         self._rate_lock = asyncio.Lock()
         self._next_request_at: float = 0.0  # time.monotonic() 기준, 다음 호출이 나갈 수 있는 가장 이른 시각
+
+    @property
+    def token_cache_file(self) -> Path:
+        p_name = getattr(settings, "PROFILE_NAME", "") or "default"
+        return ROOT_DIR / "data" / f"kis_token_{p_name}.json"
 
     async def get_session(self) -> aiohttp.ClientSession:
         """aiohttp 세션을 생성하거나 반환합니다 (Connection Pooling)"""
@@ -57,7 +63,7 @@ class AsyncKISClient:
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError))
     )
-    async def issue_token(self) -> str:
+    async def issue_token(self, force_refresh: bool = False) -> str:
         """OAuth 접근 토큰을 발급받습니다. 만료 임박 전까지는 캐시된 토큰을 재사용합니다.
 
         KIS는 토큰을 새로 발급할 때마다 카카오톡 알림을 보내므로, 만료되지 않은
@@ -65,20 +71,24 @@ class AsyncKISClient:
         """
         async with self._token_lock:  # 동시 요청들이 각자 재발급을 시도하지 않도록 직렬화
             now = time.time()
-            if self.access_token and now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SEC:
+            if not force_refresh and self.access_token and now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SEC:
                 return self.access_token
 
+            token_file = self.token_cache_file
             # 프로세스 간 공유 디스크 캐시 확인
-            if TOKEN_CACHE_FILE.exists():
+            if not force_refresh and token_file.exists():
                 try:
-                    with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+                    with open(token_file, "r", encoding="utf-8") as f:
                         cached_data = json.load(f)
                     c_token = cached_data.get("access_token")
                     c_expires = float(cached_data.get("expires_at", 0.0))
                     c_is_mock = cached_data.get("is_mock")
-                    # 모의/실전 모드가 변경되었으면 이전 토큰 캐시 무효화
+                    c_app_key = cached_data.get("app_key")
+                    # 모의/실전 모드 또는 APP_KEY가 변경되었으면 이전 토큰 캐시 무효화
                     if c_is_mock is not None and c_is_mock != settings.IS_MOCK:
                         logger.info("모의/실전 모드 변경 감지 - 기존 토큰 캐시 무효화")
+                    elif c_app_key is not None and c_app_key != self.app_key:
+                        logger.info("APP_KEY 변경 감지 - 기존 토큰 캐시 무효화")
                     elif c_token and now < c_expires - TOKEN_REFRESH_MARGIN_SEC:
                         self.access_token = c_token
                         self.token_expires_at = c_expires
@@ -101,13 +111,14 @@ class AsyncKISClient:
                     expires_in = int(data.get("expires_in", 86400))
                     self.token_expires_at = now + expires_in
                     try:
-                        TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+                        token_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(token_file, "w", encoding="utf-8") as f:
                             json.dump(
                                 {
                                     "access_token": self.access_token,
                                     "expires_at": self.token_expires_at,
                                     "is_mock": settings.IS_MOCK,
+                                    "app_key": self.app_key,
                                 },
                                 f,
                             )
@@ -167,6 +178,17 @@ class AsyncKISClient:
                 result = await response.json()
                 if isinstance(result, dict):
                     result["_resp_headers"] = dict(response.headers)
+                    # 토큰 만료 에러(EGW00123 등) 감지 시: 캐시 무효화 및 1회 강제 재발급 후 즉시 재시도
+                    if result.get("msg_cd") in ("EGW00123", "EGW00121", "EGW00122"):
+                        logger.warning(f"KIS 토큰 만료 에러({result.get('msg_cd')}) 감지 - 토큰 강제 재발급 후 즉시 재시도")
+                        new_token = await self.issue_token(force_refresh=True)
+                        req_headers["authorization"] = f"Bearer {new_token}"
+                        await self._throttle()
+                        async with session.request(method, url, headers=req_headers, json=data, params=params) as retry_resp:
+                            result = await retry_resp.json()
+                            if isinstance(result, dict):
+                                result["_resp_headers"] = dict(retry_resp.headers)
+
             if result.get("msg_cd") != RATE_LIMIT_MSG_CD or attempt == max_attempts:
                 return result
             await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC * attempt)

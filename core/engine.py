@@ -30,6 +30,8 @@ from core.llm.base import LLMProvider
 from core.lock import InstanceLock
 from core.news import sentiment as news_sentiment
 from core.risk import RiskManager
+from core.utils.krx_calendar import is_krx_market_open_now
+from core.utils.tick_size import adjust_to_tick_size, is_krx_etf
 from core.websocket_client import KISWebSocketClient
 
 logger = logging.getLogger(__name__)
@@ -40,17 +42,13 @@ CYCLE_INTERVAL_SEC = 1800  # 종목당 모니터링/매매 윈도우: 30분
 CHART_LOOKBACK_DAYS = 90
 
 # 미국 거래소(NASD/NYSE/AMEX) 정규장. America/New_York 시간대로 판정하므로 서머타임 전환은
-# 자동 반영된다. 휴장일 캘린더는 아직 없음.
+# 자동 반영된다.
 _US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
 
 
 def _is_krx_open_now() -> bool:
-    now = datetime.now(tz=KST)
-    if now.weekday() >= 5:  # 5=토, 6=일
-        return False
-    open_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return open_t <= now <= close_t
+    """한국거래소(KRX) 정규장 개장 중인지 판별 (주말 및 법정 공휴일/휴장일 자동 제외)."""
+    return is_krx_market_open_now()
 
 
 def _is_us_market_open_now() -> bool:
@@ -316,10 +314,37 @@ class TradingEngine:
 
         halted_count = 0
         domestic_symbol_count = 0
-        for symbol in active_weights:
-            info = symbol_info.get(symbol) or {"market": "domestic", "exchange": None}
+
+        # [실계좌 보호 & 비편입 보유종목 감시]
+        # active_weights에 없더라도 실제 계좌에 보유 잔고(qty > 0)가 존재하는 종목(미편입 종목)을 순회에 포함한다.
+        # target_weight=0.0으로 처리되어 손절/익절 감시 및 점진적 청산(excluded_liquidation) 파이프라인이 정상 작동한다.
+        held_domestic_symbols = {
+            s for s, h in holdings_by_symbol.items()
+            if float(h.get("hldg_qty") or 0) > 0
+        }
+        held_overseas_symbols = {
+            s for s, h in overseas_holdings_by_symbol.items()
+            if float(h.get("cblc_qty13") or 0) > 0
+        }
+        all_symbols = list(active_weights.keys())
+        for s in sorted(held_domestic_symbols | held_overseas_symbols):
+            if s not in active_weights:
+                all_symbols.append(s)
+
+        for symbol in all_symbols:
+            info = symbol_info.get(symbol) or {}
+            if symbol not in symbol_info:
+                if symbol in held_overseas_symbols:
+                    info = {
+                        "market": "overseas",
+                        "exchange": (overseas_holdings_by_symbol.get(symbol) or {}).get("ovrs_excg_cd") or "NASD",
+                    }
+                else:
+                    info = {"market": "domestic", "exchange": None}
+
             market = info.get("market") or "domestic"
             exchange = info.get("exchange")
+            target_weight = active_weights.get(symbol, 0.0)
 
             if domestic_only and market == "overseas":
                 continue  # 국내 전용: 해외 종목은 매매·정리 모두 건너뛴다 (DB의 종목/이력은 그대로 둔다)
@@ -334,7 +359,7 @@ class TradingEngine:
                     time.time() - info["winding_down_at"] >= settings.WINDDOWN_MAX_DAYS * 86400
                 )
 
-            if active_weights[symbol] <= 0 or winddown_liquidating is not None:
+            if target_weight <= 0 or winddown_liquidating is not None:
                 held = holdings_by_symbol.get(symbol) if market != "overseas" else overseas_holdings_by_symbol.get(symbol)
                 if not held or float(held.get("hldg_qty") or held.get("cblc_qty13") or 0) <= 0:
                     if winddown_liquidating is not None and (market != "overseas" or overseas_balance_ok):
@@ -346,14 +371,14 @@ class TradingEngine:
             try:
                 if market == "overseas":
                     await self._process_overseas_symbol(
-                        cycle_id, symbol, exchange, active_weights[symbol],
+                        cycle_id, symbol, exchange, target_weight,
                         overseas_holdings_by_symbol.get(symbol), total_equity, ws_ok,
                         winddown_liquidating=winddown_liquidating,
                     )
                 else:
                     domestic_symbol_count += 1
                     halted = await self._process_symbol(
-                        cycle_id, symbol, active_weights[symbol], holdings_by_symbol.get(symbol),
+                        cycle_id, symbol, target_weight, holdings_by_symbol.get(symbol),
                         total_equity, ws_ok, winddown_liquidating=winddown_liquidating,
                     )
                     if halted:
@@ -537,8 +562,7 @@ class TradingEngine:
                 valuation_signal = await fundamental_valuation.get_valuation_signal(self.conn, self.client, symbol)
             except Exception:
                 logger.exception(f"'{symbol}' 밸류에이션 시그널 조회 오류 - 밸류에이션 없이 계속")
-        context["valuation_signal"] = valuation_signal
-
+        is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         action = await signal_engine.decide(
             symbol=symbol,
             current_weight=current_weight,
@@ -555,6 +579,7 @@ class TradingEngine:
             risk=self.risk,
             winding_down=winddown_liquidating is not None,
             winddown_liquidating=bool(winddown_liquidating),
+            accumulation_mode=is_accumulation,
         )
 
         if action is None:
@@ -605,9 +630,14 @@ class TradingEngine:
             return False
 
         try:
+            # KRX 호가 단위(Tick size) 보정: 유효 호가 단위(5원, 10원 등)로 정규화
+            clean_price = None
+            if action.price is not None and action.price > 0:
+                clean_price = adjust_to_tick_size(
+                    action.price, market="domestic", is_etf=is_krx_etf(symbol), side=action.side
+                )
             result = await kis_domestic.order_cash(
-                self.client, symbol, action.side, int(action.qty),
-                int(action.price) if action.price else None,
+                self.client, symbol, action.side, int(action.qty), clean_price,
             )
             kis_order_no = result.get("ODNO") or result.get("odno")
             await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
@@ -782,8 +812,7 @@ class TradingEngine:
             )
         except Exception:
             logger.exception(f"'{symbol}' 해외 밸류에이션 시그널 계산 오류 - 기술적 지표만 사용")
-        context["valuation_signal"] = valuation_signal
-
+        is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         action = await signal_engine.decide(
             symbol=symbol,
             current_weight=current_weight,
@@ -800,6 +829,7 @@ class TradingEngine:
             risk=self.risk,
             winding_down=winddown_liquidating is not None,
             winddown_liquidating=bool(winddown_liquidating),
+            accumulation_mode=is_accumulation,
         )
 
 
@@ -868,8 +898,11 @@ class TradingEngine:
                 return
 
             try:
+                clean_dom_price = adjust_to_tick_size(
+                    dom_price, market="domestic", is_etf=True, side=action.side
+                )
                 result = await kis_domestic.order_cash(
-                    self.client, proxy_symbol, action.side, int(proxy_qty), int(dom_price),
+                    self.client, proxy_symbol, action.side, int(proxy_qty), clean_dom_price,
                 )
                 kis_order_no = result.get("ODNO") or result.get("odno")
                 await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
