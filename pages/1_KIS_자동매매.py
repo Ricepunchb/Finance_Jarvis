@@ -8,6 +8,7 @@ import ast
 import json
 import time
 import os
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -393,11 +394,16 @@ with tab_portfolio:
             new_exchange = fc3.selectbox("거래소", ["NASD", "NYSE", "AMEX"])
         submitted = st.form_submit_button("등록")
         if submitted and new_symbol:
-            payload = {"symbol": new_symbol.strip(), "market": "domestic" if new_market == "국내" else "overseas"}
-            if new_exchange:
-                payload["exchange"] = new_exchange
-            api_post("/portfolio/symbols", payload)
-            st.rerun()
+            clean_sym = new_symbol.strip()
+            # 한글이나 공백이 포함된 경우 종목명이 아닌지 확인
+            if any("\uac00" <= ch <= "\ud7a3" for ch in clean_sym) or " " in clean_sym:
+                st.error("종목코드에 한글이나 공백이 포함되어 있습니다. 종목명이 아닌 6자리 종목코드(예: 005930)를 입력해주세요.")
+            else:
+                payload = {"symbol": clean_sym, "market": "domestic" if new_market == "국내" else "overseas"}
+                if new_exchange:
+                    payload["exchange"] = new_exchange
+                api_post("/portfolio/symbols", payload)
+                st.rerun()
 
     symbols = api_get("/portfolio/symbols")
     if symbols:
@@ -411,10 +417,11 @@ with tab_portfolio:
         st.dataframe(symbols_df, width='stretch', hide_index=True)
 
         dc1, dc2 = st.columns([3, 1])
+        symbols_to_delete = [r['symbol'] for r in symbols if not r.get("winding_down_at")]
         delete_target = dc1.selectbox(
             "포트폴리오에서 삭제할 종목",
-            [f"{r['symbol']} {symbol_names.get(r['symbol'], '')}".strip()
-             for r in symbols if not r.get("winding_down_at")],
+            symbols_to_delete,
+            format_func=lambda s: f"{s} {symbol_names.get(s, '')}".strip(),
             index=None,
             placeholder="종목 선택",
         )
@@ -425,10 +432,13 @@ with tab_portfolio:
         )
         dc2.write("")
         if dc2.button("삭제", disabled=delete_target is None, width='stretch'):
-            result = api_delete(f"/portfolio/symbols/{delete_target.split()[0]}")
+            encoded_symbol = urllib.parse.quote(delete_target, safe="")
+            result = api_delete(f"/portfolio/symbols/{encoded_symbol}")
             if result is not None:
-                if result["status"] == "winding_down":
+                if result.get("status") == "winding_down":
                     st.toast(f"{delete_target}: 정리 대기로 전환했습니다")
+                else:
+                    st.toast(f"{delete_target}: 포트폴리오에서 삭제되었습니다")
                 st.rerun()
 
     st.divider()

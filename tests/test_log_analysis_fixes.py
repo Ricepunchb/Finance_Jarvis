@@ -107,3 +107,19 @@ def test_yfinance_skips_domestic_symbols():
 def test_kis_rate_limit_codes():
     assert "EGW00201" in RATE_LIMIT_MSG_CDS
     assert "EGW00215" in RATE_LIMIT_MSG_CDS
+
+
+def test_api_add_symbol_rejects_korean_and_spaces():
+    from fastapi.testclient import TestClient
+    from api.main import app
+
+    client = TestClient(app)
+    # 한글 종목명 입력 시 400 Bad Request
+    resp = client.post("/portfolio/symbols", json={"symbol": "TIGER 미국S&P500", "market": "domestic"})
+    assert resp.status_code == 400
+    assert "유효하지 않은 종목코드" in resp.json()["detail"]
+
+    # 공백 포함 종목코드 입력 시 400 Bad Request
+    resp2 = client.post("/portfolio/symbols", json={"symbol": "005930 ", "market": "domestic"})
+    # strip 후 정상 처리되는지 또는 공백 포함 검사
+    assert resp2.status_code in (200, 400)

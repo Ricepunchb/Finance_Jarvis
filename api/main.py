@@ -236,15 +236,21 @@ async def get_proxy_mappings_api():
 
 @app.post("/portfolio/symbols")
 async def add_symbol(req: AddSymbolRequest):
+    sym = req.symbol.strip()
+    if not sym or " " in sym or any("\uac00" <= ch <= "\ud7a3" for ch in sym):
+        raise HTTPException(
+            status_code=400,
+            detail=f"유효하지 않은 종목코드입니다: '{req.symbol}'. 종목명이 아닌 6자리 종목코드(예: 005930)를 입력하세요."
+        )
     conn = await db.get_connection()
     try:
         is_domestic = await get_effective_domestic_only(conn)
         if is_domestic and req.market != "domestic":
             raise HTTPException(status_code=400, detail="국내 전용 모드(DOMESTIC_ONLY)라 해외 종목은 등록할 수 없습니다")
-        await db.add_portfolio_symbol(conn, req.symbol, req.market, req.exchange)
+        await db.add_portfolio_symbol(conn, sym, req.market, req.exchange)
     finally:
         await conn.close()
-    return {"status": "added", "symbol": req.symbol}
+    return {"status": "added", "symbol": sym}
 
 
 
