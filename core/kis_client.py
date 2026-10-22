@@ -26,8 +26,10 @@ MAX_REQUESTS_PER_SECOND = 3 if not settings.IS_MOCK else 1
 # 호출 시작 사이의 최소 간격 (초). 실전투자 0.35초(약 2.8 req/sec), 모의투자 1.2초(약 0.8 req/sec).
 MIN_REQUEST_INTERVAL_SEC = 0.35 if not settings.IS_MOCK else 1.2
 
-# 초당 거래건수 초과(EGW00201)는 서버가 요청을 처리하지 않고 거절한 것이라, 조회(GET)는 잠시 뒤 재시도해도 안전하다.
+# 초당 거래건수 초과(EGW00201: 게이트웨이 초과, EGW00215: 원장 초과)는 서버가 요청을
+# 처리하지 않고 거절한 것이라, 조회(GET)는 잠시 뒤 재시도해도 안전하다.
 RATE_LIMIT_MSG_CD = "EGW00201"
+RATE_LIMIT_MSG_CDS = {"EGW00201", "EGW00215"}
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SEC = 1.5
 
@@ -189,8 +191,12 @@ class AsyncKISClient:
                             if isinstance(result, dict):
                                 result["_resp_headers"] = dict(retry_resp.headers)
 
-            if result.get("msg_cd") != RATE_LIMIT_MSG_CD or attempt == max_attempts:
+            msg_cd = result.get("msg_cd") if isinstance(result, dict) else None
+            if msg_cd not in RATE_LIMIT_MSG_CDS or attempt == max_attempts:
                 return result
+            logger.warning(
+                f"KIS 초당 호출 한도 초과({msg_cd}) - {attempt}/{max_attempts}회 백오프({RATE_LIMIT_BACKOFF_SEC * attempt:.1f}초) 대기 후 재시도"
+            )
             await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC * attempt)
 
     async def _throttle(self) -> None:

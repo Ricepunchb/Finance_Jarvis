@@ -113,11 +113,15 @@ class TradingEngine:
             else:
                 logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
 
-            self.ws_client = KISWebSocketClient(
-                hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
-                include_overseas=not settings.DOMESTIC_ONLY,
-            )
-            await self.ws_client.start()
+            if settings.ENABLE_WEBSOCKET:
+                self.ws_client = KISWebSocketClient(
+                    hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
+                    include_overseas=not settings.DOMESTIC_ONLY,
+                )
+                await self.ws_client.start()
+            else:
+                logger.info("ENABLE_WEBSOCKET=False — 실시간 웹소켓 비활성화 (REST 주기 대조 모드로 구동)")
+                self.ws_client = None
 
             self._stop_event.clear()
             self._loop_task = asyncio.create_task(self._run_loop())

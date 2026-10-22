@@ -190,6 +190,10 @@ async def propose_rebalance(
         max_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
         min_weight=settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
         max_weight=settings.MAX_POSITION_PCT,
+        max_symbols_added=settings.AI_REBALANCE_MAX_SYMBOLS_ADDED,
+        max_symbols_removed=settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED,
+        max_weight_delta_pct=settings.AI_REBALANCE_MAX_WEIGHT_DELTA_PCT,
+        max_turnover_pct=settings.AI_REBALANCE_MAX_TURNOVER_PCT,
     )
 
     if result.get("degraded"):

@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     KIS_ACCOUNT_NO: str    # 예: 12345678-01
     KIS_HTS_ID: str        # 실시간 체결통보(웹소켓) 구독에 필요한 HTS 로그인 ID
     IS_MOCK: bool = True   # 기본값은 모의투자
+    # True면 실시간 체결통보를 위한 KIS 웹소켓 클라이언트를 구동한다.
+    # 동일 HTS ID를 사용하는 복수 계좌(실전 일반 + ISA) 동시 구동 시 단일 세션 충돌 방지를 위해 보조 계좌는 False 권장.
+    ENABLE_WEBSOCKET: bool = True
 
     # True면 국내(KRX 주식·ETF)만 매매·조회·발굴·등록한다. 해외는 수수료 부담이 커서 기본 비활성.
     # DB에 이미 있는 해외 종목/체결 이력은 지우지 않고 엔진이 건너뛸 뿐이다(분석 대시보드에서는 그대로 보인다).

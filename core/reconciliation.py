@@ -81,6 +81,17 @@ def _resolve_status(row: Dict[str, Any], market: str = "domestic") -> str:
 async def _find_candidates(
     ccld_rows: List[Dict[str, Any]], intent: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
+    # 1) intent에 kis_order_no가 이미 있는 경우: 주문번호(odno)로 우선 정확히 1:1 대조
+    kis_odno = (intent.get("kis_order_no") or "").strip()
+    if kis_odno:
+        by_odno = [
+            row for row in ccld_rows
+            if (row.get("odno") or "").strip() == kis_odno
+            or (row.get("odno") or "").strip().lstrip("0") == kis_odno.lstrip("0")
+        ]
+        if by_odno:
+            return by_odno
+
     market = intent.get("market", "domestic")
     fields = _MARKET_FIELDS[market]
     side_cd = _SIDE_TO_SLL_BUY_CD.get(intent["side"])
@@ -164,7 +175,15 @@ async def reconcile_unresolved_intents(
         rows = overseas_rows if intent.get("market") == "overseas" else domestic_rows
         candidates = await _find_candidates(rows, intent)
         if len(candidates) == 0:
-            # KIS 기록에 없음 -> 브로커에 도달하지 못했다고 결론. 재시도는 다음 사이클에 새 intent로.
+            if intent.get("kis_order_no"):
+                # 브로커에 정상 전송되어 주문번호(odno)가 이미 발급된 건은 KIS 당일 내역 지연 등으로
+                # 일시 매칭이 안 될 수 있으므로, 절대 NOT_SUBMITTED로 내리지 않는다 (중복 발주 원천 차단).
+                logger.warning(
+                    f"미해결 intent({intent['intent_id']})에 주문번호({intent['kis_order_no']})가 존재하나 "
+                    f"KIS 체결내역에서 찾지 못했습니다. 상태({intent.get('status', 'SUBMITTED')})를 유지합니다."
+                )
+                continue
+            # KIS 기록에 없고 주문번호도 없음 -> 브로커에 도달하지 못했다고 결론. 재시도는 다음 사이클에 새 intent로.
             await db.update_order_intent(conn, intent["intent_id"], status="NOT_SUBMITTED")
         elif len(candidates) == 1:
             row = candidates[0]

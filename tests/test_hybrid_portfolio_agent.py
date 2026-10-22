@@ -1,7 +1,9 @@
 import asyncio
+from datetime import datetime
 import json
 import time
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import pytest
@@ -65,13 +67,14 @@ def test_semantic_profile_and_rebalance_integration():
         )
 
         # 3. 증권사 리포트 및 분석 적재
+        today_str = datetime.now(tz=ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         await db.upsert_research_reports(conn, [{
             "research_id": 101,
             "symbol": "005930",
             "name": "삼성전자",
             "broker": "신한투자",
             "title": "목표가 상향",
-            "write_date": "20261005",
+            "write_date": today_str,
             "read_count": 500,
         }])
         await db.save_report_analysis(conn, 101, json.dumps({
@@ -116,6 +119,8 @@ def test_semantic_profile_and_rebalance_integration():
             assert k["insight_digest"] is not None
             assert k["insight_digest"]["headline"] == "반도체 주도 강세장"
             assert k["insight_digest"]["risks"] == ["원달러 환율 급등"]
+            assert k["max_symbols_added"] == 2
+            assert k["max_symbols_removed"] == 2
 
         await conn.close()
 
@@ -166,6 +171,9 @@ def test_gemini_provider_propose_portfolio_changes_with_digest():
             assert "고환율" in prompt_used
             assert "보유종목 관전 포인트" in prompt_used
             assert "AI시맨틱 +0.75" in prompt_used
+            assert "안전 가드 제약 규정" in prompt_used
+            assert "1회 최대 제외 종목 수" in prompt_used
+            assert "1회 최대 신규 편입 종목 수" in prompt_used
 
     asyncio.run(run())
 

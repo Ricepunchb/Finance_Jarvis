@@ -113,7 +113,8 @@ class KISWebSocketClient:
 
     async def _connect_and_subscribe(self) -> None:
         approval_key = await issue_approval_key()
-        self._ws = await websockets.connect(WS_URL)
+        # KIS 웹소켓은 표준 WS 핑퐁 대신 자체 전문을 사용하므로, 클라이언트 측 주기적 ping_interval을 비활성화한다.
+        self._ws = await websockets.connect(WS_URL, ping_interval=None, ping_timeout=None)
         self._enc_state = {}  # 이전 세션의 key/iv는 무효 — 구독 응답으로 새로 받는다
 
         subscriptions = [(ccnl_notice_tr_id(), _DOMESTIC_CCNL_COLUMNS)]
@@ -137,15 +138,18 @@ class KISWebSocketClient:
         delay = self._RECONNECT_BASE_DELAY_SEC
         while not self._stopping:
             if self._ws is not None:
+                connected_at = time.time()
                 try:
                     async for raw in self._ws:
                         await self.on_any_message()  # 데이터든 PINGPONG이든 "살아있다"의 근거
                         await self._handle_message(raw)
-                        delay = self._RECONNECT_BASE_DELAY_SEC  # 정상 수신 중엔 백오프 초기화
+                        # 최소 30초 이상 연결이 안정적으로 유지되었을 때만 백오프 딜레이를 초기화
+                        if time.time() - connected_at > 30.0:
+                            delay = self._RECONNECT_BASE_DELAY_SEC
                 except asyncio.CancelledError:
                     return
-                except Exception:
-                    logger.exception("KIS 웹소켓 연결이 끊겼습니다")
+                except Exception as e:
+                    logger.warning(f"KIS 웹소켓 연결이 종료되었습니다 ({type(e).__name__}: {e})")
                 finally:
                     if self._ws is not None:
                         try:
@@ -167,11 +171,10 @@ class KISWebSocketClient:
             try:
                 await self._connect_and_subscribe()
                 logger.info("KIS 웹소켓 재연결 성공")
-                delay = self._RECONNECT_BASE_DELAY_SEC
             except asyncio.CancelledError:
                 return
-            except Exception:
-                logger.exception("KIS 웹소켓 재연결 실패")
+            except Exception as e:
+                logger.warning(f"KIS 웹소켓 재연결 시도 실패 ({type(e).__name__}: {e})")
 
     async def _handle_message(self, raw: str) -> None:
         if raw[0] in ("0", "1"):

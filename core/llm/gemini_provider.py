@@ -5,6 +5,7 @@
 그래도 실패하면(네트워크 오류, 스키마 위반, 타임아웃 등) 절대 예외를 상위로 올리지
 않고 안전한 HOLD로 귀결시킨다 — 자동매매 로직이 LLM 장애로 오작동하면 안 되기 때문.
 """
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
@@ -187,33 +188,57 @@ class GeminiProvider(LLMProvider):
     async def _generate(
         self, prompt: str, response_schema: Type[_SchemaT], temperature: float
     ) -> _SchemaT:
-        """주 모델로 시도하고, 5xx(수요 폭주 등 서버측 장애)만 백업 모델로 한 번 더 시도한다.
-
-        스키마 위반 등 4xx성 오류는 모델을 바꿔도 똑같이 재현될 가능성이 높으므로 재시도하지
-        않고 즉시 호출부의 안전한 폴백(HOLD/균등비중)으로 넘긴다.
-        """
+        """주 모델로 시도하고, 5xx(서버측 장애) 및 429(할당량/속도제한) 발생 시 지수 백오프 및 백업 모델로 재시도한다."""
         last_exc: Exception = RuntimeError("모델 목록이 비어 있음")
         for i, model in enumerate(self._models):
-            try:
-                response = await self._client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                        temperature=temperature,
-                    ),
-                )
-                if response.parsed is None:
-                    raise ValueError("빈 응답")
-                return response.parsed
-            except genai_errors.ServerError as e:
-                last_exc = e
-                if i < len(self._models) - 1:
-                    logger.warning(
-                        f"모델 '{model}' 서버 오류({e.code}) - 백업 모델 "
-                        f"'{self._models[i + 1]}'로 재시도"
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await self._client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                            temperature=temperature,
+                        ),
                     )
+                    if response.parsed is None:
+                        raise ValueError("빈 응답")
+                    return response.parsed
+                except genai_errors.ClientError as e:
+                    last_exc = e
+                    # 429 RESOURCE_EXHAUSTED / RATE_LIMIT: 백오프 재시도 및 모델 폴백
+                    is_429 = getattr(e, "code", None) == 429 or "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+                    if is_429:
+                        if attempt < max_attempts:
+                            backoff = 2.0 * attempt
+                            logger.warning(
+                                f"Gemini 모델 '{model}' 429 Rate Limit (시도 {attempt}/{max_attempts}) - {backoff:.1f}초 대기 후 재시도"
+                            )
+                            await asyncio.sleep(backoff)
+                            continue
+                        elif i < len(self._models) - 1:
+                            logger.warning(
+                                f"Gemini 모델 '{model}' 429 재시도 소진 - 백업 모델 '{self._models[i + 1]}'로 전환"
+                            )
+                            break
+                    raise
+                except genai_errors.ServerError as e:
+                    last_exc = e
+                    if attempt < max_attempts:
+                        backoff = 1.5 * attempt
+                        logger.warning(
+                            f"Gemini 모델 '{model}' 서버 오류({getattr(e, 'code', '5xx')}) - {backoff:.1f}초 대기 후 재시도"
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+                    elif i < len(self._models) - 1:
+                        logger.warning(
+                            f"모델 '{model}' 서버 오류({getattr(e, 'code', '5xx')}) 소진 - 백업 모델 "
+                            f"'{self._models[i + 1]}'로 재시도"
+                        )
+                        break
         raise last_exc
 
     async def analyze_news(self, symbol: str, title: str, summary: str) -> Dict[str, Any]:
@@ -266,6 +291,10 @@ class GeminiProvider(LLMProvider):
         max_symbols: int,
         min_weight: float,
         max_weight: float,
+        max_symbols_added: int = 2,
+        max_symbols_removed: int = 2,
+        max_weight_delta_pct: float = 0.10,
+        max_turnover_pct: float = 0.20,
     ) -> Dict[str, Any]:
         current_weights = {p["symbol"]: p["weight"] for p in current_positions}
         candidate_symbols = {c["symbol"] for c in candidate_pool}
@@ -341,30 +370,52 @@ class GeminiProvider(LLMProvider):
                 lines.append(f"- 보유종목 관전 포인트: {', '.join(insight_digest['holdings_watch'])}")
         lines.append("")
         lines.append(
-            f"[제약] 최종 포트폴리오 종목 수는 최대 {max_symbols}개. weights의 키는 반드시 "
-            "현재 포트폴리오 종목코드 또는 후보 종목코드와 정확히 일치해야 하고, 값의 합은 "
-            "1.0을 넘으면 안 된다 (전액을 다 투자할 필요는 없다 - 확신이 부족하면 나머지는 "
-            "현금으로 남겨두는 것이 안전하다).\n"
-            f"[비중 범위] 보유할 종목(비중>0)의 비중은 반드시 {min_weight:.0%} 이상 {max_weight:.0%} 이하여야 한다. "
-            f"이 범위를 벗어난 종목이 하나라도 있으면 제안 전체가 폐기된다. '최소 비중'으로 담으려면 "
-            f"{min_weight:.0%}를 쓰고, 그 이하로 담을 만큼의 확신이면 adds에 넣지 마라. "
-            "제외하려는 종목은 removes에 넣고 비중을 0으로 둔다."
+            "[안전 가드 제약 규정 - 아래 기준 중 하나라도 위반 시 제안 전체가 즉시 반려되므로 엄격히 준수하라]\n"
+            f"1. [최종 종목 수 및 비중 합] 최종 포트폴리오 보유 종목(비중>0) 수는 최대 {max_symbols}개. "
+            "weights의 키는 현재 포트폴리오 또는 후보 종목코드와 일치해야 하며, 비중의 총합은 1.0(100%)을 "
+            "초과할 수 없다 (확신이 부족하면 나머지는 현금으로 남겨두는 것이 안전함).\n"
+            f"2. [개별 종목 비중 범위] 보유할 종목(비중>0)의 비중은 반드시 {min_weight:.0%} 이상 {max_weight:.0%} 이하여야 한다. "
+            f"최소 비중({min_weight:.0%}) 미만으로 담을 종목은 adds에 넣지 마라. 제외하려는 종목은 removes에 넣고 비중을 0으로 둔다.\n"
+            f"3. [1회 최대 제외 종목 수] 이번 제안에서 removes에 포함할 수 있는 종목은 최대 {max_symbols_removed}개다. "
+            f"제외하고 싶은 종목이 {max_symbols_removed}개를 넘더라도, 가장 위험/시급한 {max_symbols_removed}개만 우선 골라 removes에 넣고 "
+            "나머지 종목은 이번 회차에서는 보유를 유지하되 비중만 점진적으로 축소하라 (한 번에 과다 제외 시 제안이 통째로 반려됨).\n"
+            f"4. [1회 최대 신규 편입 종목 수] 이번 제안에서 adds에 포함할 수 있는 종목은 최대 {max_symbols_added}개다.\n"
+            f"5. [종목당 1회 비중 변화폭] 기존 보유 종목의 비중은 1회 제안당 최대 ±{max_weight_delta_pct:.0%}p까지만 변경 가능하다 "
+            "(단, removes에 명시된 종목은 비중 0%로 전량 청산 허용).\n"
+            f"6. [총 회전율 상한] 이번 제안의 총 회전율(sum|Δweight|/2)은 {max_turnover_pct:.0%} 이하여야 한다 (포트폴리오의 급격한 전면 교체 금지)."
         )
         prompt = "\n".join(lines)
 
+        allowed_symbols = {s.strip().upper() for s in (set(current_weights) | candidate_symbols)}
+        if not allowed_symbols:
+            logger.warning("현재 보유 종목 및 발굴 후보군이 모두 비어 있어 리밸런싱을 제안할 수 없습니다.")
+            return {
+                "adds": [],
+                "removes": [],
+                "weights": dict(current_weights),
+                "rationale": "보유 종목 및 후보군이 모두 비어 있어 리밸런싱 대상이 없습니다. 종목 등록 또는 후보군 스크리닝을 먼저 실행하세요.",
+                "degraded": True,
+                "error_kind": "no_candidates",
+            }
+
         try:
             parsed = await self._generate(prompt, _PortfolioChangeSchema, temperature=0.3)
-            allowed_symbols = set(current_weights) | candidate_symbols
-            weights = {item.symbol: item.weight for item in parsed.weights if item.symbol in allowed_symbols}
+            weights = {
+                item.symbol.strip().upper(): item.weight
+                for item in parsed.weights
+                if item.symbol.strip().upper() in allowed_symbols
+            }
             if not weights:
                 raise ValueError("응답에 유효한 종목이 하나도 없음")
             adds = [
-                {"symbol": a.symbol, "name": a.name, "rationale": a.rationale}
-                for a in parsed.adds if a.symbol in candidate_symbols
+                {"symbol": a.symbol.strip().upper(), "name": a.name, "rationale": a.rationale}
+                for a in parsed.adds
+                if a.symbol.strip().upper() in {s.strip().upper() for s in candidate_symbols}
             ]
             removes = [
-                {"symbol": r.symbol, "rationale": r.rationale}
-                for r in parsed.removes if r.symbol in current_weights
+                {"symbol": r.symbol.strip().upper(), "rationale": r.rationale}
+                for r in parsed.removes
+                if r.symbol.strip().upper() in {s.strip().upper() for s in current_weights}
             ]
             return {
                 "adds": adds,

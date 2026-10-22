@@ -43,6 +43,10 @@ class LLMProvider(ABC):
         max_symbols: int,
         min_weight: float,
         max_weight: float,
+        max_symbols_added: int = 2,
+        max_symbols_removed: int = 2,
+        max_weight_delta_pct: float = 0.10,
+        max_turnover_pct: float = 0.20,
     ) -> Dict[str, Any]:
         """현재 포트폴리오 맥락(비중/손익/시그널)과 후보종목 숏리스트를 근거로 리밸런싱을
         제안한다 (사용자 승인 전까지는 활성화되지 않음). candidate_pool이 비어 있으면

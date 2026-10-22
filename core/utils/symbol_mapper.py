@@ -53,12 +53,21 @@ _RUNTIME_CACHE: Dict[str, str] = dict(_STATIC_REUTERS_MAP)
 _INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
+_KRX_SHORT_CODE_RE = re.compile(r"^[0-9][A-Z0-9]{5}$", re.IGNORECASE)
+
+
 def is_overseas_symbol(symbol: str) -> bool:
-    """국내 6자리 숫자 종목코드(예: 005930)가 아닌 영문 티커인지 판정."""
+    """국내 단축 종목코드(숫자로 시작하는 6자리 영숫자, 예: 005930, 0193M0, 0040X0)가 아닌 해외 티커인지 판정."""
     if not symbol:
         return False
-    s = symbol.strip()
-    return not (len(s) == 6 and s.isdigit())
+    s = symbol.strip().upper()
+    # 1. KRX 단축코드 (숫자로 시작하는 6자리 영숫자: 보통주, 우선주, 채권형/액티브 ETF 등)
+    if _KRX_SHORT_CODE_RE.match(s):
+        return False
+    # 2. 거래소 접미사가 붙은 국내 코드 (005930.KS, 035720.KQ 등)
+    if s.endswith(".KS") or s.endswith(".KQ"):
+        return False
+    return True
 
 
 def ticker_to_reuters_code(ticker: str, exchange: Optional[str] = None) -> str:

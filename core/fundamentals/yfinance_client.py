@@ -10,12 +10,17 @@ from typing import Any, Dict, List, Optional
 
 import yfinance as yf
 
+from core.utils.symbol_mapper import is_overseas_symbol
+
 logger = logging.getLogger(__name__)
 
 
 def fetch_analyst_targets(ticker: str) -> Dict[str, Any]:
     """미국 종목의 월가 목표주가 및 투자의견 컨센서스를 가져온다 (동기 함수)."""
     clean_ticker = ticker.strip().upper()
+    if not is_overseas_symbol(clean_ticker):
+        return {}
+
     try:
         t = yf.Ticker(clean_ticker)
         info = t.info or {}
@@ -46,14 +51,17 @@ def fetch_analyst_targets(ticker: str) -> Dict[str, Any]:
             "pbr": float(price_to_book) if price_to_book is not None else None,
             "source": "yfinance",
         }
-    except Exception:
-        logger.warning(f"yfinance 컨센서스 조회 실패 ({clean_ticker}) - 빈 결과 반환", exc_info=True)
+    except Exception as e:
+        logger.debug(f"yfinance 컨센서스 조회 생략/실패 ({clean_ticker}): {e}")
         return {}
 
 
 def fetch_upgrades_downgrades(ticker: str, max_items: int = 5) -> List[Dict[str, Any]]:
     """최근 투자은행의 투자의견 상향/하향 및 목표가 변동 이력을 가져온다."""
     clean_ticker = ticker.strip().upper()
+    if not is_overseas_symbol(clean_ticker):
+        return []
+
     try:
         t = yf.Ticker(clean_ticker)
         df = getattr(t, "upgrades_downgrades", None)
@@ -84,6 +92,9 @@ def fetch_upgrades_downgrades(ticker: str, max_items: int = 5) -> List[Dict[str,
 def fetch_recent_news_yfinance(ticker: str, max_items: int = 5) -> List[Dict[str, Any]]:
     """yfinance를 통한 종목 뉴스 수집 (폴백용 동기 함수)."""
     clean_ticker = ticker.strip().upper()
+    if not is_overseas_symbol(clean_ticker):
+        return []
+
     try:
         t = yf.Ticker(clean_ticker)
         raw_news = getattr(t, "news", []) or []
@@ -110,7 +121,7 @@ def fetch_recent_news_yfinance(ticker: str, max_items: int = 5) -> List[Dict[str
                 "published_at": published_at,
             })
         return articles
-    except Exception:
-        logger.warning(f"yfinance 뉴스 조회 실패 ({clean_ticker})", exc_info=True)
+    except Exception as e:
+        logger.debug(f"yfinance 뉴스 조회 생략/실패 ({clean_ticker}): {e}")
         return []
 
