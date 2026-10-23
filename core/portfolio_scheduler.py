@@ -26,7 +26,8 @@ from core.kis_client import AsyncKISClient
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
-CHECK_INTERVAL_SEC = 3600  # 거친 폴링 주기 - 실제 트리거는 날짜/임계값 기반이라 자주 볼 필요 없음
+CHECK_INTERVAL_SEC = 60  # 정밀 스케줄링 폴링 주기 (1분) - 정각(09, 12, 15, 21시) 도달 시 즉시 트리거
+REBALANCE_CHECK_INTERVAL_SEC = 3600  # 리밸런스 드리프트/뉴스 감성 검사 주기 (1시간)
 
 
 class PortfolioScheduler:
@@ -63,10 +64,18 @@ class PortfolioScheduler:
         conn = await db.get_connection()
         try:
             await self._maybe_refresh_discovery(conn)
+
+            # 리밸런싱 트리거(드리프트/뉴스) 검사는 1시간(3600초) 간격으로만 실행하여 불필요한 KIS 잔고 조회 방지
+            last_reb_check = await db.get_state(conn, "last_rebalance_trigger_check_at")
+            if last_reb_check is not None and (time.time() - float(last_reb_check)) < REBALANCE_CHECK_INTERVAL_SEC:
+                return
+
             if await db.get_state(conn, "ai_rebalance_scheduler_enabled") != "1":
                 return
             if await self._cooldown_active(conn):
                 return
+
+            await db.set_state(conn, "last_rebalance_trigger_check_at", str(time.time()))
 
             if await self._periodic_due(conn):
                 logger.info("AI 포트폴리오 에이전트: 정기 재검토 트리거")
@@ -113,20 +122,29 @@ class PortfolioScheduler:
                 await db.apply_rebalance_event(conn, event_id, approve=True, decided_by="auto_apply")
 
     async def _maybe_refresh_discovery(self, conn) -> None:
-        """AI 리밸런스 토글과 무관하게 돈다 - 발굴 결과는 대시보드에서 사람이 보는 용도이기도 하다.
-        장 마감 후 하루 1회: 당일 순위/뉴스가 확정된 뒤에 모아야 의미가 있다."""
-        if not settings.DISCOVERY_DYNAMIC_ENABLED:
+        """AI 인사이트 및 종목 발굴을 정기 스케줄(아침 9시, 오후 12시, 오후 3시, 오후 9시 KST)에 맞춰 자동 실행한다."""
+        if not settings.DISCOVERY_DYNAMIC_ENABLED and not settings.INSIGHT_ENABLED:
             return
+
         now_kst = datetime.now(tz=KST)
-        if now_kst.weekday() >= 5 or now_kst.hour < settings.DISCOVERY_REFRESH_HOUR_KST:
+        schedule_hours = getattr(settings, "INSIGHT_SCHEDULE_HOURS_KST", [9, 12, 15, 21])
+        if now_kst.hour not in schedule_hours:
             return
-        raw = await db.get_state(conn, discovery_sources.STATE_REFRESHED_AT)
-        if raw is not None and datetime.fromtimestamp(float(raw), tz=KST).date() == now_kst.date():
+
+        # 당일 해당 시각 슬롯(예: '20261023_09')에 이미 실행되었는지 검사 (동일 슬롯 중복 실행 방지)
+        slot_key = f"{now_kst.strftime('%Y%m%d')}_{now_kst.hour:02d}"
+        last_slot = await db.get_state(conn, "last_insight_schedule_slot")
+        if last_slot == slot_key:
             return
+
+        logger.info(
+            f"AI 인사이트 & 발굴 정기 스케줄러 트리거 ({now_kst.strftime('%Y-%m-%d %H:%M:%S')} KST, 슬롯={slot_key})"
+        )
+        await db.set_state(conn, "last_insight_schedule_slot", slot_key)
         try:
-            await discovery_sources.refresh_dynamic_universe(conn, self.client)
+            await discovery_sources.refresh_dynamic_universe(conn, self.client, trigger_type="SCHEDULED")
         except Exception:
-            logger.exception("동적 종목 발굴 갱신 실패 - 다음 tick에 재시도")
+            logger.exception("AI 인사이트 & 동적 종목 발굴 갱신 실패 - 다음 tick에 재시도")
 
     async def _cooldown_active(self, conn) -> bool:
         raw = await db.get_state(conn, "ai_rebalance_last_decision_at")

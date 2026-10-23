@@ -565,7 +565,7 @@ async def remove_discovery_candidate(symbol: str):
 async def _run_discovery_refresh() -> None:
     conn = await db.get_connection()
     try:
-        await discovery_sources.refresh_dynamic_universe(conn, engine.client)
+        await discovery_sources.refresh_dynamic_universe(conn, engine.client, trigger_type="MANUAL")
     except Exception:
         logger.exception("수동 종목 발굴 갱신 실패")
     finally:
@@ -574,9 +574,9 @@ async def _run_discovery_refresh() -> None:
 
 @app.post("/discovery/refresh")
 async def refresh_discovery():
-    """전종목 마스터 → 발굴 소스 → 후보 갱신 → 점수 재계산을 백그라운드로 시작한다. 모의투자에서는
-    수 분 걸리므로 응답을 기다리지 않는다 - 진행 여부는 GET /discovery/shortlist의 refreshing으로 확인.
-    (평소에는 스케줄러가 장 마감 후 하루 1회 자동으로 돈다)."""
+    """전종목 마스터 → 발굴 소스 → 후보 갱신 → 점수 재계산 및 AI 인사이트 묶음 생성을 백그라운드로 시작한다.
+    모의투자에서는 수 분 걸리므로 응답을 기다리지 않는다 - 진행 여부는 GET /discovery/shortlist의 refreshing으로 확인.
+    (평소에는 스케줄러가 매일 09시, 12시, 15시, 21시 정기적으로 돈다)."""
     global _discovery_refresh_task
     if discovery_sources.is_refreshing():
         raise HTTPException(status_code=409, detail="종목 발굴 갱신이 이미 진행 중")

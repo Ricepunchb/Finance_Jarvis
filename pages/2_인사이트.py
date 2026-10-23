@@ -19,6 +19,7 @@ st.markdown(
 with st.sidebar:
     st.title("💡 AI 인사이트")
     st.caption("증권사 리포트 · 뉴스 · 발굴 묶음 분석")
+    st.caption("⏰ 정기 스케줄: **09:00, 12:00, 15:00, 21:00** (KST)")
     force = st.button("🔄 데이터 새로고침", width="stretch")
     if force:
         clear_cache()
@@ -35,7 +36,7 @@ if not batches:
     st.title("💡 AI 인사이트")
     st.info(
         "아직 생성된 인사이트 묶음이 없습니다.\n\n"
-        "장 마감 후 16시 정기 스케줄러가 돌거나, 'KIS 자동매매' 탭에서 **[🔎 지금 발굴 갱신]**을 누르면 "
+        "정기 스케줄러(매일 09시, 12시, 15시, 21시 KST)가 돌거나, 'KIS 자동매매' 탭에서 **[🔎 지금 발굴 갱신]**을 누르면 "
         "증권사 리포트 본문 수집, 뉴스 헤드라인, 보유종목 감성 분석, 발굴 결과가 하나의 묶음으로 생성됩니다."
     )
     st.stop()

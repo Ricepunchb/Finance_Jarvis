@@ -149,8 +149,9 @@ class Settings(BaseSettings):
     # 관점별 최소 할당 - 한 관점이 숏리스트를 독식하지 않게 먼저 채운 뒤 나머지는 점수순
     DISCOVERY_ANGLE_QUOTA: dict[str, int] = {"value": 3, "early": 3, "momentum": 3, "broker": 2}
 
-    # --- AI 리포트/뉴스 인사이트 묶음 (인사이트 탭) ---
+    # --- AI 리포트/뉴스 인사이트 묶음 및 정기 스케줄링 (인사이트 탭) ---
     INSIGHT_ENABLED: bool = True
+    INSIGHT_SCHEDULE_HOURS_KST: list[int] = [9, 12, 15, 21]  # 아침 9시, 오후 12시, 오후 3시, 오후 9시 KST 정기 실행
     INSIGHT_RETENTION_DAYS: int = 365             # 1년 단위 보관 후 자동 정리
     INSIGHT_REPORT_ANALYZE_MAX_PER_RUN: int = 60  # 1회 갱신에서 본문 수집·분석할 최대 리포트 수 (백로그 상한)
     INSIGHT_REPORT_LLM_BATCH_SIZE: int = 8        # LLM 1회 호출당 리포트 수
