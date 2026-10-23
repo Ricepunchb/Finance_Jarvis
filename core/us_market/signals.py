@@ -85,8 +85,9 @@ def evaluate_us_exit_guard(
 ) -> Optional[Dict[str, Any]]:
     """보유자의 손절 및 트레일링 익절 조건을 평가한다.
 
-    1. 손절: 평단가 대비 -6%(설정값) 도달 시 즉시 발동
-    2. 트레일링 익절: 진입 후 고점(+3% 이상) 대비 하락 시(기본 -5% 또는 ATR 기반) 발동
+    1. 손절: 고정 손절선 대신 ATR(변동성) 기반 동적 손절선 적용 (노이즈에 robust하게 대응).
+       - 기본 손절선(기본 -6%~-8%)과 변동성(2.0x ATR) 중 큰 값을 손절 폭으로 채택 (최대 15% 상한).
+    2. 트레일링 익절: 진입 후 고점(+3% 이상 또는 ATR 배수) 달성 후 고점 대비 ATR 기반 하락 시 발동.
     """
     if not avg_entry_price or avg_entry_price <= 0 or current_price <= 0:
         return None
@@ -94,23 +95,30 @@ def evaluate_us_exit_guard(
     pnl_pct = (current_price - avg_entry_price) / avg_entry_price
     effective_peak = max(peak_price or avg_entry_price, avg_entry_price, current_price)
 
-    # 1. 손절 검사
-    stop_threshold = -abs(settings.STOP_LOSS_PCT)
+    # 1. ATR 변동성 기반 동적 손절 검사 (3번 안: 노이즈에 robust하게 대응)
+    base_stop = abs(settings.STOP_LOSS_PCT)
+    if atr_pct and atr_pct > 0:
+        # 변동성이 큰 종목은 손절 폭을 atr_pct * 2.0까지 유연하게 확장하여 일중 노이즈 털림 방지 (상한 15%)
+        dynamic_stop_pct = min(max(atr_pct * 2.0, base_stop), 0.15)
+        stop_desc = f"변동성 적응 손절 기준 -{dynamic_stop_pct * 100:.1f}% (2.0x ATR)"
+    else:
+        dynamic_stop_pct = base_stop
+        stop_desc = f"손절 기준 -{dynamic_stop_pct * 100:.1f}%"
+
+    stop_threshold = -dynamic_stop_pct
     if pnl_pct <= stop_threshold:
         return {
             "trigger": "STOP_LOSS",
             "pnl_pct": round(pnl_pct * 100, 2),
             "reason": (
                 f"🚨 [손절 경고] 평단가(${avg_entry_price:.2f}) 대비 "
-                f"{pnl_pct * 100:.1f}% 하락 (손절 기준 {stop_threshold * 100:.0f}% 도달)"
+                f"{pnl_pct * 100:.1f}% 하락 ({stop_desc} 도달)"
             ),
         }
 
     # 2. 트레일링 익절 검사
-    # 고점이 평단가보다 일정 수준(+3% 또는 ATR 배수) 이상 상승했었는지 확인
-    arm_pct = settings.TRAILING_ARM_FALLBACK_PCT
+    arm_pct = max(settings.TRAILING_ARM_FALLBACK_PCT, (atr_pct * settings.TRAILING_ARM_ATR_MULT) if atr_pct else 0.0)
     if effective_peak >= avg_entry_price * (1.0 + arm_pct):
-        # 트레일링 폭 결정 (ATR 기반 또는 기본 5%)
         trail_pct = settings.TRAILING_TAKE_PROFIT_PCT
         if atr_pct:
             dynamic_trail = min(max(atr_pct * settings.TRAILING_ATR_MULT, settings.TRAILING_MIN_PCT), settings.TRAILING_MAX_PCT)
@@ -130,6 +138,56 @@ def evaluate_us_exit_guard(
             }
 
     return None
+
+
+def check_buy_confirmation(
+    df_30m: pd.DataFrame,
+    df_daily: pd.DataFrame,
+    intraday_snap: Dict[str, Any],
+    daily_snap: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """30분봉 및 일봉 캔들을 분석하여 거짓 반등(노이즈)에 의한 조기 매수를 차단한다 (4번 안).
+
+    통과 조건:
+    1. 최신 30분봉이 장대 음봉으로 하락 진행 중인 경우 매수 차단.
+    2. 최소한 단기 저점 지지(양봉 마감 또는 Higher Low) 확인.
+    3. 일봉이 20일선 아래에서 역배열 하락 추세일 때는, 30분봉이 20선(SMA20) 위로 올라서거나
+       MACD 히스토그램이 양전환되어야만 매수 확증 인정 (떨어지는 칼날 매수 차단).
+    """
+    if df_30m.empty or len(df_30m) < 3:
+        return True, ""
+
+    last_bar = df_30m.iloc[-1]
+    prev_bar = df_30m.iloc[-2]
+
+    last_close = float(last_bar["close"])
+    last_open = float(last_bar["open"])
+    last_low = float(last_bar["low"])
+    prev_low = float(prev_bar["low"])
+
+    # 1. 음봉 하락 진행 중인 경우 확증 실패
+    if last_close < last_open:
+        candle_body_pct = (last_open - last_close) / last_open
+        if candle_body_pct >= 0.003:  # -0.3% 이상의 음봉 하락 진행
+            return False, "30분봉 음봉 하락 진행 중 (캔들 지지 미확인)"
+
+    # 2. 일봉 중기 추세가 하락 추세인 경우 (일봉 종가 < SMA20)
+    daily_close = daily_snap.get("close")
+    daily_sma20 = daily_snap.get("sma20")
+    if daily_close and daily_sma20 and daily_close < daily_sma20:
+        sma20_30m = intraday_snap.get("sma20")
+        macd_hist_30m = intraday_snap.get("macd_hist")
+        if sma20_30m and last_close < sma20_30m and (macd_hist_30m is None or macd_hist_30m <= 0):
+            return False, "일봉 하락 추세 중 30분봉 SMA20 하회 (역추세 노이즈 경계)"
+
+    # 3. 연속 신저가 갱신 진행 중 (Lower Low 지속 시 하락 파동 진행)
+    if len(df_30m) >= 3:
+        p2_bar = df_30m.iloc[-3]
+        p2_low = float(p2_bar["low"])
+        if last_low < prev_low < p2_low and last_close <= last_open:
+            return False, "연속 저점 이탈 진행 중 (바닥 다지기 미확인)"
+
+    return True, "캔들 지지 및 단기 반등 확증"
 
 
 def compute_us_signals(
@@ -152,13 +210,20 @@ def compute_us_signals(
     intraday_snap = extract_indicator_snapshot(df_30m)
 
     # 3. 밸류에이션 / 월가 컨센서스 시그널
+    # (4번 안 보정: 일봉 중기 추세가 하락세인 경우, 목표가 괴리율에 의한 맹목적 BUY 왜곡 억제)
     valuation_signal = None
     if consensus and consensus.get("target_gap_pct") is not None:
         gap = consensus["target_gap_pct"]
         recomm = (consensus.get("recommendation_key") or "").lower()
+        daily_dir = daily_signal.get("direction", "HOLD")
+
         if gap >= 20.0 or "buy" in recomm:
-            strength = min(1.0, gap / 50.0) if gap > 0 else 0.5
-            valuation_signal = {"direction": "BUY", "strength": max(0.4, strength)}
+            if daily_dir == "SELL":
+                # 일봉 하락 추세 역배열 시 괴리율 매수 바이어스 억제 (HOLD 중립화)
+                valuation_signal = {"direction": "HOLD", "strength": 0.0}
+            else:
+                strength = min(1.0, gap / 50.0) if gap > 0 else 0.5
+                valuation_signal = {"direction": "BUY", "strength": max(0.4, strength)}
         elif gap <= -5.0 or "underperform" in recomm or "sell" in recomm:
             strength = min(1.0, abs(gap) / 20.0)
             valuation_signal = {"direction": "SELL", "strength": max(0.4, strength)}
@@ -176,21 +241,31 @@ def compute_us_signals(
     combined_action = combined.get("direction", "HOLD")
     strength = round(float(combined.get("strength", 0.0)), 2)
 
-    # 5. Exit Guard (손절 / 트레일링 익절) 평가
+    # 5. Exit Guard (손절 / 트레일링 익절) 평가 (3번 안: ATR 변동성 동적 손절)
     avg_price = holding.get("avg_entry_price") if holding else None
     peak_price = holding.get("peak_price") if holding else None
     atr_pct = compute_atr_pct(df_daily, settings.ATR_LENGTH) if not df_daily.empty else None
 
     exit_info = evaluate_us_exit_guard(current_price, avg_price, peak_price, atr_pct)
 
-    # 6. 사용자 친화적 판단 근거 및 권고 행동 문안 작성
+    # 6. 매수 확증 캔들 필터 검사 (4번 안: 노이즈 휩소 및 조기 매수 차단)
+    is_buy_confirmed = True
+    buy_confirm_reason = ""
+    if combined_action == "BUY":
+        is_buy_confirmed, buy_confirm_reason = check_buy_confirmation(
+            df_30m=df_30m,
+            df_daily=df_daily,
+            intraday_snap=intraday_snap,
+            daily_snap=daily_snap,
+        )
+
+    # 7. 사용자 친화적 판단 근거 및 권고 행동 문안 작성
     if exit_info:
         exit_trigger = exit_info["trigger"]
         action_recommendation = exit_info["reason"]
         final_action = "SELL"
     else:
         exit_trigger = "NONE"
-        final_action = combined_action
 
         # 지표 기반 서술형 근거 생성
         intra_dir = intraday_signal.get("direction", "HOLD")
@@ -215,22 +290,30 @@ def compute_us_signals(
 
         if consensus and consensus.get("target_gap_pct") is not None:
             gap = consensus["target_gap_pct"]
-            if gap > 15:
+            if gap > 15 and daily_dir != "SELL":
                 reasons.append(f"월가 목표가 괴리율 +{gap:.1f}%")
 
         reason_text = ", ".join(reasons) if reasons else "단기 및 중기 지표 중립"
 
         if combined_action == "BUY":
-            if strength >= 0.6:
+            if not is_buy_confirmed:
+                # 4번 안: 확증 필터 미통과 시 HOLD 전환 (노이즈 휩소 방지)
+                final_action = "HOLD"
+                action_recommendation = f"🟡 [관망/지지대기] {buy_confirm_reason}. 바닥 확인 전 조기 진입 차단 ({reason_text})"
+            elif strength >= 0.6:
+                final_action = "BUY"
                 action_recommendation = f"🟢 [적극 매수] {reason_text} (시그널 강도 {int(strength*100)}%). 분할 매수 적기"
             else:
+                final_action = "BUY"
                 action_recommendation = f"🟢 [매수 관심] {reason_text} (시그널 강도 {int(strength*100)}%). 지지선 확인 후 접근"
         elif combined_action == "SELL":
+            final_action = "SELL"
             if strength >= 0.6:
                 action_recommendation = f"🔴 [비중 축소/매도] {reason_text} (시그널 강도 {int(strength*100)}%). 차익 실현 고려"
             else:
                 action_recommendation = f"🔴 [분할 매도] {reason_text} (시그널 강도 {int(strength*100)}%). 리스크 관리"
         else:
+            final_action = "HOLD"
             action_recommendation = f"🟡 [관망/보유] {reason_text}. 뚜렷한 진입 신호 대기"
 
     # 보유 포지션 손익률 계산

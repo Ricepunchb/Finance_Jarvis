@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from api.main import app
 from core import db
 from core.us_market.client import get_us_market_status
-from core.us_market.signals import evaluate_us_exit_guard, compute_us_signals, extract_indicator_snapshot
+from core.us_market.signals import (
+    evaluate_us_exit_guard,
+    compute_us_signals,
+    extract_indicator_snapshot,
+    check_buy_confirmation,
+)
 from core.us_market.notifier import format_signal_alert_message
 
 
@@ -46,6 +51,31 @@ def test_us_exit_guard_normal_holding():
     """정상 범위(손절선 미달, 익절 하락 없음)에서는 트리거가 발생하지 않음 검증."""
     res = evaluate_us_exit_guard(current_price=102.0, avg_entry_price=100.0, peak_price=103.0)
     assert res is None
+
+
+def test_us_exit_guard_dynamic_atr_stop():
+    """3번 안: 변동성(ATR) 기반 동적 손절선 동작 검증.
+    고변동성 종목(ATR 7%)의 경우 기본 -6%~-8%에 털리지 않고 14%까지 여유를 두는지 검증.
+    """
+    # 1. ATR 7% 종목에서 -8% 일중 하락 발생: 기존 고정 손절선(-6%)이면 손절되지만, 동적 손절(-14%)에서는 생존
+    res1 = evaluate_us_exit_guard(
+        current_price=92.0,
+        avg_entry_price=100.0,
+        peak_price=100.0,
+        atr_pct=0.07,
+    )
+    assert res1 is None  # 손절되지 않고 홀딩 유지
+
+    # 2. 동적 손절 한계치(-14%)를 초과하는 -15% 하락 발생: 손절 트리거 발동
+    res2 = evaluate_us_exit_guard(
+        current_price=85.0,
+        avg_entry_price=100.0,
+        peak_price=100.0,
+        atr_pct=0.07,
+    )
+    assert res2 is not None
+    assert res2["trigger"] == "STOP_LOSS"
+    assert "변동성 적응 손절 기준 -14.0%" in res2["reason"]
 
 
 def _make_dummy_ohlcv(n_bars=70, base_price=100.0, trend=0.3):
@@ -235,4 +265,78 @@ def test_us_watchlist_last_alert_key_persistence():
         await conn.close()
 
     asyncio.run(_run())
+
+
+def test_check_buy_confirmation_filters():
+    """4번 안: 30분봉 음봉 하락 및 일봉 역배열 시 매수 확증 차단 테스트."""
+    dates = pd.date_range("2026-01-01", periods=5, freq="30min")
+
+    # 1. 30분봉 음봉 하락 진행 중인 경우 차단
+    df_bearish_bar = pd.DataFrame({
+        "date": dates,
+        "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "high": [101.0, 102.0, 103.0, 104.0, 104.5],
+        "low": [99.0, 100.0, 101.0, 102.0, 100.0],
+        "close": [100.5, 101.5, 102.5, 103.5, 101.0],  # open 104.0 -> close 101.0 (장대 음봉)
+        "volume": [1000.0] * 5,
+    })
+    confirmed1, reason1 = check_buy_confirmation(
+        df_30m=df_bearish_bar,
+        df_daily=pd.DataFrame(),
+        intraday_snap={},
+        daily_snap={},
+    )
+    assert confirmed1 is False
+    assert "음봉 하락" in reason1
+
+    # 2. 일봉 하락 추세(close < sma20) 중 30분봉 SMA20 하회 및 MACD 음수 차단
+    df_bullish_bar = pd.DataFrame({
+        "date": dates,
+        "open": [100.0, 100.5, 101.0, 101.5, 102.0],
+        "high": [101.0, 101.5, 102.0, 102.5, 103.5],
+        "low": [99.5, 100.0, 100.5, 101.0, 101.8],
+        "close": [100.5, 101.0, 101.5, 102.0, 103.0],  # 양봉
+        "volume": [1000.0] * 5,
+    })
+    confirmed2, reason2 = check_buy_confirmation(
+        df_30m=df_bullish_bar,
+        df_daily=pd.DataFrame(),
+        intraday_snap={"sma20": 105.0, "macd_hist": -0.5},
+        daily_snap={"close": 103.0, "sma20": 110.0},
+    )
+    assert confirmed2 is False
+    assert "일봉 하락 추세 중 30분봉 SMA20 하회" in reason2
+
+    # 3. 정상 확증 통과 (양봉 + 지지 확인)
+    confirmed3, reason3 = check_buy_confirmation(
+        df_30m=df_bullish_bar,
+        df_daily=pd.DataFrame(),
+        intraday_snap={"sma20": 101.0, "macd_hist": 0.2},
+        daily_snap={"close": 115.0, "sma20": 110.0},
+    )
+    assert confirmed3 is True
+
+
+def test_compute_us_signals_consensus_bias_and_candle_confirmation():
+    """SPCX 시나리오 검증: 일봉 하락 추세 + 컨센서스 괴리율 +70%일 때
+    맹목적 BUY 왜곡을 억제하고 HOLD(관망/지지대기)로 휩소를 차단하는지 검증.
+    """
+    # 70개 봉의 하락 추세 데이터 생성 (일봉 및 30분봉 모두 하향)
+    df_30m = _make_dummy_ohlcv(70, 150.0, trend=-0.5)
+    df_daily = _make_dummy_ohlcv(70, 150.0, trend=-0.5)
+
+    sig = compute_us_signals(
+        symbol="SPCX",
+        df_30m=df_30m,
+        df_daily=df_daily,
+        current_price=110.0,
+        holding=None,
+        consensus={"target_gap_pct": 77.0, "recommendation_key": "strong_buy"},
+    )
+    # 1. 일봉 하락 추세이므로 목표가 괴리율 +77%에 의한 맹목적 BUY가 HOLD로 억제됨
+    assert sig["valuation_signal"]["direction"] == "HOLD"
+    # 2. 결과적으로 시그널이 섣부른 적극매수로 왜곡되지 않고 HOLD 또는 SELL로 방어됨
+    assert sig["combined_action"] in ("HOLD", "SELL")
+    assert sig["combined_action"] != "BUY"
+
 
