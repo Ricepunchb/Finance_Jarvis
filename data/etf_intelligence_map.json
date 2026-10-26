@@ -71,79 +71,129 @@
   },
   "OZEM": {
     "type": "THEMATIC",
-    "anchors": ["LLY", "NVO"],
+    "anchors": [
+      "LLY",
+      "NVO"
+    ],
     "theme": "비만치료제/GLP-1",
     "name": "Roundhill GLP-1 & Weight Loss ETF"
   },
   "SMH": {
     "type": "THEMATIC",
-    "anchors": ["NVDA", "TSM", "AVGO"],
+    "anchors": [
+      "NVDA",
+      "TSM",
+      "AVGO"
+    ],
     "theme": "반도체/AI하드웨어",
     "name": "VanEck Semiconductor ETF"
   },
   "SOXX": {
     "type": "THEMATIC",
-    "anchors": ["NVDA", "AVGO", "AMD"],
+    "anchors": [
+      "NVDA",
+      "AVGO",
+      "AMD"
+    ],
     "theme": "필라델피아반도체",
     "name": "iShares Semiconductor ETF"
   },
   "SOXL": {
     "type": "THEMATIC",
-    "anchors": ["NVDA", "AVGO", "AMD"],
+    "anchors": [
+      "NVDA",
+      "AVGO",
+      "AMD"
+    ],
     "theme": "필라델피아반도체3X",
     "name": "Direxion Daily Semiconductor Bull 3X Shares"
   },
   "XLE": {
     "type": "THEMATIC",
-    "anchors": ["XOM", "CVX"],
+    "anchors": [
+      "XOM",
+      "CVX"
+    ],
     "theme": "에너지/원유",
     "name": "Energy Select Sector SPDR"
   },
   "XLK": {
     "type": "THEMATIC",
-    "anchors": ["AAPL", "MSFT", "NVDA"],
+    "anchors": [
+      "AAPL",
+      "MSFT",
+      "NVDA"
+    ],
     "theme": "기술/빅테크",
     "name": "Technology Select Sector SPDR"
   },
   "XLU": {
     "type": "THEMATIC",
-    "anchors": ["NEE", "SO"],
+    "anchors": [
+      "NEE",
+      "SO"
+    ],
     "theme": "유틸리티/전력",
     "name": "Utilities Select Sector SPDR"
   },
   "XLV": {
     "type": "THEMATIC",
-    "anchors": ["UNH", "LLY", "JNJ"],
+    "anchors": [
+      "UNH",
+      "LLY",
+      "JNJ"
+    ],
     "theme": "헬스케어/제약",
     "name": "Health Care Select Sector SPDR"
   },
   "XLF": {
     "type": "THEMATIC",
-    "anchors": ["JPM", "BAC"],
+    "anchors": [
+      "JPM",
+      "BAC"
+    ],
     "theme": "금융/은행",
     "name": "Financial Select Sector SPDR"
   },
   "LIT": {
     "type": "THEMATIC",
-    "anchors": ["ALB", "006400"],
+    "anchors": [
+      "ALB",
+      "006400"
+    ],
     "theme": "2차전지/리튬",
     "name": "Global X Lithium & Battery Tech ETF"
   },
   "381180": {
     "type": "THEMATIC",
-    "anchors": ["NVDA", "TSM", "AVGO", "AMD"],
+    "anchors": [
+      "NVDA",
+      "TSM",
+      "AVGO",
+      "AMD"
+    ],
     "theme": "미국필라델피아반도체",
     "name": "TIGER 미국필라델피아반도체나스닥"
   },
   "381170": {
     "type": "THEMATIC",
-    "anchors": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
+    "anchors": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "GOOGL",
+      "AMZN"
+    ],
     "theme": "미국빅테크TOP10",
     "name": "TIGER 미국테크TOP10 INDXX"
   },
   "305720": {
     "type": "THEMATIC",
-    "anchors": ["006400", "373220", "051910"],
+    "anchors": [
+      "006400",
+      "373220",
+      "051910"
+    ],
     "theme": "2차전지산업",
     "name": "KODEX 2차전지산업"
   },
@@ -236,6 +286,16 @@
     "type": "BROAD_INDEX",
     "macro_driven": true,
     "name": "TIGER 미국나스닥100"
+  },
+  "BOTZ": {
+    "type": "THEMATIC",
+    "anchors": [
+      "ISRG",
+      "6954.T",
+      "6861.T"
+    ],
+    "theme": "Technology",
+    "name": "Global X Robotics & Artificial ",
+    "auto_discovered": true
   }
 }
-
