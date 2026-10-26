@@ -290,8 +290,9 @@ def compute_us_signals(
 
         if consensus and consensus.get("target_gap_pct") is not None:
             gap = consensus["target_gap_pct"]
+            prefix = f"기초자산({consensus['underlying']}) " if consensus.get("is_etf_proxy") and consensus.get("underlying") else ""
             if gap > 15 and daily_dir != "SELL":
-                reasons.append(f"월가 목표가 괴리율 +{gap:.1f}%")
+                reasons.append(f"{prefix}월가 목표가 괴리율 +{gap:.1f}%")
 
         reason_text = ", ".join(reasons) if reasons else "단기 및 중기 지표 중립"
 

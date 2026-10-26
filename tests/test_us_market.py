@@ -340,3 +340,42 @@ def test_compute_us_signals_consensus_bias_and_candle_confirmation():
     assert sig["combined_action"] != "BUY"
 
 
+def test_us_consensus_and_news_proxy_mapping(monkeypatch):
+    """TSLW 등 단일 기초자산 ETF가 기초자산(TSLA)의 컨센서스와 뉴스를 프록시 상속하는지 검증."""
+    from unittest.mock import MagicMock
+    from core.us_market.client import _fetch_consensus_and_news_sync
+
+    queried_symbols = []
+
+    class MockTicker:
+        def __init__(self, sym):
+            queried_symbols.append(sym)
+            self.info = {
+                "targetMeanPrice": 420.0,
+                "currentPrice": 350.0,
+                "recommendationKey": "buy",
+                "recommendationMean": 2.0,
+            }
+            self.news = [
+                {
+                    "title": "Tesla Announces Record Deliveries",
+                    "link": "https://example.com/tsla-news",
+                    "publisher": "Reuters",
+                    "providerPublishTime": 1793010000,
+                }
+            ]
+
+    monkeypatch.setattr("yfinance.Ticker", MockTicker)
+
+    res = _fetch_consensus_and_news_sync("TSLW")
+    assert "TSLA" in queried_symbols
+    assert res["symbol"] == "TSLW"
+    assert res["underlying"] == "TSLA"
+    assert res["is_etf_proxy"] is True
+    assert res["target_mean"] == 420.0
+    assert res["target_gap_pct"] == 20.0
+    assert len(res["news"]) == 1
+    assert "Tesla Announces" in res["news"][0]["title"]
+
+
+

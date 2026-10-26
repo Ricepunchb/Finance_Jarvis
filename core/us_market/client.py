@@ -209,10 +209,31 @@ async def get_us_daily_bars(symbol: str, period: str = "3mo") -> pd.DataFrame:
 
 
 def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
-    """월가 컨센서스 목표주가 및 최근 뉴스 수집."""
+    """월가 컨센서스 목표주가 및 최근 뉴스 수집.
+
+    단일 기초자산 ETF(TSLW -> TSLA 등)나 테마 ETF(OZEM -> LLY 등)는 기초자산/앵커 주식의
+    목표가 컨센서스와 뉴스를 프록시 상속합니다.
+    """
     clean_sym = symbol.strip().upper()
     try:
-        t = yf.Ticker(clean_sym)
+        from core.news.etf_mapper import load_etf_map
+        etf_map = load_etf_map()
+        target_sym = clean_sym
+        underlying: Optional[str] = None
+        is_etf_proxy = False
+
+        if clean_sym in etf_map:
+            profile = etf_map[clean_sym]
+            if profile.get("type") == "SINGLE_STOCK" and profile.get("underlying"):
+                target_sym = profile["underlying"].strip().upper()
+                underlying = target_sym
+                is_etf_proxy = True
+            elif profile.get("type") == "THEMATIC" and profile.get("anchors"):
+                target_sym = profile["anchors"][0].strip().upper()
+                underlying = target_sym
+                is_etf_proxy = True
+
+        t = yf.Ticker(target_sym)
         info = t.info or {}
 
         target_mean = info.get("targetMeanPrice")
@@ -226,8 +247,15 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
         if target_mean and current_price and current_price > 0:
             target_gap_pct = round(((target_mean - current_price) / current_price) * 100, 2)
 
-        # 뉴스
+        # 뉴스: yf.Ticker.news 우선 확인 후 빈 리스트면 yf.Search로 안정적 폴백
         raw_news = getattr(t, "news", []) or []
+        if not raw_news:
+            try:
+                search_obj = yf.Search(target_sym, news_count=5)
+                raw_news = getattr(search_obj, "news", []) or []
+            except Exception:
+                pass
+
         articles: List[Dict[str, Any]] = []
         for item in raw_news[:5]:
             content = item.get("content") or item
@@ -253,6 +281,8 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
             "recommendation_key": recomm_key,
             "recommendation_mean": float(recomm_mean) if recomm_mean else None,
             "news": articles,
+            "underlying": underlying,
+            "is_etf_proxy": is_etf_proxy,
         }
     except Exception as e:
         logger.warning(f"yfinance 컨센서스/뉴스 수집 오류 ({clean_sym}): {e}")
@@ -265,6 +295,8 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
             "recommendation_key": "",
             "recommendation_mean": None,
             "news": [],
+            "underlying": None,
+            "is_etf_proxy": False,
         }
 
 
