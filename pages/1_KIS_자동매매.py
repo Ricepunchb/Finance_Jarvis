@@ -364,15 +364,16 @@ with tab_settings:
     a6.metric("종목당 최소 비중", fmt_pct(config["ai_rebalance_min_symbol_weight_pct"]))
     st.caption(
         f"발굴 스크리닝 상위 노출 종목수: {config['discovery_top_n']}개 "
-        f"(점수 {config.get('discovery_min_score', 0.6):g} 이상만)"
+        f"(점수 {config.get('discovery_min_score', 0.4):g} 이상만)"
     )
 
-    a7, a8 = st.columns(2)
+    a7, a8, a9 = st.columns(3)
     a7.metric("에이전트 자체 결정 쿨다운", f"{config['ai_rebalance_min_interval_sec'] // 3600}시간")
     a8.metric("정기 재검토 주기", f"{config['ai_rebalance_periodic_interval_days']}일")
-    a9, a10 = st.columns(2)
-    a9.metric("드리프트 트리거 버퍼", fmt_pct(config["ai_rebalance_drift_trigger_buffer_pct"]))
-    a10.metric("뉴스 트리거 강도 임계치", config["ai_rebalance_news_trigger_strength"])
+    a9.metric("발굴 트리거 점수 임계치", f"{config.get('ai_rebalance_discovery_trigger_score', 0.45):g}")
+    a10, a11 = st.columns(2)
+    a10.metric("드리프트 트리거 버퍼", fmt_pct(config["ai_rebalance_drift_trigger_buffer_pct"]))
+    a11.metric("뉴스 트리거 강도 임계치", config["ai_rebalance_news_trigger_strength"])
     st.caption(f"무위험수익률(연, 샤프/소티노 계산용): {fmt_pct(config['risk_free_rate_annual'])}")
 
 # =========================================================================
@@ -600,7 +601,7 @@ with tab_ai:
     st.divider()
     st.markdown("#### ⏱️ 자동 트리거 스케줄러 & 자율 반영 (Auto-Apply)")
     st.caption(
-        "스케줄러는 정기(30일)/드리프트(±10%)/뉴스이벤트를 감지해 자동으로 리밸런싱을 제안합니다. "
+        "스케줄러는 정기(7일)/고득점 발굴/드리프트(±10%)/뉴스이벤트를 감지해 자동으로 리밸런싱을 제안합니다. "
         "**Auto-Apply**가 켜져 있으면 안전 가드레일을 통과한 제안을 사람 승인 대기 없이 즉시 포트폴리오에 자동 반영(자율 매매)합니다."
     )
     scheduler_status = api_get("/ai-rebalance/scheduler")
@@ -613,6 +614,7 @@ with tab_ai:
         sc4.metric("마지막 정기실행", fmt_kst(scheduler_status["last_scheduled_run_at"]))
         st.caption(
             f"정기 재검토 주기: {scheduler_status['periodic_interval_days']}일 · "
+            f"발굴 트리거 임계치: {scheduler_status.get('discovery_trigger_score', 0.45):g}점 · "
             f"에이전트 자체 결정 쿨다운: {scheduler_status['min_interval_sec'] // 3600}시간"
         )
         sb1, sb2, sb3, sb4 = st.columns(4)
@@ -734,7 +736,7 @@ with tab_ai:
         st.dataframe(sdf, width='stretch', hide_index=True)
     else:
         st.caption(
-            f"점수 {config.get('discovery_min_score', 0.6):g} 이상인 발굴 결과가 없습니다 - "
+            f"점수 {config.get('discovery_min_score', 0.4):g} 이상인 발굴 결과가 없습니다 - "
             "'지금 발굴 갱신'을 눌러보세요."
         )
 

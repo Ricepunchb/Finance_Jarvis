@@ -199,6 +199,7 @@ async def get_config():
         "ai_rebalance_periodic_interval_days": settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS,
         "ai_rebalance_drift_trigger_buffer_pct": settings.AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT,
         "ai_rebalance_news_trigger_strength": settings.AI_REBALANCE_NEWS_TRIGGER_STRENGTH,
+        "ai_rebalance_discovery_trigger_score": settings.AI_REBALANCE_DISCOVERY_TRIGGER_SCORE,
         "risk_free_rate_annual": settings.RISK_FREE_RATE_ANNUAL,
         "winddown_max_days": settings.WINDDOWN_MAX_DAYS,
     }
@@ -628,6 +629,7 @@ async def get_scheduler_status():
         "last_scheduled_run_at": float(last_scheduled_run_at) if last_scheduled_run_at else None,
         "periodic_interval_days": settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS,
         "min_interval_sec": settings.AI_REBALANCE_MIN_INTERVAL_SEC,
+        "discovery_trigger_score": settings.AI_REBALANCE_DISCOVERY_TRIGGER_SCORE,
     }
 
 

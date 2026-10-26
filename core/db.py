@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS news_cache (
 -- target_weights 행들이 이 이벤트를 rebalance_event_id로 역참조해 어느 제안에서 나왔는지 추적한다.
 CREATE TABLE IF NOT EXISTS rebalance_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trigger_type TEXT NOT NULL,        -- 'MANUAL' | 'SCHEDULED' | 'DRIFT' | 'NEWS_EVENT' | 'ROLLBACK'
+    trigger_type TEXT NOT NULL,        -- 'MANUAL' | 'SCHEDULED' | 'DISCOVERY' | 'DRIFT' | 'NEWS_EVENT' | 'ROLLBACK'
     trigger_detail TEXT,
     autonomy_mode TEXT NOT NULL,       -- 'approval_gated' | 'full_auto' (실행 시점 스냅샷)
     status TEXT NOT NULL,              -- RUNNING | PROPOSED | APPROVED | REJECTED | AUTO_APPLIED | BLOCKED | FAILED | SKIPPED

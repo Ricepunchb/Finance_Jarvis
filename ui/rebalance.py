@@ -14,7 +14,7 @@ STATUS_BADGE = {
     "APPROVED": "🟢 승인", "AUTO_APPLIED": "🟢 자동적용", "PROPOSED": "🟡 제안(대기)", "REJECTED": "🔴 거부",
     "BLOCKED": "⛔ 차단", "FAILED": "⚠️ 실패", "SKIPPED": "⚪ 건너뜀", "RUNNING": "⏳ 실행중",
 }
-TRIGGER_LABEL = {"MANUAL": "수동", "SCHEDULED": "정기", "DRIFT": "드리프트", "NEWS_EVENT": "뉴스", "ROLLBACK": "롤백"}
+TRIGGER_LABEL = {"MANUAL": "수동", "SCHEDULED": "정기", "DISCOVERY": "발굴", "DRIFT": "드리프트", "NEWS_EVENT": "뉴스", "ROLLBACK": "롤백"}
 MAX_STACK = 8  # 카테고리 슬롯 상한. 넘으면 나머지는 '기타'
 
 

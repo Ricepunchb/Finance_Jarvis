@@ -233,4 +233,4 @@ def test_macro_rotation_tags_in_discovery():
     assert "KR_SAFE_HAVEN" in discovery.MACRO_ROTATION_TAGS
     assert "KR_DIVIDEND_FINANCE" in discovery.MACRO_ROTATION_TAGS
     assert "KR_GLOBAL_ETF" in discovery.MACRO_ROTATION_TAGS
-    assert settings.DISCOVERY_MIN_SCORE <= 0.30
+    assert settings.DISCOVERY_MIN_SCORE <= 0.40

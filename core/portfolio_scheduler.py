@@ -13,13 +13,14 @@ AsyncKISClient(engine.client)를 그대로 받아쓴다 — KIS는 토큰을 새
 """
 import ast
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from core import db, discovery_sources, kis_domestic, portfolio_agent, rebalancer
+from core import db, discovery, discovery_sources, kis_domestic, portfolio_agent, proxy_mapping, rebalancer
 from core.config import settings
 from core.kis_client import AsyncKISClient
 
@@ -28,6 +29,7 @@ KST = ZoneInfo("Asia/Seoul")
 
 CHECK_INTERVAL_SEC = 60  # 정밀 스케줄링 폴링 주기 (1분) - 정각(09, 12, 15, 21시) 도달 시 즉시 트리거
 REBALANCE_CHECK_INTERVAL_SEC = 3600  # 리밸런스 드리프트/뉴스 감성 검사 주기 (1시간)
+STATE_DISCOVERY_TRIGGERED = "ai_rebalance_discovery_triggered_json"
 
 
 class PortfolioScheduler:
@@ -63,11 +65,16 @@ class PortfolioScheduler:
     async def _tick(self) -> None:
         conn = await db.get_connection()
         try:
-            await self._maybe_refresh_discovery(conn)
+            refreshed = await self._maybe_refresh_discovery(conn)
 
-            # 리밸런싱 트리거(드리프트/뉴스) 검사는 1시간(3600초) 간격으로만 실행하여 불필요한 KIS 잔고 조회 방지
+            # 리밸런싱 트리거(드리프트/뉴스/발굴) 검사는 1시간(3600초) 간격으로만 실행하여 불필요한 KIS 잔고 조회 방지.
+            # 단, 방금 발굴 갱신이 실행된 직후(refreshed=True)에는 신규 고득점 발굴 종목을 즉시 평가하도록 스로틀을 건너뛴다.
             last_reb_check = await db.get_state(conn, "last_rebalance_trigger_check_at")
-            if last_reb_check is not None and (time.time() - float(last_reb_check)) < REBALANCE_CHECK_INTERVAL_SEC:
+            if (
+                not refreshed
+                and last_reb_check is not None
+                and (time.time() - float(last_reb_check)) < REBALANCE_CHECK_INTERVAL_SEC
+            ):
                 return
 
             if await db.get_state(conn, "ai_rebalance_scheduler_enabled") != "1":
@@ -82,6 +89,16 @@ class PortfolioScheduler:
                 res = await portfolio_agent.propose_rebalance(
                     conn, client=self.client, trigger_type="SCHEDULED",
                     trigger_detail=f"{settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS}일 정기 재검토",
+                )
+                await self._maybe_auto_apply(conn, res)
+                await self._mark_decision(conn)
+                return
+
+            discovery_detail = await self._discovery_trigger_detail(conn)
+            if discovery_detail:
+                logger.info(f"AI 포트폴리오 에이전트: 발굴 트리거 - {discovery_detail}")
+                res = await portfolio_agent.propose_rebalance(
+                    conn, client=self.client, trigger_type="DISCOVERY", trigger_detail=discovery_detail,
                 )
                 await self._maybe_auto_apply(conn, res)
                 await self._mark_decision(conn)
@@ -121,21 +138,21 @@ class PortfolioScheduler:
                 logger.info(f"AI 포트폴리오 에이전트: auto_apply 활성 — 이벤트 #{event_id} 자동 승인 및 포트폴리오 반영")
                 await db.apply_rebalance_event(conn, event_id, approve=True, decided_by="auto_apply")
 
-    async def _maybe_refresh_discovery(self, conn) -> None:
+    async def _maybe_refresh_discovery(self, conn) -> bool:
         """AI 인사이트 및 종목 발굴을 정기 스케줄(아침 9시, 오후 12시, 오후 3시, 오후 9시 KST)에 맞춰 자동 실행한다."""
         if not settings.DISCOVERY_DYNAMIC_ENABLED and not settings.INSIGHT_ENABLED:
-            return
+            return False
 
         now_kst = datetime.now(tz=KST)
         schedule_hours = getattr(settings, "INSIGHT_SCHEDULE_HOURS_KST", [9, 12, 15, 21])
         if now_kst.hour not in schedule_hours:
-            return
+            return False
 
         # 당일 해당 시각 슬롯(예: '20261023_09')에 이미 실행되었는지 검사 (동일 슬롯 중복 실행 방지)
         slot_key = f"{now_kst.strftime('%Y%m%d')}_{now_kst.hour:02d}"
         last_slot = await db.get_state(conn, "last_insight_schedule_slot")
         if last_slot == slot_key:
-            return
+            return False
 
         logger.info(
             f"AI 인사이트 & 발굴 정기 스케줄러 트리거 ({now_kst.strftime('%Y-%m-%d %H:%M:%S')} KST, 슬롯={slot_key})"
@@ -143,8 +160,10 @@ class PortfolioScheduler:
         await db.set_state(conn, "last_insight_schedule_slot", slot_key)
         try:
             await discovery_sources.refresh_dynamic_universe(conn, self.client, trigger_type="SCHEDULED")
+            return True
         except Exception:
             logger.exception("AI 인사이트 & 동적 종목 발굴 갱신 실패 - 다음 tick에 재시도")
+            return False
 
     async def _cooldown_active(self, conn) -> bool:
         raw = await db.get_state(conn, "ai_rebalance_last_decision_at")
@@ -165,6 +184,74 @@ class PortfolioScheduler:
         if due:
             await db.set_state(conn, "ai_rebalance_last_scheduled_run_at", str(time.time()))
         return due
+
+    async def _discovery_trigger_detail(self, conn) -> Optional[str]:
+        """신선한 발굴 캐시에서 아직 보유하지 않았고 최근 트리거된 적 없는 고득점(>= AI_REBALANCE_DISCOVERY_TRIGGER_SCORE)
+        우량 후보가 출현했을 때 정기 주기를 기다리지 않고 즉시 리밸런싱을 트리거한다 (KIS 호출 없음)."""
+        active_weights = await db.get_active_target_weights(conn)
+        if not active_weights:
+            return None
+
+        cache = await discovery.load_scored_cache(conn)
+        if not cache:
+            return None
+        now = time.time()
+        scored_at = float(cache.get("scored_at") or 0.0)
+        if (now - scored_at) >= settings.DISCOVERY_SHORTLIST_TTL_HOURS * 3600:
+            return None
+
+        enabled = {c["symbol"] for c in await db.list_candidate_universe(conn)}
+        recently_removed = set(
+            await db.list_recently_removed_symbols(conn, settings.AI_REBALANCE_REMOVED_COOLDOWN_DAYS)
+        )
+        held_or_excluded = set(active_weights.keys()) | recently_removed
+        proxy_enabled = await portfolio_agent.get_effective_proxy_trading(conn)
+
+        expiry_sec = settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS * 86400
+        raw_trig = await db.get_state(conn, STATE_DISCOVERY_TRIGGERED)
+        try:
+            triggered_map = json.loads(raw_trig) if raw_trig else {}
+        except Exception:
+            triggered_map = {}
+        triggered_map = {
+            s: float(ts) for s, ts in triggered_map.items() if (now - float(ts)) < expiry_sec
+        }
+
+        min_score = settings.AI_REBALANCE_DISCOVERY_TRIGGER_SCORE
+        qualifying = []
+        for e in cache.get("entries", []):
+            sym = e.get("symbol")
+            if not sym or sym not in enabled or sym in held_or_excluded or sym in triggered_map:
+                continue
+            if proxy_enabled:
+                proxy_info = proxy_mapping.get_proxy_etf(sym)
+                if proxy_info and (
+                    proxy_info["proxy_symbol"] in held_or_excluded
+                    or proxy_info["proxy_symbol"] in triggered_map
+                ):
+                    continue
+            score = float(e.get("score") or 0.0)
+            if score >= min_score:
+                qualifying.append(e)
+
+        if not qualifying:
+            return None
+
+        qualifying.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        for e in qualifying:
+            sym = e["symbol"]
+            triggered_map[sym] = now
+            if proxy_enabled:
+                proxy_info = proxy_mapping.get_proxy_etf(sym)
+                if proxy_info:
+                    triggered_map[proxy_info["proxy_symbol"]] = now
+
+        await db.set_state(conn, STATE_DISCOVERY_TRIGGERED, json.dumps(triggered_map, ensure_ascii=False))
+
+        top = qualifying[0]
+        angle_str = top.get("angle_label") or top.get("angle") or "복합"
+        extra = f" 외 {len(qualifying) - 1}건" if len(qualifying) > 1 else ""
+        return f"고득점 발굴 포착: {top['symbol']}({top.get('name', '')}) 점수 {float(top['score']):.2f} [{angle_str}]{extra}"
 
     async def _drift_trigger_detail(self, conn) -> Optional[str]:
         """국내 종목만 검사한다 - 해외는 환율까지 조회해야 해 이 저빈도 체크의 범위를

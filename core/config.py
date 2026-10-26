@@ -132,7 +132,7 @@ class Settings(BaseSettings):
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지
-    DISCOVERY_MIN_SCORE: float = 0.25  # 복합점수가 이 값 미만인 후보는 숏리스트/오늘의 발굴에서 제외 (단일/복합 관점 상위 후보 및 ETF 진입 보장)
+    DISCOVERY_MIN_SCORE: float = 0.40  # 복합점수가 이 값 미만인 후보는 숏리스트/오늘의 발굴에서 제외 (상위 ~10% 고확신 복합 팩터 후보 진입)
 
     # --- 동적 종목 발굴 (전종목 마스터 + 모멘텀/증권사/뉴스/저평가/테마후발 소스) ---
     DISCOVERY_DYNAMIC_ENABLED: bool = True
@@ -165,9 +165,10 @@ class Settings(BaseSettings):
 
     # --- AI 포트폴리오 에이전트 (Phase 5.2: 스케줄러 트리거) ---
     AI_REBALANCE_MIN_INTERVAL_SEC: int = 86400            # 에이전트 자체 의사결정 쿨다운 (주문 쿨다운과 별개)
-    AI_REBALANCE_PERIODIC_INTERVAL_DAYS: int = 30         # 정기 재검토 주기
+    AI_REBALANCE_PERIODIC_INTERVAL_DAYS: int = 7          # 정기 재검토 주기 (주간 단위 하트비트)
     AI_REBALANCE_DRIFT_TRIGGER_BUFFER_PCT: float = 0.05   # REBALANCE_BAND_PCT를 넘어 이만큼 더 벗어나야 트리거
     AI_REBALANCE_NEWS_TRIGGER_STRENGTH: float = 0.7       # 보유종목 뉴스감성 강도가 이 이상이면 트리거
+    AI_REBALANCE_DISCOVERY_TRIGGER_SCORE: float = 0.45    # 미보유 고득점 발굴 종목 출현 시 즉시 리밸런싱 트리거 임계치
     AI_REBALANCE_AUTO_APPLY: bool = False                 # True면 가드레일을 통과한 제안을 사람 승인 대기 없이 자동 반영
 
     # --- 백테스팅 기본값 ---
