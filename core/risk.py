@@ -81,14 +81,27 @@ class RiskManager:
     # --- 쿨다운 ---
 
     async def is_cooldown_active(self, symbol: str) -> bool:
+        now = time.time()
         cur = await self.conn.execute(
             "SELECT created_at FROM order_intents WHERE symbol = ? ORDER BY created_at DESC LIMIT 1",
             (symbol,),
         )
         row = await cur.fetchone()
-        if row is None:
-            return False
-        return (time.time() - row["created_at"]) < settings.ORDER_COOLDOWN_SEC
+        if row is not None and (now - row["created_at"]) < settings.ORDER_COOLDOWN_SEC:
+            return True
+
+        # 손절(STOP_LOSS) 발생 종목은 역추세 연속 손절(Whipsaw) 방지를 위해 STOP_LOSS_COOLDOWN_DAYS 동안 재진입 차단
+        if settings.STOP_LOSS_COOLDOWN_DAYS > 0:
+            sl_cutoff = now - (settings.STOP_LOSS_COOLDOWN_DAYS * 86400)
+            sl_cur = await self.conn.execute(
+                "SELECT 1 FROM order_intents WHERE symbol = ? AND reason = 'STOP_LOSS' "
+                "AND created_at >= ? AND status NOT IN ('REJECTED', 'CANCELLED', 'NOT_SUBMITTED') LIMIT 1",
+                (symbol, sl_cutoff),
+            )
+            if await sl_cur.fetchone() is not None:
+                return True
+
+        return False
 
     # --- 분할 온보딩 매수 일일 예산 ---
 

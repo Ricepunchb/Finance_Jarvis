@@ -119,35 +119,35 @@
     "description": "이튼 등 데이터센터 전력 분배 핵심 인프라"
   },
   "KO": {
-    "proxy_symbol": "441640",
+    "proxy_symbol": "458730",
     "proxy_name": "TIGER 미국배당다우존스",
     "type": "DIVIDEND",
     "beta_estimate": 0.80,
     "description": "코카콜라 등 미국 대표 배당성장 및 경기방어주 포트폴리오"
   },
   "PG": {
-    "proxy_symbol": "441640",
+    "proxy_symbol": "458730",
     "proxy_name": "TIGER 미국배당다우존스",
     "type": "DIVIDEND",
     "beta_estimate": 0.80,
     "description": "P&G 등 글로벌 필수소비재/경기방어주 포트폴리오"
   },
   "JNJ": {
-    "proxy_symbol": "441640",
+    "proxy_symbol": "458730",
     "proxy_name": "TIGER 미국배당다우존스",
     "type": "DIVIDEND",
     "beta_estimate": 0.80,
     "description": "존슨앤드존슨 등 헬스케어 방어주 포트폴리오"
   },
   "NEE": {
-    "proxy_symbol": "441640",
+    "proxy_symbol": "458730",
     "proxy_name": "TIGER 미국배당다우존스",
     "type": "DIVIDEND",
     "beta_estimate": 0.80,
     "description": "넥스트에라 등 재생에너지 및 유틸리티 방어주"
   },
   "XLU": {
-    "proxy_symbol": "441640",
+    "proxy_symbol": "458730",
     "proxy_name": "TIGER 미국배당다우존스",
     "type": "DIVIDEND",
     "beta_estimate": 0.80,

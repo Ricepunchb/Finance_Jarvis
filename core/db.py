@@ -1073,6 +1073,16 @@ async def update_position_peak(conn: aiosqlite.Connection, symbol: str, current_
     await conn.commit()
 
 
+async def reset_position_peak(conn: aiosqlite.Connection, symbol: str, current_price: float) -> None:
+    """상승 추세 50% 분할 트레일링 익절(Scale-Out) 직후 잔여 물량이 다음 사이클에 즉시
+    연쇄 청산되지 않도록 기준 고점을 현재가로 재설정한다."""
+    await conn.execute(
+        "UPDATE positions SET peak_price_since_entry = ? WHERE symbol = ? AND qty > 0",
+        (current_price, symbol),
+    )
+    await conn.commit()
+
+
 async def get_position(conn: aiosqlite.Connection, symbol: str) -> Optional[Dict[str, Any]]:
     cur = await conn.execute("SELECT * FROM positions WHERE symbol = ?", (symbol,))
     row = await cur.fetchone()

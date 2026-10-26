@@ -86,7 +86,14 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     - 횡보/중립: 기존의 부드러운 연속값 평균회귀 점수 유지.
     """
     if len(df) < MIN_BARS_REQUIRED:
-        return {"direction": "HOLD", "strength": 0.0, "detail": "데이터 부족"}
+        return {
+            "direction": "HOLD",
+            "strength": 0.0,
+            "detail": "데이터 부족",
+            "is_uptrend": False,
+            "is_downtrend": False,
+            "above_sma20": True,
+        }
 
     work = df.copy()
     work.ta.rsi(length=14, append=True)
@@ -95,8 +102,9 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
     last = work.iloc[-1]
     close = float(last["close"])
 
+    sma20 = float(work["close"].rolling(20).mean().iloc[-1]) if len(work) >= 20 else close
+    above_sma20 = (close >= sma20)
     if len(work) >= 60:
-        sma20 = float(work["close"].rolling(20).mean().iloc[-1])
         sma60 = float(work["close"].rolling(60).mean().iloc[-1])
         is_uptrend = (sma20 >= sma60)
         is_downtrend = (sma20 < sma60) and (close < sma20)
@@ -180,7 +188,14 @@ def compute_technical_signal(df: pd.DataFrame) -> Dict[str, Any]:
 
     score = sum(votes) / len(votes) if votes else 0.0
     direction = "BUY" if score > 0.15 else "SELL" if score < -0.15 else "HOLD"
-    return {"direction": direction, "strength": min(1.0, abs(score)), "detail": f"score={score:.2f}"}
+    return {
+        "direction": direction,
+        "strength": min(1.0, abs(score)),
+        "detail": f"score={score:.2f}",
+        "is_uptrend": is_uptrend,
+        "is_downtrend": is_downtrend,
+        "above_sma20": above_sma20,
+    }
 
 
 def compute_technical_detail(df: pd.DataFrame) -> Dict[str, Any]:

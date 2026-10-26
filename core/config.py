@@ -132,7 +132,7 @@ class Settings(BaseSettings):
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---
     DISCOVERY_TOP_N: int = 15  # candidate_universe 중 스크리닝 상위 몇 개까지 LLM에 보여줄지
-    DISCOVERY_MIN_SCORE: float = 0.6  # 복합점수가 이 값 미만인 후보는 숏리스트/오늘의 발굴에서 제외
+    DISCOVERY_MIN_SCORE: float = 0.25  # 복합점수가 이 값 미만인 후보는 숏리스트/오늘의 발굴에서 제외 (단일/복합 관점 상위 후보 및 ETF 진입 보장)
 
     # --- 동적 종목 발굴 (전종목 마스터 + 모멘텀/증권사/뉴스/저평가/테마후발 소스) ---
     DISCOVERY_DYNAMIC_ENABLED: bool = True

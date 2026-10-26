@@ -509,27 +509,36 @@ class TradingEngine:
         # 위한 게 아니다 — 킬스위치와 같은 급의 예외로 취급한다.
         today = datetime.now(tz=KST)
         df = None
+        tech_signal = None
         if qty > 0:
             avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
             await db.update_position_peak(self.conn, symbol, price)
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
             atr_pct = None
+            is_uptrend = False
             try:  # 일봉은 아래 시그널 계산에서도 쓰므로 재사용한다. 실패해도 손절/익절 평가는 폴백값으로 계속.
                 df = await self._load_daily_df(symbol, today)
                 atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
+                tech_signal = indicators.compute_technical_signal(df)
+                is_uptrend = bool(tech_signal.get("is_uptrend", False))
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
-            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price, atr_pct)
+            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price, atr_pct, is_uptrend=is_uptrend)
             context["exit_check"] = {
                 "avg_price": avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
+                "is_uptrend": is_uptrend,
                 "fired": exit_decision.reason if exit_decision else None,
+                "sell_ratio": exit_decision.sell_ratio if exit_decision else None,
             }
             if exit_decision is not None:
+                sell_qty = qty if exit_decision.sell_ratio >= 1.0 else max(1.0, float(int(qty * exit_decision.sell_ratio)))
                 await self._submit_exit_order(
-                    cycle_id, symbol, target_weight, current_weight, qty, price, avg_price,
+                    cycle_id, symbol, target_weight, current_weight, sell_qty, price, avg_price,
                     exit_decision.reason, context,
                 )
+                if sell_qty < qty:
+                    await db.reset_position_peak(self.conn, symbol, price)
                 return False
 
         if not ws_ok:
@@ -545,7 +554,8 @@ class TradingEngine:
 
         if df is None:
             df = await self._load_daily_df(symbol, today)
-        tech_signal = indicators.compute_technical_signal(df)
+        if tech_signal is None:
+            tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
         intraday_signal = await intraday.get_intraday_signal_domestic(
@@ -758,6 +768,7 @@ class TradingEngine:
         # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
         # 체결확률을 확보한다. 가격/평단가는 원화(KRW) 기준으로 일관되게 비교한다.
         df = None
+        tech_signal = None
         if qty > 0:
             avg_price_foreign = float(holding.get("avg_unpr3") or 0) if holding else 0.0
             avg_price_krw = avg_price_foreign * bass_exrt
@@ -765,22 +776,32 @@ class TradingEngine:
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
             atr_pct = None
+            is_uptrend = False
             try:  # 일봉은 아래 시그널 계산에서도 재사용. 실패해도 폴백값으로 청산 평가는 계속한다.
                 chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
                 df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
                 atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
+                tech_signal = indicators.compute_technical_signal(df)
+                is_uptrend = bool(tech_signal.get("is_uptrend", False))
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
-            exit_decision = exit_guard.evaluate_exit(avg_price_krw, peak_price, price_krw, atr_pct)
+            exit_decision = exit_guard.evaluate_exit(
+                avg_price_krw, peak_price, price_krw, atr_pct, is_uptrend=is_uptrend
+            )
             context["exit_check"] = {
                 "avg_price_krw": avg_price_krw, "peak_price_krw": peak_price, "atr_pct": atr_pct,
+                "is_uptrend": is_uptrend,
                 "fired": exit_decision.reason if exit_decision else None,
+                "sell_ratio": exit_decision.sell_ratio if exit_decision else None,
             }
             if exit_decision is not None:
+                sell_qty = qty if exit_decision.sell_ratio >= 1.0 else max(1.0, float(int(qty * exit_decision.sell_ratio)))
                 await self._submit_exit_order_overseas(
-                    cycle_id, symbol, exchange, target_weight, current_weight, qty,
+                    cycle_id, symbol, exchange, target_weight, current_weight, sell_qty,
                     price_foreign, price_krw, avg_price_krw, exit_decision.reason, context,
                 )
+                if sell_qty < qty:
+                    await db.reset_position_peak(self.conn, symbol, price_krw)
                 return
 
         if not ws_ok:
@@ -797,7 +818,8 @@ class TradingEngine:
         if df is None:
             chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
             df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
-        tech_signal = indicators.compute_technical_signal(df)
+        if tech_signal is None:
+            tech_signal = indicators.compute_technical_signal(df)
         context["tech_signal"] = tech_signal
 
         intraday_signal = await intraday.get_intraday_signal_overseas(

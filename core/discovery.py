@@ -298,6 +298,21 @@ async def load_scored_cache(conn: aiosqlite.Connection) -> Optional[Dict[str, An
     return json.loads(raw) if raw else None
 
 
+MACRO_ROTATION_TAGS = {
+    "KR_DEFENSE",
+    "KR_ENERGY_COMMODITY",
+    "KR_SAFE_HAVEN",
+    "KR_DIVIDEND_FINANCE",
+    "KR_GLOBAL_ETF",
+    "US_INDEX",
+    "US_COMMODITY",
+    "US_DEFENSIVE",
+    "US_AI_POWER",
+    "US_HEALTHCARE",
+}
+MACRO_RESERVE_SLOTS = 5
+
+
 async def screen_candidates(
     conn: aiosqlite.Connection,
     client: AsyncKISClient,
@@ -305,8 +320,9 @@ async def screen_candidates(
     benchmark_returns: Optional[pd.Series] = None,
 ) -> List[Dict[str, Any]]:
     """아직 보유하지 않은 후보 중 관점별 할당(저평가/조기신호/모멘텀/증권사)을 지켜 상위
-    DISCOVERY_TOP_N개를 LLM 숏리스트로 반환한다. 점수 캐시가 신선하면 KIS 호출 없이 캐시를
-    쓰고, 없거나 오래됐으면 그 자리에서 다시 계산한다."""
+    DISCOVERY_TOP_N개를 LLM 숏리스트로 반환한다. 또한 국면별 로테이션(방산/에너지/달러·국채/
+    배당금융/지수ETF) 후보가 PER/리포트 부재로 인해 숏리스트에서 누락되지 않도록 상위 매크로
+    후보를 함께 공급한다."""
     cache = await load_scored_cache(conn)
     fresh = cache is not None and (time.time() - cache["scored_at"]) < settings.DISCOVERY_SHORTLIST_TTL_HOURS * 3600
     if fresh:
@@ -314,7 +330,51 @@ async def screen_candidates(
         entries = [e for e in cache["entries"] if e["symbol"] in enabled]
     else:
         entries = await score_candidates(conn, client, benchmark_returns=benchmark_returns)
-    return discovery_signals.select_with_quota(
-        entries, settings.DISCOVERY_TOP_N, settings.DISCOVERY_ANGLE_QUOTA, exclude=set(exclude_symbols),
+
+    exclude_set = set(exclude_symbols)
+    chosen = discovery_signals.select_with_quota(
+        entries, settings.DISCOVERY_TOP_N, settings.DISCOVERY_ANGLE_QUOTA, exclude=exclude_set,
         min_score=settings.DISCOVERY_MIN_SCORE,
     )
+    chosen_symbols = {e["symbol"] for e in chosen}
+
+    # 매크로 로테이션 후보(ETF·방산·에너지·채권·금융방어 등) 중 아직 선택되지 않은 상위 종목을 보충
+    def _macro_rank_key(e: Dict[str, Any]) -> tuple:
+        tech = e.get("tech") or {}
+        t_dir = 1 if tech.get("direction") == "BUY" else (0 if tech.get("direction") == "HOLD" else -1)
+        t_str = float(tech.get("strength") or 0.0) * t_dir
+        sharpe = float(e.get("sharpe") if e.get("sharpe") is not None else -99.0)
+        score = float(e.get("score") or 0.0)
+        return (score, t_str, sharpe)
+
+    macro_pool = sorted(
+        (
+            e for e in entries
+            if e["symbol"] not in exclude_set
+            and e["symbol"] not in chosen_symbols
+            and e.get("universe_tag") in MACRO_ROTATION_TAGS
+        ),
+        key=_macro_rank_key,
+        reverse=True,
+    )
+    # 카테고리(universe_tag)별로 골고루 먼저 1개씩 뽑고 남은 슬롯은 순위순으로 채움
+    added_macro = 0
+    seen_tags = set()
+    for e in macro_pool:
+        if added_macro >= MACRO_RESERVE_SLOTS:
+            break
+        tag = e.get("universe_tag")
+        if tag not in seen_tags:
+            chosen.append(e)
+            chosen_symbols.add(e["symbol"])
+            seen_tags.add(tag)
+            added_macro += 1
+    for e in macro_pool:
+        if added_macro >= MACRO_RESERVE_SLOTS:
+            break
+        if e["symbol"] not in chosen_symbols:
+            chosen.append(e)
+            chosen_symbols.add(e["symbol"])
+            added_macro += 1
+
+    return chosen

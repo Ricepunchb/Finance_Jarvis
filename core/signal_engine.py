@@ -66,7 +66,7 @@ def combine_signals(
 async def _onboarding_action(
     *, symbol: Optional[str], combined: Signal, drift, target_weight: float, price: float,
     current_position_value: float, total_equity: float, risk: RiskManager,
-    accumulation_mode: bool = False,
+    accumulation_mode: bool = False, is_downtrend: bool = False,
 ) -> Optional[Action]:
     """분할 온보딩 매수. 스윙 시그널 문턱(0.5)은 "언제 비중을 키우느냐"를 정하는 용도라, 신규
     편입/저비중 종목이 목표비중까지 가는 경로가 없었다. 퀀트의 통상 방식대로 목표비중과의 갭을
@@ -76,6 +76,13 @@ async def _onboarding_action(
         return None
     if drift.required_direction != "BUY":  # 밴드 안이면 이미 충분히 채워진 것
         return None
+
+    # 일반 스윙 모드에서 확정적 하락 추세(SMA20 < SMA60 이고 현재가 < SMA20)일 때는
+    # 떨어지는 칼날(Falling Knife) 물타기를 방지하기 위해 단기 이평선(SMA20) 안착 전까지 온보딩 보류.
+    # (단, 상승추세 SMA20>=SMA60 내 눌림목이나 바닥권에서 SMA20을 돌파한 초동 반등 종목은 정상 진입 허용)
+    if not accumulation_mode and is_downtrend:
+        if settings.REQUIRE_UPTREND_FOR_ONBOARDING or settings.REQUIRE_SMA20_FOR_BUY:
+            return None
 
     # 일반 스윙 모드는 단기 SELL 시 온보딩을 보류하지만,
     # 적립식(ISA/DCA) 모드는 극단적 패닉셀(strength >= 0.85)이 아니면 저가 분할 적립(DCA)을 허용한다.
@@ -167,6 +174,7 @@ async def decide(
         reason = "band_ceiling_forced_trim"
     else:
         is_accumulation = bool(accumulation_mode)
+        is_downtrend = bool(tech_signal.get("is_downtrend", False))
         # ISA/적립식 계좌: 단기 기술적 하락 시그널에 의한 분할 매도(swing_signal sell) 차단.
         # 우량 자산을 모아가는 장기 계좌에서 바닥 털림을 방지한다.
         # (단, 손절/익절/밴드상한초과/제외청산은 위와 exit_guard에서 정상 실행됨)
@@ -174,16 +182,18 @@ async def decide(
             return await _onboarding_action(
                 symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
                 current_position_value=current_position_value, total_equity=total_equity, risk=risk,
-                accumulation_mode=is_accumulation,
+                accumulation_mode=is_accumulation, is_downtrend=is_downtrend,
             )
 
         if combined["direction"] == "HOLD" or combined["strength"] < SWING_SIGNAL_THRESHOLD:
             return await _onboarding_action(
                 symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
                 current_position_value=current_position_value, total_equity=total_equity, risk=risk,
-                accumulation_mode=is_accumulation,
+                accumulation_mode=is_accumulation, is_downtrend=is_downtrend,
             )
         side = combined["direction"].lower()
+        if side == "buy" and not is_accumulation and is_downtrend and settings.REQUIRE_SMA20_FOR_BUY:
+            return None
         trade_value = combined["strength"] * SWING_TRADE_MAX_EQUITY_FRACTION * total_equity
         if side == "buy":
             room_value = max(0.0, ceiling_weight * total_equity - current_position_value)
