@@ -299,11 +299,18 @@ def resolve_etf_profile_sync(
         return None
 
     quote_type = (info.get("quoteType") or "").upper()
+    if quote_type == "EQUITY":
+        # 명백한 개별 기업 주식 (예: AAPL, TSLA, NFLX 등)
+        return None
+
+    short_name = (info.get("shortName") or "").upper()
+    long_name = (info.get("longName") or "").upper()
+
     is_fund_or_etf = (
         quote_type in ("ETF", "MUTUALFUND")
         or bool(info.get("category"))
-        or "ETF" in (info.get("shortName") or "").upper()
-        or "ETF" in (info.get("longName") or "").upper()
+        or bool(re.search(r"\bETF\b", short_name))
+        or bool(re.search(r"\bETF\b", long_name))
     )
 
     if not is_fund_or_etf:
