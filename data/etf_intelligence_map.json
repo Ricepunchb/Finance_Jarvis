@@ -87,6 +87,12 @@
     "theme": "필라델피아반도체",
     "name": "iShares Semiconductor ETF"
   },
+  "SOXL": {
+    "type": "THEMATIC",
+    "anchors": ["NVDA", "AVGO", "AMD"],
+    "theme": "필라델피아반도체3X",
+    "name": "Direxion Daily Semiconductor Bull 3X Shares"
+  },
   "XLE": {
     "type": "THEMATIC",
     "anchors": ["XOM", "CVX"],
@@ -190,6 +196,11 @@
     "type": "BROAD_INDEX",
     "macro_driven": true,
     "name": "iShares 20+ Year Treasury Bond ETF"
+  },
+  "SGOV": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "iShares 0-3 Month Treasury Bond ETF"
   },
   "446720": {
     "type": "BROAD_INDEX",
