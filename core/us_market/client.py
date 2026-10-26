@@ -211,78 +211,161 @@ async def get_us_daily_bars(symbol: str, period: str = "3mo") -> pd.DataFrame:
 def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
     """월가 컨센서스 목표주가 및 최근 뉴스 수집.
 
-    단일 기초자산 ETF(TSLW -> TSLA 등)나 테마 ETF(OZEM -> LLY 등)는 기초자산/앵커 주식의
-    목표가 컨센서스와 뉴스를 프록시 상속합니다.
+    - 단일 기초자산 ETF(TSLW -> TSLA 등): 원본 주식의 목표가 및 뉴스 100% 프록시 상속
+    - 테마/섹터 ETF(OZEM -> LLY + NVO, SOXL -> NVDA + AVGO + AMD 등): 핵심 앵커 기업 전체의
+      목표가 괴리율 가중평균 및 기업별 대표 뉴스를 종합 수집
     """
     clean_sym = symbol.strip().upper()
     try:
         from core.news.etf_mapper import load_etf_map
         etf_map = load_etf_map()
-        target_sym = clean_sym
         underlying: Optional[str] = None
         is_etf_proxy = False
+        target_symbols = [clean_sym]
+        is_thematic = False
 
         if clean_sym in etf_map:
             profile = etf_map[clean_sym]
-            if profile.get("type") == "SINGLE_STOCK" and profile.get("underlying"):
+            etf_type = profile.get("type")
+            if etf_type == "SINGLE_STOCK" and profile.get("underlying"):
                 target_sym = profile["underlying"].strip().upper()
+                target_symbols = [target_sym]
                 underlying = target_sym
                 is_etf_proxy = True
-            elif profile.get("type") == "THEMATIC" and profile.get("anchors"):
-                target_sym = profile["anchors"][0].strip().upper()
-                underlying = target_sym
-                is_etf_proxy = True
+            elif etf_type == "THEMATIC" and profile.get("anchors"):
+                anchors = [a.strip().upper() for a in profile["anchors"] if a]
+                if anchors:
+                    target_symbols = anchors
+                    underlying = ", ".join(anchors)
+                    is_etf_proxy = True
+                    is_thematic = True
 
-        t = yf.Ticker(target_sym)
-        info = t.info or {}
+        # 단일 종목 / SINGLE_STOCK인 경우
+        if not is_thematic:
+            target_sym = target_symbols[0]
+            t = yf.Ticker(target_sym)
+            info = t.info or {}
 
-        target_mean = info.get("targetMeanPrice")
-        target_high = info.get("targetHighPrice")
-        target_low = info.get("targetLowPrice")
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-        recomm_key = info.get("recommendationKey", "")
-        recomm_mean = info.get("recommendationMean")  # 1.0(Strong Buy) ~ 5.0(Strong Sell)
+            target_mean = info.get("targetMeanPrice")
+            target_high = info.get("targetHighPrice")
+            target_low = info.get("targetLowPrice")
+            current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+            recomm_key = info.get("recommendationKey", "")
+            recomm_mean = info.get("recommendationMean")  # 1.0(Strong Buy) ~ 5.0(Strong Sell)
 
-        target_gap_pct = None
-        if target_mean and current_price and current_price > 0:
-            target_gap_pct = round(((target_mean - current_price) / current_price) * 100, 2)
+            target_gap_pct = None
+            if target_mean and current_price and current_price > 0:
+                target_gap_pct = round(((target_mean - current_price) / current_price) * 100, 2)
 
-        # 뉴스: yf.Ticker.news 우선 확인 후 빈 리스트면 yf.Search로 안정적 폴백
-        raw_news = getattr(t, "news", []) or []
-        if not raw_news:
-            try:
-                search_obj = yf.Search(target_sym, news_count=5)
-                raw_news = getattr(search_obj, "news", []) or []
-            except Exception:
-                pass
+            # 뉴스: yf.Ticker.news 우선 확인 후 빈 리스트면 yf.Search로 안정적 폴백
+            raw_news = getattr(t, "news", []) or []
+            if not raw_news:
+                try:
+                    search_obj = yf.Search(target_sym, news_count=5)
+                    raw_news = getattr(search_obj, "news", []) or []
+                except Exception:
+                    pass
 
+            articles: List[Dict[str, Any]] = []
+            for item in raw_news[:5]:
+                content = item.get("content") or item
+                title = content.get("title") or item.get("title") or ""
+                if not title:
+                    continue
+                link = content.get("canonicalUrl", {}).get("url") if isinstance(content.get("canonicalUrl"), dict) else item.get("link")
+                pub_time = content.get("pubDate") or item.get("providerPublishTime")
+                publisher = content.get("provider", {}).get("displayName") or item.get("publisher") or "Wall Street News"
+                articles.append({
+                    "title": title,
+                    "publisher": publisher,
+                    "link": link or "",
+                    "published_at": pub_time,
+                })
+
+            return {
+                "symbol": clean_sym,
+                "target_mean": float(target_mean) if target_mean else None,
+                "target_high": float(target_high) if target_high else None,
+                "target_low": float(target_low) if target_low else None,
+                "target_gap_pct": target_gap_pct,
+                "recommendation_key": recomm_key,
+                "recommendation_mean": float(recomm_mean) if recomm_mean else None,
+                "news": articles,
+                "underlying": underlying,
+                "is_etf_proxy": is_etf_proxy,
+            }
+
+        # 테마/섹터(THEMATIC) 멀티 앵커인 경우 (예: OZEM -> LLY + NVO, SOXL -> NVDA + AVGO + AMD)
+        gaps: List[float] = []
+        recomm_means: List[float] = []
         articles: List[Dict[str, Any]] = []
-        for item in raw_news[:5]:
-            content = item.get("content") or item
-            title = content.get("title") or item.get("title") or ""
-            if not title:
-                continue
-            link = content.get("canonicalUrl", {}).get("url") if isinstance(content.get("canonicalUrl"), dict) else item.get("link")
-            pub_time = content.get("pubDate") or item.get("providerPublishTime")
-            publisher = content.get("provider", {}).get("displayName") or item.get("publisher") or "Wall Street News"
-            articles.append({
-                "title": title,
-                "publisher": publisher,
-                "link": link or "",
-                "published_at": pub_time,
-            })
+        seen_titles = set()
+
+        for anchor in target_symbols:
+            try:
+                t = yf.Ticker(anchor)
+                info = t.info or {}
+                tm = info.get("targetMeanPrice")
+                cp = info.get("currentPrice") or info.get("regularMarketPrice")
+                if tm and cp and cp > 0:
+                    gaps.append(((tm - cp) / cp) * 100)
+                rm = info.get("recommendationMean")
+                if rm:
+                    recomm_means.append(float(rm))
+
+                # 앵커별 최신 뉴스 2건 수집
+                raw_news = getattr(t, "news", []) or []
+                if not raw_news:
+                    try:
+                        search_obj = yf.Search(anchor, news_count=3)
+                        raw_news = getattr(search_obj, "news", []) or []
+                    except Exception:
+                        pass
+
+                for item in raw_news[:2]:
+                    content = item.get("content") or item
+                    raw_title = content.get("title") or item.get("title") or ""
+                    if not raw_title or raw_title in seen_titles:
+                        continue
+                    seen_titles.add(raw_title)
+                    link = content.get("canonicalUrl", {}).get("url") if isinstance(content.get("canonicalUrl"), dict) else item.get("link")
+                    pub_time = content.get("pubDate") or item.get("providerPublishTime")
+                    publisher = content.get("provider", {}).get("displayName") or item.get("publisher") or "Wall Street News"
+                    articles.append({
+                        "title": f"[{anchor}] {raw_title}",
+                        "publisher": publisher,
+                        "link": link or "",
+                        "published_at": pub_time,
+                    })
+            except Exception as anchor_err:
+                logger.warning(f"테마 ETF '{clean_sym}' 앵커 '{anchor}' 수집 오류: {anchor_err}")
+
+        avg_gap_pct = round(sum(gaps) / len(gaps), 2) if gaps else None
+        avg_recomm_mean = round(sum(recomm_means) / len(recomm_means), 2) if recomm_means else None
+        if avg_recomm_mean:
+            recomm_key = "strong_buy" if avg_recomm_mean <= 1.5 else "buy" if avg_recomm_mean <= 2.5 else "hold"
+        else:
+            recomm_key = ""
+
+        # 대표 1위 앵커의 목표가
+        first_info = {}
+        try:
+            first_t = yf.Ticker(target_symbols[0])
+            first_info = first_t.info or {}
+        except Exception:
+            pass
 
         return {
             "symbol": clean_sym,
-            "target_mean": float(target_mean) if target_mean else None,
-            "target_high": float(target_high) if target_high else None,
-            "target_low": float(target_low) if target_low else None,
-            "target_gap_pct": target_gap_pct,
+            "target_mean": float(first_info.get("targetMeanPrice")) if first_info.get("targetMeanPrice") else None,
+            "target_high": float(first_info.get("targetHighPrice")) if first_info.get("targetHighPrice") else None,
+            "target_low": float(first_info.get("targetLowPrice")) if first_info.get("targetLowPrice") else None,
+            "target_gap_pct": avg_gap_pct,
             "recommendation_key": recomm_key,
-            "recommendation_mean": float(recomm_mean) if recomm_mean else None,
+            "recommendation_mean": avg_recomm_mean,
             "news": articles,
             "underlying": underlying,
-            "is_etf_proxy": is_etf_proxy,
+            "is_etf_proxy": True,
         }
     except Exception as e:
         logger.warning(f"yfinance 컨센서스/뉴스 수집 오류 ({clean_sym}): {e}")
