@@ -68,6 +68,8 @@ class RiskManager:
     # --- 체결통보 웹소켓 staleness 게이트 ---
 
     async def is_ws_healthy(self) -> bool:
+        if not settings.ENABLE_WEBSOCKET:
+            return True
         raw = await db.get_state(self.conn, "last_ws_message_at")
         if raw is None:
             return False

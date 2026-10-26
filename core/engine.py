@@ -276,7 +276,11 @@ class TradingEngine:
 
         symbol_info = await db.get_portfolio_symbol_info(self.conn)
         cycle_id = await db.new_cycle(self.conn)
-        ws_ok = await self.risk.is_ws_healthy()
+        ws_ok = (
+            not settings.ENABLE_WEBSOCKET
+            or (self.ws_client is not None and self.ws_client.is_connected)
+            or await self.risk.is_ws_healthy()
+        )
         try:
             # 웹소켓이 체결통보를 놓쳐도 intent 상태/체결가가 복구되도록 매 사이클 대조한다.
             await reconciliation.reconcile_unresolved_intents(self.client, self.conn, min_age_sec=60)

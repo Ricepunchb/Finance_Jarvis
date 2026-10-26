@@ -84,6 +84,7 @@ class KISWebSocketClient:
 
     _RECONNECT_BASE_DELAY_SEC = 2
     _RECONNECT_MAX_DELAY_SEC = 60
+    _HEARTBEAT_INTERVAL_SEC = 30  # 연결 유지 시 생존신호 갱신 주기 (데드락 방지)
 
     def __init__(self, hts_id: str, on_fill: OnFill, on_any_message: OnAnyMessage, include_overseas: bool = False):
         self.hts_id = hts_id
@@ -92,9 +93,20 @@ class KISWebSocketClient:
         self.include_overseas = include_overseas
         self._ws: Optional[websockets.ClientConnection] = None
         self._task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._columns_by_tr_id: Dict[str, List[str]] = {}
         self._enc_state: Dict[str, Tuple[str, str]] = {}  # tr_id -> (key, iv)
         self._stopping = False
+
+    @property
+    def is_connected(self) -> bool:
+        """웹소켓 소켓 객체가 정상적으로 연결(Open)되어 있는지 여부."""
+        if self._ws is None:
+            return False
+        state = getattr(self._ws, "state", None)
+        if state is not None:
+            return getattr(state, "name", str(state)) == "OPEN"
+        return not getattr(self._ws, "closed", True)
 
     async def start(self) -> None:
         self._stopping = False
@@ -110,6 +122,19 @@ class KISWebSocketClient:
                     await asyncio.sleep(1.0)
         # 초기 연결이 일시 실패하더라도 _run 태스크가 지수 백오프로 재연결을 지속 시도함
         self._task = asyncio.create_task(self._run())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        """연결 유지 중 주기적 생존신호 갱신 — 체결이 없는 장중 유휴 상태에서 staleness 데드락 방지."""
+        while not self._stopping:
+            try:
+                await asyncio.sleep(self._HEARTBEAT_INTERVAL_SEC)
+                if self.is_connected:
+                    await self.on_any_message()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"웹소켓 하트비트 갱신 중 예외: {e}")
 
     async def _connect_and_subscribe(self) -> None:
         approval_key = await issue_approval_key()
@@ -133,6 +158,8 @@ class KISWebSocketClient:
                 "body": {"input": {"tr_id": tr_id, "tr_key": self.hts_id}},
             }
             await self._ws.send(json.dumps(subscribe_msg))
+        # 구독 요청 전송 완료 즉시 생존 신호 기록
+        await self.on_any_message()
 
     async def _run(self) -> None:
         delay = self._RECONNECT_BASE_DELAY_SEC
@@ -200,8 +227,9 @@ class KISWebSocketClient:
 
         header = msg.get("header", {})
         if header.get("tr_id") == "PINGPONG":
-            if self._ws is not None:
-                await self._ws.pong(raw)
+            if self.is_connected:
+                # KIS 웹소켓 서버는 수신한 PINGPONG 텍스트 전문 그대로 Echo 응답(send)을 요구한다
+                await self._ws.send(raw)
             return
 
         body = msg.get("body", {})
@@ -211,6 +239,13 @@ class KISWebSocketClient:
 
     async def stop(self) -> None:
         self._stopping = True  # 진행 중이던 재연결 시도가 close() 이후에 새 연결을 여는 것을 막는다
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
         if self._task is not None:
             self._task.cancel()
             try:
