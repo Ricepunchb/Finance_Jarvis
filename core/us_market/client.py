@@ -217,15 +217,14 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
     """
     clean_sym = symbol.strip().upper()
     try:
-        from core.news.etf_mapper import load_etf_map
-        etf_map = load_etf_map()
+        from core.news.etf_mapper import resolve_etf_profile_sync
+        profile = resolve_etf_profile_sync(clean_sym)
         underlying: Optional[str] = None
         is_etf_proxy = False
         target_symbols = [clean_sym]
         is_thematic = False
 
-        if clean_sym in etf_map:
-            profile = etf_map[clean_sym]
+        if profile:
             etf_type = profile.get("type")
             if etf_type == "SINGLE_STOCK" and profile.get("underlying"):
                 target_sym = profile["underlying"].strip().upper()
