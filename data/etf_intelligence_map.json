@@ -297,5 +297,11 @@
     "theme": "Technology",
     "name": "Global X Robotics & Artificial ",
     "auto_discovered": true
+  },
+  "379810": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "KODEX 미국나스닥100",
+    "dynamic": true
   }
 }

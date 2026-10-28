@@ -204,7 +204,15 @@ class PortfolioScheduler:
         recently_removed = set(
             await db.list_recently_removed_symbols(conn, settings.AI_REBALANCE_REMOVED_COOLDOWN_DAYS)
         )
-        held_or_excluded = set(active_weights.keys()) | recently_removed
+        # [방안 2] 우수 발굴 시 쿨다운 즉시 면제 (고득점 발굴 시 신규 편입 후보 및 트리거 허용)
+        high_score_exemptions = {
+            e["symbol"]
+            for e in cache.get("entries", [])
+            if float(e.get("score") or 0.0) >= settings.AI_REBALANCE_DISCOVERY_TRIGGER_SCORE
+        }
+        recently_removed -= high_score_exemptions
+        active_held = {s for s, w in active_weights.items() if (w or 0.0) > 0}
+        held_or_excluded = active_held | recently_removed
         proxy_enabled = await portfolio_agent.get_effective_proxy_trading(conn)
 
         expiry_sec = settings.AI_REBALANCE_PERIODIC_INTERVAL_DAYS * 86400

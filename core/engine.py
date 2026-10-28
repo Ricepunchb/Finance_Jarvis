@@ -370,10 +370,10 @@ class TradingEngine:
             if target_weight <= 0 or winddown_liquidating is not None:
                 held = holdings_by_symbol.get(symbol) if market != "overseas" else overseas_holdings_by_symbol.get(symbol)
                 if not held or float(held.get("hldg_qty") or held.get("cblc_qty13") or 0) <= 0:
-                    if winddown_liquidating is not None and (market != "overseas" or overseas_balance_ok):
-                        # 잔고 조회가 성공했는데 보유가 없다 — 정리 완료, 포트폴리오에서 완전히 제거한다.
+                    if (winddown_liquidating is not None or (symbol in active_weights and active_weights[symbol] <= 0)) and (market != "overseas" or overseas_balance_ok):
+                        # 잔고 조회가 성공했는데 보유가 없다 — 정리/청산 완료, 포트폴리오에서 완전히 제거한다.
                         await db.finish_symbol_removal(self.conn, symbol)
-                        logger.info(f"'{symbol}' 정리 완료 - 포트폴리오에서 제거")
+                        logger.info(f"'{symbol}' 정리/청산 완료 - 포트폴리오에서 제거")
                     continue  # 제외 종목이고 잔여 보유도 없음 — 청산 완료, 매매 루프에서 빠진다(발굴/후보 쪽에서만 관찰)
 
             try:

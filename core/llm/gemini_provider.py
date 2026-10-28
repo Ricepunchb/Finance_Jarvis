@@ -316,6 +316,11 @@ class GeminiProvider(LLMProvider):
             "3. 실제 단기 매수/매도 진입 시점(20일선·추세 확인 후 칼날잡기 방지, 3일 분할 온보딩, 30분봉 스윙 시그널, "
             "손절 및 ATR 트레일링 익절)은 하위 퀀트 트레이딩 엔진이 보수적으로 엄격히 통제한다. 따라서 너는 단기 노이즈에 "
             "위축되어 현금만 쌓아두지 말고, 현재 국면과 인텔리전스 다이제스트에 부합하는 수혜 후보 종목들에 목표 비중(Target Weight)을 전략적으로 배분하라.",
+            "4. [기존 보유 종목 평가 및 제외(removes) 신중 원칙 - 손실 확정 및 배당 가치 종합 고려]:",
+            "   - 보유 종목을 제외(removes)하거나 비중을 축소할 때는 각 종목의 '평단가'와 '내 평단가 대비 ROI'를 반드시 대조하라.",
+            "   - 평단가 대비 손실이 경미하거나(-5% 이내) 횡보 중인 종목을 단순한 단기 보조지표(RSI/MACD 데드크로스) 일시 둔화만으로 섣불리 손절·교체 매매하지 마라.",
+            "   - 특히 고배당 인프라(맥쿼리인프라 등), 배당금융, 필수 소비/방어 자산은 배당 수익률과 현금흐름 방어력이 있으므로, 펀더멘털의 치명적 훼손이나 거시 국면의 명백한 역풍이 아니라면 잦은 손절을 지양하고 비중을 유지하라.",
+            "   - 반대로 평단가 대비 유의미한 수익(+10% 이상)이 났거나 추세가 완전히 꺾인 종목, 또는 명백한 악재/리스크가 확인된 종목을 우선적 이익 실현 및 위험 관리(removes/축소) 대상으로 삼아라.",
             "",
             "[현재 포트폴리오]",
         ]
@@ -346,8 +351,9 @@ class GeminiProvider(LLMProvider):
                 metrics_parts.append(f"CCI {p['cci']:.0f}")
             if "bb_percent_b" in p:
                 metrics_parts.append(f"볼린저%B {p['bb_percent_b']:.2f}")
+            name_str = f" ({p['name']})" if p.get("name") else ""
             lines.append(
-                f"- {p['symbol']}: 비중 {p['weight']:.1%}, 평단가 {p.get('avg_price', 0):.0f}"
+                f"- {p['symbol']}{name_str}: 비중 {p['weight']:.1%}, 평단가 {p.get('avg_price', 0):.0f}"
                 + (f", {', '.join(metrics_parts)}" if metrics_parts else "")
                 + (f", 현재시그널 {signal}" if signal else "")
             )

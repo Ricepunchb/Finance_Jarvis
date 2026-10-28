@@ -152,6 +152,20 @@ async def propose_rebalance(
     benchmark_returns = await quant_metrics.fetch_benchmark_return_series(client) if client is not None else None
 
     current_positions = await _build_current_positions(client, active_weights, positions, benchmark_returns)
+    cur = await conn.execute(
+        "SELECT symbol, name FROM candidate_universe WHERE name IS NOT NULL AND name != '' "
+        "UNION "
+        "SELECT symbol, name FROM stock_master WHERE name IS NOT NULL AND name != ''"
+    )
+    name_map = {row["symbol"]: row["name"] for row in await cur.fetchall()}
+    for p in current_positions:
+        p["name"] = name_map.get(p["symbol"], "")
+
+    # 실제 보유 중이거나 목표 비중이 있는 유효 포지션만 LLM에 현재 포트폴리오로 노출 (비중 0% & 잔고 0인 청산 완료 종목 제외)
+    current_positions = [
+        p for p in current_positions
+        if (p.get("weight") or 0.0) > 0 or float(p.get("qty") or 0.0) > 0
+    ]
     current_signals: Dict[str, Any] = {}
     for p in current_positions:
         sym = p["symbol"]
@@ -167,12 +181,25 @@ async def propose_rebalance(
     candidate_pool: List[Dict[str, Any]] = []
     if client is not None:
         try:
-            # 사용자가 삭제한 종목이 동적 발굴로 되살아나 재편입 제안되지 않도록 쿨다운 동안 제외한다.
-            recently_removed = await db.list_recently_removed_symbols(
-                conn, settings.AI_REBALANCE_REMOVED_COOLDOWN_DAYS
+            # 사용자가 삭제하거나 청산된 종목이 동적 발굴로 즉시 되살아나 재편입 제안되지 않도록 쿨다운 동안 제외한다.
+            recently_removed = set(
+                await db.list_recently_removed_symbols(
+                    conn, settings.AI_REBALANCE_REMOVED_COOLDOWN_DAYS
+                )
             )
+            # [방안 2] 우수 발굴 시 쿨다운 즉시 면제: 발굴 캐시에서 고득점(>= AI_REBALANCE_DISCOVERY_TRIGGER_SCORE)
+            # 종목은 쿨다운을 면제하여 신규 편입 후보 풀에 포함되도록 한다.
+            cache = await discovery.load_scored_cache(conn)
+            if cache and cache.get("entries"):
+                high_score_exemptions = {
+                    e["symbol"]
+                    for e in cache["entries"]
+                    if float(e.get("score") or 0.0) >= settings.AI_REBALANCE_DISCOVERY_TRIGGER_SCORE
+                }
+                recently_removed -= high_score_exemptions
+
             candidate_pool = await discovery.screen_candidates(
-                conn, client, exclude_symbols=symbols + recently_removed, benchmark_returns=benchmark_returns,
+                conn, client, exclude_symbols=list(set(symbols) | recently_removed), benchmark_returns=benchmark_returns,
             )
         except Exception:
             logger.exception("후보종목 스크리닝 실패 - 발굴 없이 재비중만 제안")
@@ -245,7 +272,11 @@ async def propose_rebalance(
     valid_removes = [r for r in result.get("removes", []) if r.get("symbol") in active_weights]
     remove_symbols = [r["symbol"] for r in valid_removes]
 
-    allowed_symbols = set(active_weights) | set(valid_add_symbols)
+    active_held_symbols = {
+        s for s, w in active_weights.items()
+        if w > 0 or float((positions.get(s) or {}).get("qty") or 0) > 0
+    }
+    allowed_symbols = active_held_symbols | set(valid_add_symbols)
     raw_weights = result.get("weights", {})
     # LLM이 비중을 백분율(예: 15.0%, 65.0%)로 반환했을 때 0.0~1.0 소수점 단위로 자동 정규화
     total_raw_w = sum(raw_weights.values()) if raw_weights else 0.0
