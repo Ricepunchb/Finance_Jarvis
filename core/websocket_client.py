@@ -15,6 +15,7 @@ PINGPONG이든)마다 RiskManager에 "살아있다"를 기록해 staleness 게�
 import asyncio
 import json
 import logging
+import time
 from base64 import b64decode
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -164,44 +165,53 @@ class KISWebSocketClient:
     async def _run(self) -> None:
         delay = self._RECONNECT_BASE_DELAY_SEC
         while not self._stopping:
-            if self._ws is not None:
-                connected_at = time.time()
+            try:
+                if self._ws is not None:
+                    connected_at = time.time()
+                    try:
+                        async for raw in self._ws:
+                            await self.on_any_message()  # 데이터든 PINGPONG이든 "살아있다"의 근거
+                            await self._handle_message(raw)
+                            # 최소 30초 이상 연결이 안정적으로 유지되었을 때만 백오프 딜레이를 초기화
+                            if time.time() - connected_at > 30.0:
+                                delay = self._RECONNECT_BASE_DELAY_SEC
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        logger.warning(f"KIS 웹소켓 연결이 종료되었습니다 ({type(e).__name__}: {e})")
+                    finally:
+                        if self._ws is not None:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+                            self._ws = None
+
+                if self._stopping:
+                    return
+
+                logger.warning(f"{delay}초 후 KIS 웹소켓 재연결을 시도합니다")
                 try:
-                    async for raw in self._ws:
-                        await self.on_any_message()  # 데이터든 PINGPONG이든 "살아있다"의 근거
-                        await self._handle_message(raw)
-                        # 최소 30초 이상 연결이 안정적으로 유지되었을 때만 백오프 딜레이를 초기화
-                        if time.time() - connected_at > 30.0:
-                            delay = self._RECONNECT_BASE_DELAY_SEC
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+                delay = min(delay * 2, self._RECONNECT_MAX_DELAY_SEC)
+
+                try:
+                    await self._connect_and_subscribe()
+                    logger.info("KIS 웹소켓 재연결 성공")
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
-                    logger.warning(f"KIS 웹소켓 연결이 종료되었습니다 ({type(e).__name__}: {e})")
-                finally:
-                    if self._ws is not None:
-                        try:
-                            await self._ws.close()
-                        except Exception:
-                            pass
-                        self._ws = None
-
-            if self._stopping:
-                return
-
-            logger.warning(f"{delay}초 후 KIS 웹소켓 재연결을 시도합니다")
-            try:
-                await asyncio.sleep(delay)
+                    logger.warning(f"KIS 웹소켓 재연결 시도 실패 ({type(e).__name__}: {e})")
             except asyncio.CancelledError:
                 return
-            delay = min(delay * 2, self._RECONNECT_MAX_DELAY_SEC)
-
-            try:
-                await self._connect_and_subscribe()
-                logger.info("KIS 웹소켓 재연결 성공")
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.warning(f"KIS 웹소켓 재연결 시도 실패 ({type(e).__name__}: {e})")
+            except Exception:
+                logger.exception("KIS 웹소켓 루프 내 처리되지 않은 예외 발생 — 지연 후 재연결 시도")
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
 
     async def _handle_message(self, raw: str) -> None:
         if raw[0] in ("0", "1"):

@@ -76,3 +76,36 @@ def test_ws_client_pingpong_echo():
         mock_ws.send.assert_awaited_once_with(ping_msg)
 
     asyncio.run(run())
+
+
+def test_ws_client_run_loop_time_import_and_no_name_error():
+    """_run 태스크가 실행될 때 time.time() NameError 없이 정상 구동되는지 검증."""
+    from websockets.protocol import State
+
+    async def run():
+        on_any_mock = AsyncMock()
+        client = KISWebSocketClient("test_id", AsyncMock(), on_any_mock)
+        mock_ws = AsyncMock()
+        mock_ws.state = State.OPEN
+
+        # async iterator simulating receiving 1 message then closing
+        async def mock_aiter():
+            yield json.dumps({"header": {"tr_id": "PINGPONG"}})
+
+        mock_ws.__aiter__ = lambda self: mock_aiter()
+        client._ws = mock_ws
+
+        task = asyncio.create_task(client._run())
+        # Let task run briefly
+        await asyncio.sleep(0.05)
+        client._stopping = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert on_any_mock.await_count >= 1
+
+    asyncio.run(run())
+
