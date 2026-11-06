@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core import (
     analytics, db, discovery, discovery_signals, discovery_sources, kis_domestic, portfolio_agent,
@@ -1137,6 +1137,12 @@ class USScanRequest(BaseModel):
     send_notifications: bool = False
 
 
+class USNewsScanRequest(BaseModel):
+    symbols: Optional[list[str]] = None
+    threshold: int = Field(default=75, ge=0, le=100)
+    send_notifications: bool = True
+
+
 class USTelegramTestRequest(BaseModel):
     token: Optional[str] = None
     chat_id: Optional[str] = None
@@ -1242,6 +1248,40 @@ async def trigger_us_scan(req: USScanRequest):
         "scanned_count": len(results),
         "items": results,
     }
+
+
+@app.get("/us-market/news-alerts")
+async def get_us_news_alerts(limit: int = 50, symbol: Optional[str] = None):
+    """최근 발송된 미국장 글로벌 뉴스 서프라이즈 알림 목록 조회."""
+    conn = await db.get_connection()
+    try:
+        clean_sym = None if not symbol or symbol.upper() == "ALL" else symbol.strip().upper()
+        alerts = await db.list_us_news_alerts(conn, limit=limit, symbol=clean_sym)
+        return alerts
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/scan-news")
+async def trigger_us_news_scan(req: USNewsScanRequest):
+    """글로벌 뉴스 수집, 동일 사건 군집화 및 서프라이즈 분석 즉시 실행."""
+    from core.us_market.service import scan_us_market_news
+
+    conn = await db.get_connection()
+    try:
+        result = await scan_us_market_news(
+            conn=conn,
+            target_symbols=req.symbols,
+            threshold=req.threshold,
+            send_notifications=req.send_notifications,
+        )
+        return {
+            "status": "ok",
+            "threshold": req.threshold,
+            **result,
+        }
+    finally:
+        await conn.close()
 
 
 @app.get("/us-market/history/{symbol}")

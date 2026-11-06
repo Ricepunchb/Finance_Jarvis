@@ -21,7 +21,7 @@ from core.us_market.client import (
     get_us_market_status,
     get_us_quote,
 )
-from core.us_market.notifier import notify_signal_if_needed
+from core.us_market.notifier import notify_news_surprise_if_needed, notify_signal_if_needed
 from core.us_market.signals import compute_us_signals
 
 logger = logging.getLogger(__name__)
@@ -180,6 +180,148 @@ async def scan_all_us_watchlist(
     return results
 
 
+async def scan_us_market_news(
+    conn: Optional[Any] = None,
+    target_symbols: Optional[List[str]] = None,
+    threshold: int = 75,
+    send_notifications: bool = True,
+    news_count_per_symbol: int = 8,
+) -> Dict[str, Any]:
+    """글로벌/미국장 주요 뉴스를 수집, 동일 사건 군집화(Clustering) 후 Surprise 점수를 산출하고
+    임계값(threshold) 이상의 서프라이즈 뉴스에 대해 텔레그램 알림 발송 및 DB 기록을 수행한다.
+    """
+    close_conn = False
+    if conn is None:
+        conn = await db.get_connection()
+        close_conn = True
+
+    try:
+        if not target_symbols:
+            # 워치리스트 종목 조회
+            wl_items = await db.list_us_watchlist(conn)
+            symbols = [it["symbol"].upper() for it in wl_items if it.get("alert_enabled", 1)]
+            # 기본 보유 포트폴리오 및 매크로 지수 보강
+            core_symbols = ["NVDA", "PLTR", "SCHD", "SPCX", "TSLW", "VOO", "SGOV", "SPY", "QQQ"]
+            for s in core_symbols:
+                if s not in symbols:
+                    symbols.append(s)
+        else:
+            symbols = [s.strip().upper() for s in target_symbols]
+
+        # 1. 종목별 최신 뉴스 및 시세 병렬 수집
+        from core.us_market.surprise import (
+            NewsArticle,
+            analyze_news_surprise,
+            cluster_news_articles,
+            fetch_latest_us_news,
+        )
+
+        llm = None
+        try:
+            from core.llm.factory import get_llm_provider
+            llm = get_llm_provider()
+        except Exception as e:
+            logger.info(f"LLM Provider 초기화 불가 (휴리스틱 모드 작동): {e}")
+
+        all_articles: List[NewsArticle] = []
+        price_changes: Dict[str, float] = {}
+
+        for sym in symbols:
+            try:
+                art_task = asyncio.to_thread(fetch_latest_us_news, sym, news_count_per_symbol)
+                quote_task = get_us_quote(sym)
+                arts, quote = await asyncio.gather(art_task, quote_task, return_exceptions=True)
+
+                if isinstance(arts, list):
+                    all_articles.extend(arts)
+                if isinstance(quote, dict) and quote.get("change_pct") is not None:
+                    price_changes[sym] = float(quote["change_pct"])
+            except Exception as sym_err:
+                logger.warning(f"'{sym}' 뉴스 수집 중 오류: {sym_err}")
+            await asyncio.sleep(0.1)
+
+        # 2. 동일 사건(Event) 군집화 (Jaccard 토큰 유사도 기반)
+        clusters = cluster_news_articles(all_articles, similarity_threshold=0.38, time_window_hours=6.0)
+
+        # 3. 클러스터별 Surprise 점수 산출 및 임계치 검사
+        processed_clusters: List[Dict[str, Any]] = []
+        alerted_clusters: List[Dict[str, Any]] = []
+
+        for cl in clusters:
+            # 24시간 이내 이미 발송된 클러스터인지 확인
+            is_sent = await db.is_us_news_cluster_already_sent(conn, cl.cluster_id, max_age_hours=24.0)
+            if is_sent:
+                continue
+
+            current_change = price_changes.get(cl.symbol)
+            analysis = await analyze_news_surprise(
+                cluster=cl,
+                llm_provider=llm,
+                current_price_change_pct=current_change,
+            )
+
+            cluster_summary_data = {
+                "cluster_id": cl.cluster_id,
+                "symbol": cl.symbol,
+                "title": cl.anchor.title,
+                "surprise_score": analysis.surprise_score,
+                "impact_type": analysis.impact_type,
+                "affected_sector": analysis.affected_sector_theme,
+                "summary": "\n".join(analysis.summary_sentences),
+                "summary_sentences": analysis.summary_sentences,
+                "sources": cl.sources,
+                "cluster_count": cl.count,
+                "published_at": cl.anchor.published_at,
+                "rationale": analysis.rationale,
+            }
+            processed_clusters.append(cluster_summary_data)
+
+            # 임계값(Threshold) 이상일 때만 알림 발송 및 DB 기록
+            if analysis.surprise_score >= threshold:
+                alert_ok = False
+                if send_notifications:
+                    alert_ok, desc = await notify_news_surprise_if_needed(
+                        symbol=cl.symbol,
+                        analysis=analysis,
+                        sources=cl.sources,
+                        cluster_count=cl.count,
+                        published_ts=cl.anchor.published_at,
+                        threshold=threshold,
+                    )
+                else:
+                    alert_ok = True
+
+                # DB 기록
+                await db.record_us_news_alert(
+                    conn=conn,
+                    cluster_id=cl.cluster_id,
+                    symbol=cl.symbol,
+                    title=cl.anchor.title,
+                    surprise_score=analysis.surprise_score,
+                    impact_type=analysis.impact_type,
+                    affected_sector=analysis.affected_sector_theme,
+                    summary="\n".join(analysis.summary_sentences),
+                    source=", ".join(cl.sources[:3]),
+                    cluster_count=cl.count,
+                    published_at=cl.anchor.published_at,
+                    sent_at=time.time(),
+                    raw_data=cluster_summary_data,
+                )
+                alerted_clusters.append(cluster_summary_data)
+
+        return {
+            "scanned_symbols": len(symbols),
+            "total_articles": len(all_articles),
+            "clusters_count": len(clusters),
+            "processed_clusters": processed_clusters,
+            "alerted_count": len(alerted_clusters),
+            "alerted_clusters": alerted_clusters,
+        }
+    finally:
+        if close_conn:
+            await conn.close()
+
+
 class USMarketMonitorScheduler:
     """미국장 30분 주기 백그라운드 모니터링 스케줄러."""
 
@@ -233,6 +375,11 @@ class USMarketMonitorScheduler:
                     self.last_scan_at = time.time()
                     self.last_scan_count = len(results)
                     logger.info(f"🇺🇸 미국장 정기 스캔 완료: {len(results)}개 종목 처리")
+
+                    # 글로벌 뉴스 인텔리전스 스캔 연계 (Surprise 75점 이상 텔레그램 발송)
+                    logger.info("🇺🇸 글로벌 뉴스 Surprise 인텔리전스 스캔 시작")
+                    news_res = await scan_us_market_news(threshold=75, send_notifications=True)
+                    logger.info(f"🇺🇸 글로벌 뉴스 스캔 완료: {news_res.get('alerted_count', 0)}건 서프라이즈 알림 발송")
             except Exception:
                 logger.exception("미국장 정기 스케줄러 루프 오류 발생")
 

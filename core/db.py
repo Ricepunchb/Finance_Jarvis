@@ -355,6 +355,26 @@ CREATE TABLE IF NOT EXISTS us_signal_history (
 );
 CREATE INDEX IF NOT EXISTS idx_us_signal_history_symbol_ts ON us_signal_history(symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_us_signal_history_ts ON us_signal_history(ts DESC);
+
+-- 미국장 글로벌 뉴스 서프라이즈 알림 이력 테이블
+CREATE TABLE IF NOT EXISTS us_news_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    title TEXT NOT NULL,
+    surprise_score INTEGER NOT NULL,
+    impact_type TEXT NOT NULL,         -- 호재 | 악재 | 중립
+    affected_sector TEXT NOT NULL,     -- 영향 섹터 및 테마
+    summary TEXT NOT NULL,             -- 최대 세 문장 요약
+    source TEXT NOT NULL,              -- 언론사 및 대표 출처
+    cluster_count INTEGER DEFAULT 1,   -- 묶인 동일 사건 기사 수
+    published_at REAL,                 -- 기사 발행 시각
+    sent_at REAL NOT NULL,             -- 텔레그램 발송 시각
+    raw_data JSON                      -- 전체 분석 결과 JSON
+);
+CREATE INDEX IF NOT EXISTS idx_us_news_alerts_cluster ON us_news_alerts(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_us_news_alerts_sent_at ON us_news_alerts(sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_us_news_alerts_symbol ON us_news_alerts(symbol, sent_at DESC);
 """
 
 
@@ -2109,6 +2129,92 @@ async def list_us_signal_history(
                    combined_action, strength, exit_trigger, reason, indicators_json
             FROM us_signal_history
             ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def record_us_news_alert(
+    conn: aiosqlite.Connection,
+    *,
+    cluster_id: str,
+    symbol: str,
+    title: str,
+    surprise_score: int,
+    impact_type: str,
+    affected_sector: str,
+    summary: str,
+    source: str,
+    cluster_count: int = 1,
+    published_at: Optional[float] = None,
+    sent_at: Optional[float] = None,
+    raw_data: Optional[Dict[str, Any]] = None,
+) -> int:
+    """미국장 뉴스 서프라이즈 알림 이력을 기록한다."""
+    cur = await conn.execute(
+        """
+        INSERT INTO us_news_alerts (
+            cluster_id, symbol, title, surprise_score, impact_type,
+            affected_sector, summary, source, cluster_count, published_at, sent_at, raw_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cluster_id,
+            symbol.strip().upper(),
+            title.strip(),
+            int(surprise_score),
+            impact_type.strip(),
+            affected_sector.strip(),
+            summary.strip(),
+            source.strip(),
+            int(cluster_count),
+            published_at,
+            sent_at or time.time(),
+            json.dumps(raw_data or {}, ensure_ascii=False),
+        ),
+    )
+    await conn.commit()
+    return cur.lastrowid or 0
+
+
+async def is_us_news_cluster_already_sent(
+    conn: aiosqlite.Connection, cluster_id: str, max_age_hours: float = 24.0
+) -> bool:
+    """해당 뉴스 클러스터(동일 사건)가 최근 max_age_hours 이내에 이미 발송되었는지 확인."""
+    min_sent_at = time.time() - (max_age_hours * 3600.0)
+    cur = await conn.execute(
+        "SELECT 1 FROM us_news_alerts WHERE cluster_id = ? AND sent_at >= ? LIMIT 1",
+        (cluster_id, min_sent_at),
+    )
+    return (await cur.fetchone()) is not None
+
+
+async def list_us_news_alerts(
+    conn: aiosqlite.Connection, limit: int = 50, symbol: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """최근 발송된 미국장 뉴스 서프라이즈 알림 목록을 반환."""
+    if symbol:
+        cur = await conn.execute(
+            """
+            SELECT id, cluster_id, symbol, title, surprise_score, impact_type,
+                   affected_sector, summary, source, cluster_count, published_at, sent_at, raw_data
+            FROM us_news_alerts
+            WHERE symbol = ?
+            ORDER BY sent_at DESC
+            LIMIT ?
+            """,
+            (symbol.strip().upper(), limit),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            SELECT id, cluster_id, symbol, title, surprise_score, impact_type,
+                   affected_sector, summary, source, cluster_count, published_at, sent_at, raw_data
+            FROM us_news_alerts
+            ORDER BY sent_at DESC
             LIMIT ?
             """,
             (limit,),

@@ -59,12 +59,13 @@ def send_telegram_message_with_result(
         return False, "메시지 내용이 비어 있습니다."
 
     url = f"https://api.telegram.org/bot{str(token).strip()}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": str(chat_id).strip(),
         "text": text,
-        "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
         try:
@@ -219,4 +220,57 @@ async def notify_signal_if_needed(
     if ok:
         _LAST_ALERT_SENT[sym] = (current_key, time.time())
     return ok
+
+
+async def notify_news_surprise_if_needed(
+    symbol: str,
+    analysis: Any,
+    company_name: str = "",
+    sources: Optional[List[str]] = None,
+    cluster_count: int = 1,
+    published_ts: Optional[float] = None,
+    token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    threshold: int = 75,
+) -> Tuple[bool, str]:
+    """Surprise 점수가 threshold(기본 75점) 이상일 때만 이모지가 배제된 정갈한 텔레그램 알림을 발송."""
+    effective_token, effective_chat_id = token, chat_id
+    if not effective_token or not effective_chat_id:
+        env_token, env_chat_id = get_telegram_config()
+        effective_token = effective_token or env_token
+        effective_chat_id = effective_chat_id or env_chat_id
+
+    if not effective_token or not effective_chat_id:
+        return False, "텔레그램 토큰 또는 Chat ID 미설정"
+
+    score = getattr(analysis, "surprise_score", None)
+    if score is None and isinstance(analysis, dict):
+        score = analysis.get("surprise_score", 0)
+    score = int(score or 0)
+
+    if score < threshold:
+        logger.info(f"'{symbol}' 서프라이즈 점수({score}점)가 임계값({threshold}점) 미만으로 텔레그램 발송 생략")
+        return False, f"서프라이즈 점수({score}점)가 임계값({threshold}점) 미만"
+
+    from core.us_market.surprise import format_news_surprise_telegram_message
+
+    msg = format_news_surprise_telegram_message(
+        symbol=symbol,
+        company_name=company_name,
+        analysis=analysis,
+        sources=sources or [],
+        cluster_count=cluster_count,
+        published_ts=published_ts,
+    )
+
+    # 이모지 배제 및 특수기호 깨짐 방지를 위해 parse_mode="" (Plain Text) 전송
+    ok, desc = await asyncio.to_thread(
+        send_telegram_message_with_result,
+        effective_token,
+        effective_chat_id,
+        msg,
+        parse_mode="",
+    )
+    return ok, desc
+
 

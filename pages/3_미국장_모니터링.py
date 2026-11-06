@@ -153,13 +153,150 @@ with col_h2:
         st.caption("최근 자동 스캔 기록 없음")
 
 # 탭 구성
-tab_board, tab_manage, tab_history, tab_settings = st.tabs(
-    ["📊 30분 실시간 시그널 보드", "💼 관심 & 보유 종목 관리", "🧾 시그널 타임라인", "🔔 알림 & 환경 설정"]
+tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
+    [
+        "⚡ 글로벌 뉴스 서프라이즈",
+        "📊 30분 실시간 시그널 보드",
+        "💼 관심 & 보유 종목 관리",
+        "🧾 시그널 타임라인",
+        "🔔 알림 & 환경 설정",
+    ]
 )
 
 
 # =========================================================================
-# TAB 1: 📊 30분 실시간 시그널 보드
+# TAB 1: ⚡ 글로벌 뉴스 서프라이즈 인텔리전스
+# =========================================================================
+with tab_news:
+    st.subheader("⚡ 글로벌 뉴스 서프라이즈 인텔리전스")
+    st.caption(
+        "로이터(Reuters), 블룸버그(Bloomberg) 등 주요 외신 뉴스를 실시간 수집 및 사건 단위로 자동 군집화(Clustering)하고, "
+        "시장 기대치 괴리도와 주가 반응을 결합한 **Surprise 점수(0~100점)**를 산출하여 핵심 요약을 전달합니다."
+    )
+
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1.5, 2, 1.5])
+    with ctrl_col1:
+        news_sym_filter = st.text_input("종목 심볼 필터 (전체는 'ALL')", value="ALL", key="news_sym_filter").strip().upper()
+    with ctrl_col2:
+        threshold_slider = st.slider(
+            "Surprise 점수 텔레그램 발송 기준선 (Threshold)",
+            min_value=50,
+            max_value=95,
+            value=75,
+            step=5,
+            help="권장: 75점 (75점 이상 유의미한 시장 충격/호재·악재 뉴스만 텔레그램으로 즉시 발송됩니다)",
+            key="news_threshold_slider",
+        )
+    with ctrl_col3:
+        st.write("")
+        st.write("")
+        if st.button("⚡ 뉴스 즉시 스캔 & 분석", type="primary", use_container_width=True, key="btn_scan_news"):
+            with st.spinner("글로벌 뉴스 수집, 사건 군집화 및 AI 서프라이즈 점수 산출 중..."):
+                scan_res = api_post(
+                    "/us-market/scan-news",
+                    {
+                        "symbols": None if news_sym_filter in ("", "ALL") else [news_sym_filter],
+                        "threshold": threshold_slider,
+                        "send_notifications": True,
+                    },
+                    timeout=30,
+                )
+                if scan_res and scan_res.get("status") == "ok":
+                    alerted = scan_res.get("alerted_count", 0)
+                    total_art = scan_res.get("total_articles", 0)
+                    clusters_n = scan_res.get("clusters_count", 0)
+                    st.success(
+                        f"스캔 완료: 총 {total_art}개 기사 수집 ➔ {clusters_n}개 사건 군집화 ➔ "
+                        f"기준선({threshold_slider}점) 이상 {alerted}건 서프라이즈 알림 발송!"
+                    )
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    detail = scan_res.get("detail", "서버 응답 오류") if isinstance(scan_res, dict) else "스캔 실패"
+                    st.error(f"뉴스 스캔 실패: {detail}")
+
+    st.divider()
+
+    # 뉴스 알림 목록 조회
+    filter_arg = None if news_sym_filter in ("", "ALL") else news_sym_filter
+    url = f"/us-market/news-alerts?limit=50"
+    if filter_arg:
+        url += f"&symbol={filter_arg}"
+
+    news_alerts = api_get(url, timeout=10) or []
+
+    if news_alerts:
+        st.markdown(f"##### 📢 포착된 서프라이즈 뉴스 피드 (최근 {len(news_alerts)}건)")
+        for n_item in news_alerts:
+            n_sym = n_item.get("symbol", "")
+            n_title = n_item.get("title", "")
+            n_score = int(n_item.get("surprise_score", 0))
+            n_impact = n_item.get("impact_type", "중립")
+            n_sector = n_item.get("affected_sector", "글로벌 거시경제")
+            n_source = n_item.get("source", "외신 종합")
+            n_clusters = int(n_item.get("cluster_count", 1))
+            n_sent_at = n_item.get("sent_at")
+            n_summary = n_item.get("summary", "")
+
+            # 영향 배지 스타일
+            if n_impact == "호재":
+                impact_badge = '<span class="badge badge-buy-strong" style="font-size:0.85rem;">호재</span>'
+                card_border = "#10b981"
+            elif n_impact == "악재":
+                impact_badge = '<span class="badge badge-sell-strong" style="font-size:0.85rem;">악재</span>'
+                card_border = "#ef4444"
+            else:
+                impact_badge = '<span class="badge badge-hold" style="font-size:0.85rem;">중립</span>'
+                card_border = "#6b7280"
+
+            # 서프라이즈 점수 색상
+            if n_score >= 85:
+                score_badge = f'<span style="background:#dc2626; color:white; padding:3px 10px; border-radius:999px; font-weight:700; font-size:0.85rem;">Surprise {n_score}점 (초대형 임팩트)</span>'
+            elif n_score >= 75:
+                score_badge = f'<span style="background:#f59e0b; color:white; padding:3px 10px; border-radius:999px; font-weight:700; font-size:0.85rem;">Surprise {n_score}점 (유의미한 서프라이즈)</span>'
+            else:
+                score_badge = f'<span style="background:#6b7280; color:white; padding:3px 10px; border-radius:999px; font-weight:700; font-size:0.85rem;">Surprise {n_score}점</span>'
+
+            # 클러스터 매체 레이블
+            src_display = n_source
+            if n_clusters > 1 and "개 매체" not in src_display:
+                src_display += f" (외 {n_clusters - 1}개 매체 보도)"
+
+            # 요약 문장 분리
+            summary_lines = [line.strip() for line in n_summary.split("\n") if line.strip()]
+            summary_html_items = "".join([f"<li style='margin-bottom:4px;'>{line}</li>" for line in summary_lines[:3]])
+
+            news_card_html = (
+                f'<div style="background:rgba(127,127,127,0.05); border:1px solid rgba(127,127,127,0.18); '
+                f'border-left:5px solid {card_border}; border-radius:12px; padding:16px 20px; margin-bottom:14px;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; margin-bottom:8px;">'
+                f'<div>'
+                f'<span style="font-size:1.25rem; font-weight:800; margin-right:10px;">[{n_sym}]</span>'
+                f'{impact_badge} {score_badge}'
+                f'</div>'
+                f'<div style="text-align:right; font-size:0.82rem; color:gray;">'
+                f'보도/발송: {fmt_kst(n_sent_at)}'
+                f'</div>'
+                f'</div>'
+                f'<div style="font-size:1.05rem; font-weight:700; margin-bottom:6px;">{n_title}</div>'
+                f'<div style="font-size:0.84rem; color:#9ca3af; margin-bottom:10px;">'
+                f'영향 섹터/테마: <b style="color:#d1d5db;">{n_sector}</b> &nbsp;|&nbsp; 출처: {src_display}'
+                f'</div>'
+                f'<div style="background:rgba(0,0,0,0.15); border-radius:8px; padding:10px 14px; font-size:0.92rem; line-height:1.5;">'
+                f'<ol style="margin:0; padding-left:18px;">{summary_html_items}</ol>'
+                f'</div>'
+                f'</div>'
+            )
+            st.html(news_card_html)
+    else:
+        st.info(
+            f"아직 기준선({threshold_slider}점) 이상의 서프라이즈 뉴스가 포착되지 않았습니다.\n\n"
+            f"우측 상단의 **'⚡ 뉴스 즉시 스캔 & 분석'** 버튼을 눌러 글로벌 뉴스를 즉시 수집하고 분석해 보세요!"
+        )
+
+
+# =========================================================================
+# TAB 2: 📊 30분 실시간 시그널 보드
 # =========================================================================
 with tab_board:
     watchlist = api_get("/us-market/watchlist", timeout=15) or []

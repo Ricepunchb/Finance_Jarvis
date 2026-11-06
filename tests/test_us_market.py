@@ -378,4 +378,275 @@ def test_us_consensus_and_news_proxy_mapping(monkeypatch):
     assert "Tesla Announces" in res["news"][0]["title"]
 
 
+def test_strip_all_emojis_clean():
+    """이모지 제거 함수가 한글을 보존하면서 유니코드 이모지만 100% 제거하는지 검증."""
+    from core.us_market.surprise import strip_all_emojis, EMOJI_PATTERN
+
+    sample_text = "🚨 [글로벌 뉴스 서프라이즈] 📈 호재! NVDA 엔비디아 실적 ⏰ 발표 🚀 반도체 ⭐ 100점 ⚡"
+    cleaned = strip_all_emojis(sample_text)
+
+    # 1. 한글 및 텍스트 보존 확인
+    assert "글로벌 뉴스 서프라이즈" in cleaned
+    assert "호재!" in cleaned
+    assert "NVDA 엔비디아 실적" in cleaned
+    assert "발표" in cleaned
+    assert "반도체" in cleaned
+    assert "100점" in cleaned
+
+    # 2. 이모지가 완전히 제거되었는지 패턴 매칭 검증
+    assert EMOJI_PATTERN.search(cleaned) is None
+
+
+def test_cluster_news_articles():
+    """동일 사건에 대한 다수 언론사 기사가 1개의 클러스터로 자동 묶이는지 검증."""
+    import time
+    from core.us_market.surprise import NewsArticle, cluster_news_articles
+
+    now = time.time()
+    articles = [
+        NewsArticle(
+            symbol="NVDA",
+            title="Exclusive: Nvidia AI chips face delays in Hong Kong amid China import approval review",
+            summary="China authorities are reviewing import licenses.",
+            source="Reuters",
+            published_at=now - 300,
+        ),
+        NewsArticle(
+            symbol="NVDA",
+            title="Nvidia chips pile up in Hong Kong as China holds import approvals",
+            summary="Supply chain bottleneck in Hong Kong.",
+            source="Bloomberg",
+            published_at=now - 500,
+        ),
+        NewsArticle(
+            symbol="NVDA",
+            title="Why Warren Buffett is buying dividend stocks right now",
+            summary="General market opinion.",
+            source="Motley Fool",
+            published_at=now - 1000,
+        ),
+        NewsArticle(
+            symbol="AAPL",
+            title="Apple unveils new M4 chip with AI capabilities",
+            summary="Hardware announcement.",
+            source="CNBC",
+            published_at=now - 100,
+        ),
+    ]
+
+    clusters = cluster_news_articles(articles, similarity_threshold=0.35, time_window_hours=6.0)
+
+    # 4개의 기사 중 NVDA의 홍콩 칩 기사 2건은 1개로 묶여 총 3개의 클러스터가 생성되어야 함
+    assert len(clusters) == 3
+
+    # NVDA 첫 번째 클러스터 검증
+    nvda_cluster = next(c for c in clusters if c.symbol == "NVDA" and c.count == 2)
+    assert nvda_cluster.count == 2
+    assert "Reuters" in nvda_cluster.sources
+    assert "Bloomberg" in nvda_cluster.sources
+
+    # AAPL 클러스터 분리 검증
+    aapl_cluster = next(c for c in clusters if c.symbol == "AAPL")
+    assert aapl_cluster.count == 1
+    assert aapl_cluster.sources == ["CNBC"]
+
+
+def test_format_news_surprise_telegram_message():
+    """텔레그램 메시지 서식이 이모지 없이 최대 3문장 요약, 호재/악재, 섹터, Surprise 점수를 포함하는지 검증."""
+    from core.us_market.surprise import (
+        EMOJI_PATTERN,
+        SurpriseAnalysisResult,
+        format_news_surprise_telegram_message,
+    )
+
+    analysis = SurpriseAnalysisResult(
+        surprise_score=85,
+        impact_type="호재",
+        affected_sector_theme="AI 반도체 및 고성능 컴퓨팅",
+        summary_sentences=[
+            "1분기 매출이 컨센서스를 15% 상회하며 분기 사상 최대치를 기록했습니다.",
+            "차세대 블랙웰 칩의 연간 선주문량이 이미 전량 완판되었습니다.",
+            "클라우드 하이퍼스케일러들의 AI 인프라 투자 지속으로 견조한 수요가 예상됩니다.",
+            "네 번째 문장은 3문장 제한 규칙에 의해 자동 탈락되어야 합니다.",
+        ],
+        rationale="컨센서스 대비 어닝 서프라이즈 및 가이던스 상향",
+    )
+
+    msg = format_news_surprise_telegram_message(
+        symbol="NVDA",
+        company_name="NVIDIA Corporation",
+        analysis=analysis,
+        sources=["Reuters", "Bloomberg"],
+        cluster_count=2,
+    )
+
+    # 1. 이모지 완전 배제 확인
+    assert EMOJI_PATTERN.search(msg) is None
+
+    # 2. 필수 요건 필드 확인
+    assert "[글로벌 뉴스 서프라이즈]" in msg
+    assert "대상 종목: NVDA (NVIDIA Corporation)" in msg
+    assert "Surprise 점수: 85점" in msg
+    assert "시장 영향: 호재" in msg
+    assert "영향 섹터/테마: AI 반도체 및 고성능 컴퓨팅" in msg
+    assert "1. 1분기 매출이 컨센서스를 15% 상회하며" in msg
+    assert "2. 차세대 블랙웰 칩의 연간 선주문량이" in msg
+    assert "3. 클라우드 하이퍼스케일러들의 AI 인프라" in msg
+    # 최대 3문장 초과분은 포함되지 않아야 함
+    assert "네 번째 문장" not in msg
+    assert "Reuters, Bloomberg (외 1개 매체)" in msg
+
+
+def test_db_news_alerts_and_deduplication():
+    """뉴스 서프라이즈 알림 DB 기록 및 동일 클러스터 24시간 중복 방지 검증."""
+    import asyncio
+    import aiosqlite
+    from core import db
+
+    async def _run():
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript(db.SCHEMA)
+
+        cluster_id = "test_cluster_nvda_001"
+
+        # 1. 발송 전: is_us_news_cluster_already_sent는 False여야 함
+        is_sent = await db.is_us_news_cluster_already_sent(conn, cluster_id, max_age_hours=24.0)
+        assert is_sent is False
+
+        # 2. 알림 기록
+        row_id = await db.record_us_news_alert(
+            conn=conn,
+            cluster_id=cluster_id,
+            symbol="NVDA",
+            title="Nvidia Q3 Earnings Beat Expectations",
+            surprise_score=88,
+            impact_type="호재",
+            affected_sector="반도체",
+            summary="1. 어닝 서프라이즈 달성",
+            source="Reuters",
+            cluster_count=2,
+        )
+        assert row_id > 0
+
+        # 3. 발송 후: 동일 클러스터 ID는 True로 반환되어야 함
+        is_sent_now = await db.is_us_news_cluster_already_sent(conn, cluster_id, max_age_hours=24.0)
+        assert is_sent_now is True
+
+        # 4. 목록 조회 검증
+        alerts = await db.list_us_news_alerts(conn, limit=10, symbol="NVDA")
+        assert len(alerts) == 1
+        assert alerts[0]["symbol"] == "NVDA"
+        assert alerts[0]["surprise_score"] == 88
+        assert alerts[0]["impact_type"] == "호재"
+        await conn.close()
+
+    asyncio.run(_run())
+
+
+def test_notify_news_surprise_threshold(monkeypatch):
+    """Surprise 점수가 임계값 미만이면 텔레그램 발송을 생략하고, 이상일 때만 발송하는지 검증."""
+    import asyncio
+    from core.us_market.notifier import notify_news_surprise_if_needed
+    from core.us_market.surprise import SurpriseAnalysisResult
+
+    sent_calls = []
+
+    def mock_send(token, chat_id, text, parse_mode="", timeout=10):
+        sent_calls.append({"text": text, "parse_mode": parse_mode})
+        return True, "성공"
+
+    monkeypatch.setattr("core.us_market.notifier.send_telegram_message_with_result", mock_send)
+
+    low_analysis = SurpriseAnalysisResult(
+        surprise_score=60,  # 75점 미만
+        impact_type="중립",
+        affected_sector_theme="거시경제",
+        summary_sentences=["단순 시황 브리핑입니다."],
+        rationale="기선반영 시황",
+    )
+
+    high_analysis = SurpriseAnalysisResult(
+        surprise_score=82,  # 75점 이상
+        impact_type="호재",
+        affected_sector_theme="소프트웨어 AI",
+        summary_sentences=["대형 클라우드 공급 계약 수주 성공."],
+        rationale="예상치 못한 대형 수주",
+    )
+
+    async def _run():
+        # 1. 60점: threshold 75 미만이므로 발송되지 않음
+        ok1, _ = await notify_news_surprise_if_needed(
+            symbol="PLTR",
+            analysis=low_analysis,
+            token="mock_token",
+            chat_id="12345",
+            threshold=75,
+        )
+        assert ok1 is False
+        assert len(sent_calls) == 0
+
+        # 2. 82점: threshold 75 이상이므로 발송됨
+        ok2, _ = await notify_news_surprise_if_needed(
+            symbol="PLTR",
+            analysis=high_analysis,
+            token="mock_token",
+            chat_id="12345",
+            threshold=75,
+        )
+        assert ok2 is True
+        assert len(sent_calls) == 1
+        assert "PLTR" in sent_calls[0]["text"]
+        assert "Surprise 점수: 82점" in sent_calls[0]["text"]
+
+    asyncio.run(_run())
+
+
+def test_us_news_api_endpoints(monkeypatch):
+    """GET /us-market/news-alerts 및 POST /us-market/scan-news API 정상 동작 검증."""
+    from unittest.mock import AsyncMock
+
+    mock_news_result = {
+        "scanned_symbols": 2,
+        "total_articles": 10,
+        "clusters_count": 3,
+        "processed_clusters": [],
+        "alerted_count": 1,
+        "alerted_clusters": [
+            {
+                "symbol": "NVDA",
+                "title": "Nvidia Beats Q3 Estimates",
+                "surprise_score": 88,
+                "impact_type": "호재",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        "core.us_market.service.scan_us_market_news",
+        AsyncMock(return_value=mock_news_result),
+    )
+
+    client = TestClient(app)
+
+    # 1. GET /us-market/news-alerts
+    resp = client.get("/us-market/news-alerts?limit=10")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+    # 2. POST /us-market/scan-news
+    post_resp = client.post(
+        "/us-market/scan-news",
+        json={"symbols": ["NVDA"], "threshold": 75, "send_notifications": False},
+    )
+    assert post_resp.status_code == 200
+    data = post_resp.json()
+    assert data["status"] == "ok"
+    assert data["threshold"] == 75
+    assert data["alerted_count"] == 1
+    assert data["scanned_symbols"] == 2
+
+
+
+
 
