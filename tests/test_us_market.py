@@ -647,6 +647,135 @@ def test_us_news_api_endpoints(monkeypatch):
     assert data["scanned_symbols"] == 2
 
 
+def test_us_rebalance_plan_cash_inflow_and_band_drift():
+    """현금 유입형(Cash-Inflow, 매도 0건) 및 밴드 이탈형(Band Drift, 초과분 슬림화) 리밸런싱 계획 수립 검증."""
+    from core.us_market.rebalance import (
+        USPositionStatus,
+        build_us_rebalance_plan,
+        format_us_rebalance_telegram_message,
+    )
+    from core.us_market.surprise import EMOJI_PATTERN
+
+    # 1. 현금 유입(Inflow) 시나리오: 과비중 종목 없이 달러만 입금된 경우
+    positions_inflow = [
+        USPositionStatus(
+            symbol="NVDA", name="NVIDIA", exchange="NASD", qty=7, current_price=140.0,
+            eval_value_usd=980.0, current_weight=0.196, target_weight=0.20, drift_pct=-0.004, status="BALANCED"
+        ),
+        USPositionStatus(
+            symbol="VOO", name="Vanguard S&P 500", exchange="AMEX", qty=1, current_price=530.0,
+            eval_value_usd=530.0, current_weight=0.106, target_weight=0.20, drift_pct=-0.094, status="DEFICIT"
+        ),
+        USPositionStatus(
+            symbol="SCHD", name="Schwab US Dividend", exchange="AMEX", qty=10, current_price=80.0,
+            eval_value_usd=800.0, current_weight=0.16, target_weight=0.20, drift_pct=-0.04, status="DEFICIT"
+        ),
+    ]
+
+    drift_data_inflow = {
+        "total_equity_usd": 5000.0,
+        "total_stock_eval_usd": 2310.0,
+        "available_usd": 1500.0,
+        "inflow_detected_usd": 1000.0,
+        "band_pct": 0.05,
+        "positions": positions_inflow,
+        "excess_positions": [],
+        "deficit_positions": [positions_inflow[1], positions_inflow[2]],
+    }
+
+    plan_inflow = build_us_rebalance_plan(drift_data_inflow)
+    assert plan_inflow.trigger_type == "CASH_INFLOW"
+    assert plan_inflow.total_sell_usd == 0.0  # 기존 주식 매도 0건 (양도세 0원)
+    assert plan_inflow.total_buy_usd > 0
+    assert len([it for it in plan_inflow.items if it.action == "SELL"]) == 0
+    assert len([it for it in plan_inflow.items if it.action == "BUY"]) >= 1
+
+    # 텔레그램 메시지 포맷 검증
+    msg = format_us_rebalance_telegram_message(plan_inflow)
+    assert EMOJI_PATTERN.search(msg) is None  # 이모지 완전 배제
+    assert "달러 신규 입금 감지" in msg
+    assert "매도 예정" not in msg  # 매도가 없으므로 섹션 생략
+
+    # 2. 밴드 이탈(Band Drift) 시나리오: NVDA 급등으로 목표비중(+5%p)을 초과한 경우
+    positions_drift = [
+        USPositionStatus(
+            symbol="NVDA", name="NVIDIA", exchange="NASD", qty=10, current_price=140.0,
+            eval_value_usd=1400.0, current_weight=0.28, target_weight=0.20, drift_pct=0.08, status="EXCESS"
+        ),
+        USPositionStatus(
+            symbol="VOO", name="Vanguard S&P 500", exchange="AMEX", qty=1, current_price=530.0,
+            eval_value_usd=530.0, current_weight=0.106, target_weight=0.20, drift_pct=-0.094, status="DEFICIT"
+        ),
+    ]
+
+    drift_data_drift = {
+        "total_equity_usd": 5000.0,
+        "total_stock_eval_usd": 1930.0,
+        "available_usd": 3070.0,
+        "inflow_detected_usd": 0.0,
+        "band_pct": 0.05,
+        "positions": positions_drift,
+        "excess_positions": [positions_drift[0]],
+        "deficit_positions": [positions_drift[1]],
+    }
+
+    plan_drift = build_us_rebalance_plan(drift_data_drift)
+    assert plan_drift.trigger_type == "BAND_DRIFT"
+    assert plan_drift.total_sell_usd > 0  # 초과분 매도 발생
+    sells = [it for it in plan_drift.items if it.action == "SELL"]
+    assert len(sells) == 1
+    assert sells[0].symbol == "NVDA"
+    assert sells[0].qty >= 1
+
+
+def test_us_rebalance_api_endpoints(monkeypatch):
+    """미국장 리밸런싱 API 엔드포인트(status, plan, weights, execute) 정상 동작 검증."""
+    from unittest.mock import AsyncMock
+
+    mock_status = {
+        "total_equity_usd": 5000.0,
+        "total_stock_eval_usd": 4000.0,
+        "available_usd": 1000.0,
+        "inflow_detected_usd": 500.0,
+        "band_pct": 0.05,
+        "positions": [],
+        "excess_positions": [],
+        "deficit_positions": [],
+        "quotes": {},
+    }
+
+    monkeypatch.setattr(
+        "core.us_market.rebalance.analyze_us_portfolio_drift",
+        AsyncMock(return_value=mock_status),
+    )
+
+    client = TestClient(app)
+
+    # 1. GET /us-market/rebalance/status
+    r1 = client.get("/us-market/rebalance/status")
+    assert r1.status_code == 200
+    assert r1.json()["total_equity_usd"] == 5000.0
+
+    # 2. POST /us-market/rebalance/plan
+    r2 = client.post("/us-market/rebalance/plan", json={"band_pct": 0.05, "force_inflow_rebalance": False})
+    assert r2.status_code == 200
+    assert "trigger_type" in r2.json()
+
+    # 3. POST /us-market/rebalance/weights
+    r3 = client.post(
+        "/us-market/rebalance/weights",
+        json={"weights": {"VOO": 0.25, "SCHD": 0.25, "NVDA": 0.25, "SGOV": 0.25}},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["status"] == "ok"
+    assert r3.json()["weights"]["VOO"] == 0.25
+
+    # 4. POST /us-market/rebalance/execute (시뮬레이션 모드)
+    r4 = client.post("/us-market/rebalance/execute", json={"shadow_mode": True})
+    assert r4.status_code == 200
+    assert "status" in r4.json()
+
+
 
 
 

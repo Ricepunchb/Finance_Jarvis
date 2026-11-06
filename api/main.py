@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -1143,6 +1143,21 @@ class USNewsScanRequest(BaseModel):
     send_notifications: bool = True
 
 
+class USRebalancePlanRequest(BaseModel):
+    band_pct: float = 0.05
+    force_inflow_rebalance: bool = False
+
+
+class USRebalanceExecuteRequest(BaseModel):
+    plan: Optional[Dict[str, Any]] = None
+    force_inflow_rebalance: bool = False
+    shadow_mode: Optional[bool] = None
+
+
+class USWeightsUpdateRequest(BaseModel):
+    weights: Dict[str, float]
+
+
 class USTelegramTestRequest(BaseModel):
     token: Optional[str] = None
     chat_id: Optional[str] = None
@@ -1280,6 +1295,99 @@ async def trigger_us_news_scan(req: USNewsScanRequest):
             "threshold": req.threshold,
             **result,
         }
+    finally:
+        await conn.close()
+
+
+@app.get("/us-market/rebalance/status")
+async def get_us_rebalance_status(band_pct: float = 0.05):
+    """미국장 포트폴리오 비중, 드리프트 및 가용 달러 상태 진단."""
+    from core.us_market.rebalance import analyze_us_portfolio_drift
+    conn = await db.get_connection()
+    try:
+        client = engine.client if getattr(engine, "is_meritz", False) else None
+        drift = await analyze_us_portfolio_drift(conn, client=client, band_pct=band_pct)
+        return drift
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/rebalance/plan")
+async def create_us_rebalance_plan_endpoint(req: USRebalancePlanRequest):
+    """드리프트 진단 기반 미국장 리밸런싱 계획 생성."""
+    from core.us_market.rebalance import analyze_us_portfolio_drift, build_us_rebalance_plan
+    conn = await db.get_connection()
+    try:
+        client = engine.client if getattr(engine, "is_meritz", False) else None
+        drift = await analyze_us_portfolio_drift(conn, client=client, band_pct=req.band_pct)
+        plan = build_us_rebalance_plan(drift, force_inflow_rebalance=req.force_inflow_rebalance)
+        return plan.model_dump()
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/rebalance/execute")
+async def execute_us_rebalance_endpoint(req: USRebalanceExecuteRequest):
+    """수립된 미국장 리밸런싱 계획을 실제 정규장 주문으로 집행."""
+    from core.us_market.rebalance import (
+        analyze_us_portfolio_drift,
+        build_us_rebalance_plan,
+        execute_us_rebalance_plan,
+        USRebalancePlan,
+    )
+    conn = await db.get_connection()
+    try:
+        client = engine.client if getattr(engine, "is_meritz", False) else None
+        if req.plan:
+            plan = USRebalancePlan.model_validate(req.plan)
+        else:
+            drift = await analyze_us_portfolio_drift(conn, client=client)
+            plan = build_us_rebalance_plan(drift, force_inflow_rebalance=req.force_inflow_rebalance)
+
+        res = await execute_us_rebalance_plan(
+            conn, plan, client=client, shadow_mode=req.shadow_mode
+        )
+        return res
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/rebalance/notify")
+async def notify_us_rebalance_endpoint(req: USRebalancePlanRequest):
+    """현재 리밸런싱 계획을 텔레그램으로 브리핑 발송."""
+    from core.us_market.rebalance import (
+        analyze_us_portfolio_drift,
+        build_us_rebalance_plan,
+        format_us_rebalance_telegram_message,
+    )
+    from core.us_market.notifier import get_telegram_config, send_telegram_message_with_result
+    conn = await db.get_connection()
+    try:
+        client = engine.client if getattr(engine, "is_meritz", False) else None
+        drift = await analyze_us_portfolio_drift(conn, client=client, band_pct=req.band_pct)
+        plan = build_us_rebalance_plan(drift, force_inflow_rebalance=req.force_inflow_rebalance)
+        msg = format_us_rebalance_telegram_message(plan)
+
+        token, chat_id = get_telegram_config()
+        if not token or not chat_id:
+            raise HTTPException(status_code=400, detail="텔레그램 토큰 또는 Chat ID가 설정되지 않았습니다.")
+
+        ok, desc = await asyncio.to_thread(
+            send_telegram_message_with_result, token, chat_id, msg, parse_mode=""
+        )
+        return {"status": "ok" if ok else "failed", "detail": desc, "message_preview": msg}
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/rebalance/weights")
+async def update_us_weights_endpoint(req: USWeightsUpdateRequest):
+    """미국장 포트폴리오 목표 비중 업데이트."""
+    from core.us_market.rebalance import set_us_target_weights
+    conn = await db.get_connection()
+    try:
+        updated = await set_us_target_weights(conn, req.weights)
+        return {"status": "ok", "weights": updated}
     finally:
         await conn.close()
 

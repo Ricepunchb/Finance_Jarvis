@@ -153,8 +153,9 @@ with col_h2:
         st.caption("최근 자동 스캔 기록 없음")
 
 # 탭 구성
-tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
+tab_rebalance, tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
     [
+        "⚖️ 자산배분 & 자동 리밸런싱",
         "⚡ 글로벌 뉴스 서프라이즈",
         "📊 30분 실시간 시그널 보드",
         "💼 관심 & 보유 종목 관리",
@@ -165,7 +166,203 @@ tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
 
 
 # =========================================================================
-# TAB 1: ⚡ 글로벌 뉴스 서프라이즈 인텔리전스
+# TAB 1: ⚖️ 자산배분 & 자동 리밸런싱 (미국장 전용)
+# =========================================================================
+with tab_rebalance:
+    st.subheader("⚖️ 미국장 스마트 자산배분 & 자동 리밸런싱")
+    st.caption(
+        "순수 USD 기준 계좌로 운영되며, **달러 입금 시 세금 없는 매수 우선(Cash-Inflow)**, "
+        "**비중 초과(±5%p) 시 슬림화(Band Drift)**, **정규장 정수 1주 단위 분할 집행**을 수행합니다."
+    )
+
+    reb_status = api_get("/us-market/rebalance/status", timeout=15)
+    if not reb_status:
+        st.warning("미국장 포트폴리오 비중 상태를 불러올 수 없습니다. FastAPI 서버를 확인하세요.")
+    else:
+        tot_eq = float(reb_status.get("total_equity_usd") or 0.0)
+        tot_stock = float(reb_status.get("total_stock_eval_usd") or 0.0)
+        avail_usd = float(reb_status.get("available_usd") or 0.0)
+        inflow_usd = float(reb_status.get("inflow_detected_usd") or 0.0)
+        pos_list = reb_status.get("positions", [])
+
+        # 1. 상단 핵심 자산 지표 (달러 기준)
+        rm1, rm2, rm3, rm4 = st.columns(4)
+        rm1.metric("총 평가자산 (USD)", f"${tot_eq:,.2f}")
+        rm2.metric("주식 평가액 (USD)", f"${tot_stock:,.2f}")
+        rm3.metric(
+            "가용 달러 (Available USD)",
+            f"${avail_usd:,.2f}",
+            delta=f"+${inflow_usd:,.2f} 입금 감지" if inflow_usd > 10.0 else None,
+        )
+        excess_cnt = len(reb_status.get("excess_positions", []))
+        deficit_cnt = len(reb_status.get("deficit_positions", []))
+        rm4.metric(
+            "포트폴리오 균형 상태",
+            "균형 유지 (정상)" if excess_cnt == 0 and deficit_cnt == 0 else f"초과 {excess_cnt} / 미달 {deficit_cnt}",
+            delta="리밸런싱 권장" if excess_cnt > 0 or (avail_usd >= 30.0 and deficit_cnt > 0) else "안정",
+            delta_color="normal" if excess_cnt == 0 else "inverse",
+        )
+
+        st.divider()
+
+        # 2. 포트폴리오 비중 현황 테이블
+        st.markdown("##### 📊 종목별 현재 비중 vs 목표 비중 현황")
+        rows = []
+        for p in pos_list:
+            sym = p.get("symbol", "")
+            name = p.get("name", sym)
+            qty = p.get("qty", 0.0)
+            prc = p.get("current_price", 0.0)
+            val = p.get("eval_value_usd", 0.0)
+            cur_w = p.get("current_weight", 0.0) * 100
+            tgt_w = p.get("target_weight", 0.0) * 100
+            drift = p.get("drift_pct", 0.0) * 100
+            stat = p.get("status", "BALANCED")
+
+            if stat == "EXCESS":
+                stat_badge = "🔴 과비중 (+5%p 초과)"
+            elif stat == "DEFICIT":
+                stat_badge = "🔵 저비중 (-5%p 미달)"
+            else:
+                stat_badge = "🟢 균형 (정상)"
+
+            rows.append({
+                "티커": sym,
+                "종목명": name,
+                "보유 수량": f"{qty:.0f}주",
+                "현재가": f"${prc:,.2f}",
+                "평가액": f"${val:,.2f}",
+                "현재 비중": f"{cur_w:.1f}%",
+                "목표 비중": f"{tgt_w:.1f}%",
+                "괴리(Drift)": f"{drift:+.1f}%p",
+                "상태": stat_badge,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # 3. 리밸런싱 실행 및 텔레그램 연동 제어
+        st.markdown("##### ⚡ 스마트 리밸런싱 진단 & 실행 제어")
+        col_act1, col_act2, col_act3 = st.columns([1.5, 1.5, 2])
+
+        with col_act1:
+            btn_plan = st.button("🔍 리밸런싱 계획 수립/새로고침", use_container_width=True, type="secondary")
+        with col_act2:
+            btn_notify = st.button("📨 텔레그램 브리핑 발송", use_container_width=True)
+        with col_act3:
+            btn_execute = st.button("🚀 리밸런싱 즉시 실행 (정규장 주문)", use_container_width=True, type="primary")
+
+        # 계획 수립
+        plan_res = api_post("/us-market/rebalance/plan", {"force_inflow_rebalance": False})
+
+        if btn_notify:
+            with st.spinner("텔레그램으로 리밸런싱 계획 발송 중..."):
+                notify_res = api_post("/us-market/rebalance/notify", {})
+                if notify_res and notify_res.get("status") == "ok":
+                    st.success("✅ 텔레그램으로 리밸런싱 계획 브리핑이 성공적으로 전송되었습니다!")
+                else:
+                    detail = notify_res.get("detail", "전송 실패") if isinstance(notify_res, dict) else "전송 실패"
+                    st.error(f"❌ 텔레그램 발송 실패: {detail}")
+
+        if btn_execute:
+            with st.spinner("리밸런싱 매매 주문 집행 중 (매도 우선 -> 매수 순서)..."):
+                exec_res = api_post("/us-market/rebalance/execute", {})
+                if exec_res and exec_res.get("status") in ("SUCCESS", "SKIPPED"):
+                    st.success(f"리밸런싱 집행 완료: {exec_res.get('executed_count', 0)}건 체결 완료!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    detail = exec_res.get("message", "주문 오류") if isinstance(exec_res, dict) else "집행 실패"
+                    st.error(f"집행 실패: {detail}")
+
+        # 계획 표시
+        if plan_res and plan_res.get("items"):
+            trigger_t = plan_res.get("trigger_type", "")
+            if trigger_t == "CASH_INFLOW":
+                banner_cls = "recommendation-box"
+                tag_str = "💡 달러 신규 입금 감지 (기존 주식 매도 0건 — 양도소득세 없는 신규 달러 매수 우선)"
+            elif trigger_t == "BAND_DRIFT":
+                banner_cls = "recommendation-box-sell"
+                tag_str = "⚠️ 비중 허용오차(±5%p) 이탈 감지 (과비중 초과분 분할 매도 및 저비중 재배치)"
+            else:
+                banner_cls = "recommendation-box"
+                tag_str = "📋 목표 비중 채움 리밸런싱"
+
+            st.markdown(
+                f'<div class="{banner_cls}" style="margin-bottom:15px;">'
+                f'<b>{tag_str}</b><br>'
+                f'<span style="font-size:0.88rem; color:#d1d5db;">{plan_res.get("rationale", "")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            p_col1, p_col2 = st.columns(2)
+            with p_col1:
+                st.markdown("###### 🔴 매도 예정 (과비중 슬림화)")
+                sells = [it for it in plan_res["items"] if it["action"] == "SELL"]
+                if sells:
+                    for s in sells:
+                        st.write(
+                            f"- **{s['symbol']}**: **{s['qty']}주** (약 ${s['estimated_amount_usd']:,.2f}) "
+                            f"— {s['reason']}"
+                        )
+                else:
+                    st.caption("매도 예정 내역 없음 (세금 발생 없음)")
+
+            with p_col2:
+                st.markdown("###### 🟢 매수 예정 (저비중 채움)")
+                buys = [it for it in plan_res["items"] if it["action"] == "BUY"]
+                if buys:
+                    for b in buys:
+                        st.write(
+                            f"- **{b['symbol']}**: **{b['qty']}주** (약 ${b['estimated_amount_usd']:,.2f}) "
+                            f"— {b['reason']}"
+                        )
+                else:
+                    st.caption("매수 예정 내역 없음")
+
+            st.caption(
+                f"총 매도 회수액: **${plan_res.get('total_sell_usd', 0):,.2f}** | "
+                f"총 매수 투입액: **${plan_res.get('total_buy_usd', 0):,.2f}** | "
+                f"예상 잔여 달러: **${plan_res.get('projected_residual_usd', 0):,.2f}**"
+            )
+        else:
+            st.info("현재 모든 종목이 목표 비중 허용 오차(±5%p) 이내이며, 추가 리밸런싱이 필요하지 않습니다.")
+
+        # 4. 목표 비중 편집기
+        with st.expander("⚙️ 미국장 포트폴리오 목표 비중(Target Weights) 편집", expanded=False):
+            st.caption("각 종목의 목표 비중을 백분율(%)로 입력하세요. 총합은 자동으로 100%로 정규화됩니다.")
+            cur_targets = {p["symbol"]: round(p["target_weight"] * 100, 1) for p in pos_list}
+            w_inputs = {}
+
+            c_w1, c_w2 = st.columns(2)
+            for idx, (sym, def_w) in enumerate(cur_targets.items()):
+                target_col = c_w1 if idx % 2 == 0 else c_w2
+                with target_col:
+                    w_inputs[sym] = st.number_input(
+                        f"{sym} 목표 비중 (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(def_w),
+                        step=1.0,
+                        key=f"target_w_{sym}",
+                    )
+
+            if st.button("💾 목표 비중 저장 및 적용", type="primary"):
+                total_w = sum(w_inputs.values())
+                if total_w <= 0:
+                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+                else:
+                    norm_weights = {k: v / total_w for k, v in w_inputs.items()}
+                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
+                    if res and res.get("status") == "ok":
+                        st.success("✅ 미국장 목표 비중이 성공적으로 저장되었습니다!")
+                        time.sleep(1)
+                        st.rerun()
+
+
+# =========================================================================
+# TAB 2: ⚡ 글로벌 뉴스 서프라이즈 인텔리전스
 # =========================================================================
 with tab_news:
     st.subheader("⚡ 글로벌 뉴스 서프라이즈 인텔리전스")
