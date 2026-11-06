@@ -221,6 +221,8 @@ with tab_rebalance:
 
             if stat == "EXCESS":
                 stat_badge = "🔴 과비중 (+5%p 초과)"
+            elif stat == "EXCESS_LOCKED":
+                stat_badge = "🟢 유지 (1주 단가 보호)"
             elif stat == "DEFICIT":
                 stat_badge = "🔵 저비중 (-5%p 미달)"
             else:

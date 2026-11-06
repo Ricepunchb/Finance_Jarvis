@@ -241,9 +241,16 @@ async def analyze_us_portfolio_drift(
         cur_w = cur_val / total_equity_usd
         tgt_w = targets.get(sym, 0.0)
         drift = cur_w - tgt_w
+        cur_qty = pos_qtys.get(sym, 0.0)
+        cur_price = quotes.get(sym, 0.0)
+        excess_val = (cur_w - (tgt_w + band_pct)) * total_equity_usd
 
         if drift > band_pct:
-            stat_label = "EXCESS"
+            # 1주 단가 보호: 초과 금액이 1주 단가보다 작거나, 보유 수량이 1주 이하인 경우 슬림화 매도 불가 (보호 유지)
+            if cur_qty <= 1.0 or (cur_price > 0 and excess_val < cur_price):
+                stat_label = "EXCESS_LOCKED"
+            else:
+                stat_label = "EXCESS"
         elif drift < -band_pct:
             stat_label = "DEFICIT"
         else:
