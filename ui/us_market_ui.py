@@ -141,10 +141,15 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
         drift = p.get("drift_pct", 0.0) * 100
         stat = p.get("status", "BALANCED")
 
+        pnl_val = p.get("pnl_pct", 0.0)
+        avg_prc = p.get("avg_price", 0.0)
+
         if stat == "EXCESS":
             stat_badge = "🔴 과비중 (+5%p 초과)"
         elif stat == "EXCESS_LOCKED":
             stat_badge = "🟢 유지 (1주 단가 보호)"
+        elif stat == "EXCESS_LOSS_LOCKED":
+            stat_badge = f"🟢 유지 (손실 보호 {pnl_val:+.1f}%)"
         elif stat == "DEFICIT":
             stat_badge = "🔵 저비중 (-5%p 미달)"
         elif stat == "UNMANAGED":
@@ -152,11 +157,15 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
         else:
             stat_badge = "🟢 균형 (정상)"
 
+        pnl_str = f"{pnl_val:+.1f}%" if avg_prc > 0 and qty > 0 else "-"
+
         rows.append({
             "티커": sym,
             "종목명": name,
             "보유 수량": f"{qty:.0f}주",
+            "내 평단가": f"${avg_prc:,.2f}" if avg_prc > 0 and qty > 0 else "-",
             "현재가": f"${prc:,.2f}",
+            "수익률": pnl_str,
             "평가액": f"${val:,.2f}",
             "현재 비중": f"{cur_w:.1f}%",
             "목표 비중": f"{tgt_w:.1f}%",

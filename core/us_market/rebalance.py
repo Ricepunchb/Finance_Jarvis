@@ -67,12 +67,14 @@ class USPositionStatus(BaseModel):
     name: str = ""
     exchange: str = "NASD"
     qty: float = 0.0
+    avg_price: float = 0.0
     current_price: float = 0.0
     eval_value_usd: float = 0.0
+    pnl_pct: float = 0.0
     current_weight: float = 0.0
     target_weight: float = 0.0
     drift_pct: float = 0.0  # current_weight - target_weight
-    status: str = "BALANCED"  # EXCESS (+밴드 초과) | DEFICIT (-밴드 미달) | BALANCED (정상)
+    status: str = "BALANCED"  # EXCESS | DEFICIT | BALANCED | EXCESS_LOCKED | EXCESS_LOSS_LOCKED | UNMANAGED
 
 
 class USRebalanceItem(BaseModel):
@@ -251,12 +253,19 @@ async def analyze_us_portfolio_drift(
         cur_price = quotes.get(sym, 0.0)
         excess_val = (cur_w - (tgt_w + band_pct)) * total_equity_usd
 
+        h_info = holdings_dict.get(sym, {})
+        avg_entry = float(h_info.get("avg_entry_price") or h_info.get("avg_price") or 0.0)
+        pnl = ((cur_price - avg_entry) / avg_entry * 100) if avg_entry > 0 and cur_price > 0 else 0.0
+
         if tgt_w == 0.0 and cur_qty > 0:
             stat_label = "UNMANAGED"
         elif drift > band_pct:
-            # 1주 단가 보호: 초과 금액이 1주 단가보다 작거나, 보유 수량이 1주 이하인 경우 슬림화 매도 불가 (보호 유지)
+            # 1. 고단가 1주 보호: 초과 금액이 1주 단가보다 작거나, 보유 수량이 1주 이하인 경우 슬림화 매도 불가
             if cur_qty <= 1.0 or (cur_price > 0 and excess_val < cur_price):
                 stat_label = "EXCESS_LOCKED"
+            # 2. 손실 보호 가드: 평단가 대비 마이너스 손실(-1.0% 초과 손실)인 종목은 바닥 강제 손실 확정 방지를 위해 매도 제외
+            elif avg_entry > 0 and cur_price < avg_entry * 0.99:
+                stat_label = "EXCESS_LOSS_LOCKED"
             else:
                 stat_label = "EXCESS"
         elif drift < -band_pct:
@@ -269,8 +278,10 @@ async def analyze_us_portfolio_drift(
             name=names.get(sym, sym),
             exchange=SYMBOL_EXCHANGE_MAP.get(sym, "NASD"),
             qty=pos_qtys.get(sym, 0.0),
+            avg_price=round(avg_entry, 2),
             current_price=round(quotes.get(sym, 0.0), 2),
             eval_value_usd=round(cur_val, 2),
+            pnl_pct=round(pnl, 2),
             current_weight=round(cur_w, 4),
             target_weight=round(tgt_w, 4),
             drift_pct=round(drift, 4),
@@ -327,6 +338,8 @@ def build_us_rebalance_plan(
                     amt = round(sell_qty * p.current_price, 2)
                     total_sell_usd += amt
                     post_w = round((p.eval_value_usd - amt) / total_equity, 4)
+                    action_desc = "이익실현" if p.pnl_pct >= 0 else "비중 축소"
+                    pnl_str = f"수익률 {p.pnl_pct:+.1f}%, " if p.avg_price > 0 else ""
                     items.append(
                         USRebalanceItem(
                             symbol=p.symbol,
@@ -335,7 +348,7 @@ def build_us_rebalance_plan(
                             qty=sell_qty,
                             estimated_price=p.current_price,
                             estimated_amount_usd=amt,
-                            reason=f"밴드 상한 초과분 이익실현 ({p.current_weight*100:.1f}% -> {post_w*100:.1f}%)",
+                            reason=f"밴드 상한 초과분 {action_desc} ({pnl_str}{p.current_weight*100:.1f}% -> {post_w*100:.1f}%)",
                             pre_weight=p.current_weight,
                             post_weight=post_w,
                         )
