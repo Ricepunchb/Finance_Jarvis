@@ -128,8 +128,8 @@ def test_engine_proxy_order_routing():
             mock_chart = [{
                 "xymd": "20261001", "open": "195", "high": "205", "low": "190", "clos": "200", "tvol": "10000"
             }]
-            with patch("core.kis_overseas.get_price", new=AsyncMock(return_value={"last": "200.0"})), \
-                 patch("core.kis_overseas.get_daily_chart", new=AsyncMock(return_value=mock_chart)), \
+            with patch("core.meritz_overseas.get_price", new=AsyncMock(return_value={"last": "200.0"})), \
+                 patch("core.meritz_overseas.get_daily_chart", new=AsyncMock(return_value=mock_chart)), \
                  patch("core.intraday.get_intraday_signal_overseas", new=AsyncMock(return_value=None)), \
                  patch("core.fundamentals.valuation.get_valuation_signal_overseas", new=AsyncMock(return_value=None)), \
                  patch("core.signal_engine.decide", new=AsyncMock(return_value=MagicMock(side="buy", qty=10, reason="GOOGL 모멘텀 매수", order_type="limit"))), \

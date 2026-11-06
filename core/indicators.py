@@ -57,16 +57,35 @@ def chart_rows_to_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def chart_rows_to_dataframe_overseas(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """KIS 해외주식 dailyprice의 output2 리스트를 OHLCV DataFrame으로 변환.
+    """해외주식 일봉(meritz_overseas.get_daily_chart) 리스트를 OHLCV DataFrame으로 변환.
 
-    국내(inquire-daily-itemchartprice)와 필드명이 다르다(xymd/open/high/low/clos/tvol).
+    메리츠 원시 필드(date/oprc/hprc/lprc/prpr/acml_vol)와 정규화 필드(xymd/open/high/low/clos/tvol)를
+    모두 수용한다.
     """
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    df = df.rename(
-        columns={"xymd": "date", "open": "open", "high": "high", "low": "low", "clos": "close", "tvol": "volume"}
-    )
+    rename_map = {}
+    if "date" not in df.columns and "xymd" in df.columns:
+        rename_map["xymd"] = "date"
+    if "open" not in df.columns and "oprc" in df.columns:
+        rename_map["oprc"] = "open"
+    if "high" not in df.columns and "hprc" in df.columns:
+        rename_map["hprc"] = "high"
+    if "low" not in df.columns and "lprc" in df.columns:
+        rename_map["lprc"] = "low"
+    if "close" not in df.columns:
+        if "prpr" in df.columns:
+            rename_map["prpr"] = "close"
+        elif "clos" in df.columns:
+            rename_map["clos"] = "close"
+    if "volume" not in df.columns:
+        if "acml_vol" in df.columns:
+            rename_map["acml_vol"] = "volume"
+        elif "tvol" in df.columns:
+            rename_map["tvol"] = "volume"
+    if rename_map:
+        df = df.rename(columns=rename_map)
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")

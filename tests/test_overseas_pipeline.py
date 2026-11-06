@@ -222,7 +222,7 @@ def test_validate_candidate_symbol_overseas():
     async def run():
         mock_client = AsyncMock()
 
-        with patch("core.kis_overseas.get_price") as mock_price:
+        with patch("core.meritz_overseas.get_price") as mock_price:
             mock_price.return_value = {
                 "last": "230.50",
                 "ovrs_nmix_prpr": "230.50",

@@ -29,18 +29,32 @@ PROFILE_DEFAULTS = {
         "api_port": 8800,
         "front_port": 8501,
         "is_mock": False,
+        "broker": "kis",
+        "shadow_mode": False,
     },
     "real": {
         "display": "실전 일반 계좌 (수수료 무료)",
         "api_port": 8801,
         "front_port": 8502,
         "is_mock": False,
+        "broker": "kis",
+        "shadow_mode": False,
     },
     "mock": {
         "display": "모의투자 계좌",
         "api_port": 8802,
         "front_port": 8503,
         "is_mock": True,
+        "broker": "kis",
+        "shadow_mode": False,
+    },
+    "meritz": {
+        "display": "메리츠 해외 실전 계좌",
+        "api_port": 8803,
+        "front_port": 8504,
+        "is_mock": False,
+        "broker": "meritz",
+        "shadow_mode": True,
     },
 }
 
@@ -99,6 +113,8 @@ def parse_env_file(env_path: Path) -> Dict[str, Any]:
         "front_port": defaults.get("front_port", 8501),
         "account_no": "-",
         "is_mock": defaults.get("is_mock", False),
+        "broker": defaults.get("broker", "kis"),
+        "shadow_mode": defaults.get("shadow_mode", False),
         "domestic_only": True,
         "proxy_trading": False,
         "hts_id": "-",
@@ -131,6 +147,10 @@ def parse_env_file(env_path: Path) -> Dict[str, Any]:
                     config["front_port"] = int(v)
                 except ValueError:
                     pass
+            elif k == "BROKER":
+                config["broker"] = v.lower()
+            elif k == "SHADOW_MODE":
+                config["shadow_mode"] = v.lower() in ("true", "1", "yes")
             elif k == "KIS_ACCOUNT_NO":
                 config["account_no"] = v
             elif k == "KIS_HTS_ID":
@@ -143,6 +163,8 @@ def parse_env_file(env_path: Path) -> Dict[str, Any]:
                 config["proxy_trading"] = v.lower() in ("true", "1", "yes")
             elif k == "I_UNDERSTAND_REAL_MONEY_RISK":
                 config["understand_risk"] = v.lower() in ("true", "1", "yes")
+        if config["broker"] == "meritz" and config["account_no"] == "-":
+            config["account_no"] = "Meritz(앱키바인딩)"
     except Exception as e:
         logger.warning(f"Error parsing {env_path}: {e}")
 
@@ -256,6 +278,8 @@ def get_all_profiles_info() -> List[Dict[str, Any]]:
             "display_name": meta["display_name"],
             "account_no": meta["account_no"],
             "is_mock": meta["is_mock"],
+            "broker": meta.get("broker", "kis"),
+            "shadow_mode": meta.get("shadow_mode", False),
             "api_port": meta["api_port"],
             "front_port": meta["front_port"],
             "domestic_only": meta["domestic_only"],

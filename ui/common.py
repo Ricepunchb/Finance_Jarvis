@@ -98,10 +98,32 @@ def fmt_kst(ts: Optional[float], fmt: str = "%m-%d %H:%M") -> str:
     return datetime.fromtimestamp(ts, tz=KST).strftime(fmt) if ts else "-"
 
 
-def fmt_krw(v: Optional[float], signed: bool = False) -> str:
+def is_usd_account() -> bool:
+    try:
+        broker = getattr(settings, "BROKER", "kis").lower()
+        pname = getattr(settings, "PROFILE_NAME", "").lower()
+        return broker == "meritz" or pname == "meritz"
+    except Exception:
+        return False
+
+
+def fmt_money(v: Optional[float], signed: bool = False, currency: Optional[str] = None) -> str:
     if v is None:
         return "-"
+    if currency is None:
+        currency = "USD" if is_usd_account() else "KRW"
+    if currency.upper() == "USD":
+        return f"${v:+,.2f}" if signed else f"${v:,.2f}"
     return f"{v:+,.0f}원" if signed else f"{v:,.0f}원"
+
+
+def fmt_krw(v: Optional[float], signed: bool = False) -> str:
+    """호환용 통화 포맷터: 메리츠 해외 계좌는 USD($), 국내 KIS 계좌는 KRW(원)로 자동 포맷팅."""
+    return fmt_money(v, signed=signed)
+
+
+def fmt_usd(v: Optional[float], signed: bool = False) -> str:
+    return fmt_money(v, signed=signed, currency="USD")
 
 
 def fmt_pct(v: Optional[float], signed: bool = False, digits: int = 2) -> str:

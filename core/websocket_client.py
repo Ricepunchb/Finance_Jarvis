@@ -25,7 +25,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 from core.config import settings
-from core.tr_ids import ccnl_notice_overseas_tr_id, ccnl_notice_tr_id
+from core.tr_ids import ccnl_notice_tr_id
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +41,6 @@ _DOMESTIC_CCNL_COLUMNS = [
     "STCK_CNTG_HOUR", "RFUS_YN", "CNTG_YN", "ACPT_YN", "BRNC_NO", "ODER_QTY",
     "ACNT_NAME", "ORD_COND_PRC", "ORD_EXG_GB", "POPUP_YN", "FILLER", "CRDT_CLS",
     "CRDT_LOAN_DATE", "CNTG_ISNM40", "ODER_PRC",
-]
-
-_OVERSEAS_CCNL_COLUMNS = [
-    "CUST_ID", "ACNT_NO", "ODER_NO", "OODER_NO", "SELN_BYOV_CLS", "RCTF_CLS",
-    "ODER_KIND2", "STCK_SHRN_ISCD", "CNTG_QTY", "CNTG_UNPR", "STCK_CNTG_HOUR",
-    "RFUS_YN", "CNTG_YN", "ACPT_YN", "BRNC_NO", "ODER_QTY", "ACNT_NAME",
-    "CNTG_ISNM", "ODER_COND", "DEBT_GB", "DEBT_DATE", "START_TM", "END_TM",
-    "TM_DIV_TP", "CNTG_UNPR12",
 ]
 
 OnFill = Callable[[dict], Awaitable[None]]
@@ -144,8 +136,6 @@ class KISWebSocketClient:
         self._enc_state = {}  # 이전 세션의 key/iv는 무효 — 구독 응답으로 새로 받는다
 
         subscriptions = [(ccnl_notice_tr_id(), _DOMESTIC_CCNL_COLUMNS)]
-        if self.include_overseas:
-            subscriptions.append((ccnl_notice_overseas_tr_id(), _OVERSEAS_CCNL_COLUMNS))
 
         for tr_id, columns in subscriptions:
             self._columns_by_tr_id[tr_id] = columns

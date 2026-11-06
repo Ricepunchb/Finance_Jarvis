@@ -144,7 +144,11 @@ class RiskManager:
     def clamp_qty_to_notional(self, qty: float, price: float) -> float:
         if price <= 0:
             return qty
-        max_qty = settings.MAX_ORDER_NOTIONAL_KRW / price
+        is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+        if is_meritz and getattr(settings, "MAX_ORDER_NOTIONAL_USD", 0) > 0:
+            max_qty = settings.MAX_ORDER_NOTIONAL_USD / price
+        else:
+            max_qty = settings.MAX_ORDER_NOTIONAL_KRW / price
         return min(qty, max_qty)
 
     def clamp_buy_qty_to_position_cap(

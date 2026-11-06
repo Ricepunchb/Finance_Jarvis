@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 
 from core import (
-    db, exit_guard, indicators, intraday, kis_domestic, kis_overseas, proxy_mapping,
+    db, exit_guard, indicators, intraday, kis_domestic, meritz_overseas, proxy_mapping,
     reconciliation, signal_engine,
 )
 from core.config import get_effective_domestic_only, get_effective_proxy_trading, settings
@@ -28,6 +28,8 @@ from core.kis_client import AsyncKISClient
 from core.kis_common import KisApiError
 from core.llm.base import LLMProvider
 from core.lock import InstanceLock
+from core.meritz_client import AsyncMeritzClient, MeritzApiError
+from core.meritz_websocket import MeritzWebSocketClient
 from core.news import sentiment as news_sentiment
 from core.risk import RiskManager
 from core.utils.krx_calendar import is_krx_market_open_now
@@ -69,11 +71,15 @@ def _is_market_open(market: str, exchange: Optional[str]) -> bool:
 
 class TradingEngine:
     def __init__(self):
-        self.client = AsyncKISClient()
+        self.is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+        if self.is_meritz:
+            self.client = AsyncMeritzClient()
+        else:
+            self.client = AsyncKISClient()
         self.conn: Optional[aiosqlite.Connection] = None
         self.risk: Optional[RiskManager] = None
         self.lock = InstanceLock(settings.ENGINE_LOCK_PATH)
-        self.ws_client: Optional[KISWebSocketClient] = None
+        self.ws_client: Optional[Any] = None
         self.llm_provider: Optional[LLMProvider] = None
         self._stop_event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
@@ -114,10 +120,17 @@ class TradingEngine:
                 logger.info("GEMINI_API_KEY 미설정 - 뉴스 감성분석 비활성화, 기술적 지표만 사용")
 
             if settings.ENABLE_WEBSOCKET:
-                self.ws_client = KISWebSocketClient(
-                    hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
-                    include_overseas=not settings.DOMESTIC_ONLY,
-                )
+                if self.is_meritz:
+                    self.ws_client = MeritzWebSocketClient(
+                        client=self.client,
+                        on_fill=self._on_fill,
+                        on_any_message=self._on_any_ws_message,
+                    )
+                else:
+                    self.ws_client = KISWebSocketClient(
+                        hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
+                        include_overseas=False,
+                    )
                 await self.ws_client.start()
             else:
                 logger.info("ENABLE_WEBSOCKET=False — 실시간 웹소켓 비활성화 (REST 주기 대조 모드로 구동)")
@@ -171,27 +184,28 @@ class TradingEngine:
         finally:
             if conn is not self.conn:
                 await conn.close()
-        try:
-            cancelable = await kis_domestic.get_cancelable_orders(self.client)
-            for row in cancelable:
-                psbl_qty = float(row.get("psbl_qty") or 0)
-                if psbl_qty <= 0:
-                    continue
-                await kis_domestic.cancel_order(
-                    self.client, row.get("pdno"), row.get("ord_gno_brno"), row.get("odno")
-                )
-        except Exception:
-            logger.exception("긴급정지 중 국내 미체결주문 취소 실패 — 수동 확인 필요")
+        if not self.is_meritz:
+            try:
+                cancelable = await kis_domestic.get_cancelable_orders(self.client)
+                for row in cancelable:
+                    psbl_qty = float(row.get("psbl_qty") or 0)
+                    if psbl_qty <= 0:
+                        continue
+                    await kis_domestic.cancel_order(
+                        self.client, row.get("pdno"), row.get("ord_gno_brno"), row.get("odno")
+                    )
+            except Exception:
+                logger.exception("긴급정지 중 국내 미체결주문 취소 실패 — 수동 확인 필요")
 
-        if not settings.DOMESTIC_ONLY:
+        if self.is_meritz or not settings.DOMESTIC_ONLY:
             try:
                 today = datetime.now(tz=KST).strftime("%Y%m%d")
-                ccnl_rows = await kis_overseas.get_ccnl(self.client, start_date=today, end_date=today)
+                ccnl_rows = await meritz_overseas.get_ccnl(self.client, start_date=today, end_date=today)
                 for row in ccnl_rows:
                     nccs_qty = float(row.get("nccs_qty") or 0)  # 미체결수량
                     if nccs_qty <= 0:
                         continue
-                    await kis_overseas.cancel_order(
+                    await meritz_overseas.cancel_order(
                         self.client, row.get("ovrs_excg_cd"), row.get("pdno"), row.get("odno"),
                         int(nccs_qty), float(row.get("ft_ord_unpr3") or 0),
                     )
@@ -289,27 +303,16 @@ class TradingEngine:
         self._intraday_backfill_budget = intraday.BackfillBudget(settings.INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE)
         self._orders_submitted_in_cycle = 0
 
-        balance = await kis_domestic.get_balance(self.client)
-        holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
-        total_equity = float(balance["summary"].get("nass_amt") or 0)
-        # 잔고에서 사라진(전량 청산) 종목도 qty=0으로 내려야 진입가/고점이 초기화된다.
-        await db.sync_positions_from_balance(
-            self.conn,
-            {s: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
-             for s, h in holdings_by_symbol.items()},
-            overseas=False,
-        )
-
-        # 관리 중인 종목 중 해외가 하나라도 있을 때만 해외 잔고를 조회한다 (국내전용 사용자는
-        # Phase 1/2 때와 동일하게 이 호출이 아예 발생하지 않는다).
-        domestic_only = await get_effective_domestic_only(self.conn)
-        overseas_holdings_by_symbol: dict = {}
-        overseas_balance_ok = False
-        if not domestic_only and any(symbol_info.get(s, {}).get("market") == "overseas" for s in active_weights):
+        if self.is_meritz:
+            balance = {"holdings": [], "summary": {}}
+            holdings_by_symbol = {}
+            total_equity = 0.0
+            overseas_holdings_by_symbol: dict = {}
+            overseas_balance_ok = False
             try:
-                present = await kis_overseas.get_present_balance_krw(self.client)
+                present = await meritz_overseas.get_present_balance_krw(self.client)
                 overseas_holdings_by_symbol = {h["pdno"]: h for h in present["holdings"] if h.get("pdno")}
-                total_equity += float((present["totals"] or {}).get("tot_asst_amt") or 0)
+                total_equity = float((present["totals"] or {}).get("tot_asst_amt") or 0)
                 await db.sync_positions_from_balance(
                     self.conn,
                     {s: (float(h.get("cblc_qty13") or 0), float(h.get("avg_unpr3") or 0), h.get("crcy_cd") or "USD")
@@ -318,7 +321,22 @@ class TradingEngine:
                 )
                 overseas_balance_ok = True
             except Exception:
-                logger.exception("해외 잔고조회 실패 - 이번 사이클은 해외 종목 처리를 건너뜀")
+                logger.exception("메리츠 해외 잔고조회 실패 - 이번 사이클은 해외 종목 처리를 건너뜀")
+        else:
+            balance = await kis_domestic.get_balance(self.client)
+            holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
+            total_equity = float(balance["summary"].get("nass_amt") or 0)
+            # 잔고에서 사라진(전량 청산) 종목도 qty=0으로 내려야 진입가/고점이 초기화된다.
+            await db.sync_positions_from_balance(
+                self.conn,
+                {s: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
+                 for s, h in holdings_by_symbol.items()},
+                overseas=False,
+            )
+            overseas_holdings_by_symbol = {}
+            overseas_balance_ok = False
+
+        domestic_only = await get_effective_domestic_only(self.conn)
 
         halted_count = 0
         domestic_symbol_count = 0
@@ -356,6 +374,12 @@ class TradingEngine:
 
             if domestic_only and market == "overseas":
                 continue  # 국내 전용: 해외 종목은 매매·정리 모두 건너뛴다 (DB의 종목/이력은 그대로 둔다)
+
+            if self.is_meritz and market != "overseas":
+                continue  # 메리츠 계좌: 해외 전용이므로 국내 종목은 스킵
+
+            if not self.is_meritz and market == "overseas":
+                continue  # KIS 계좌: 해외 지원 종료(메리츠로 이관)로 스킵
 
             if not _is_market_open(market, exchange):
                 continue  # 이 종목이 속한 시장이 지금 닫혀있음 - 매 사이클 로그가 쌓이지 않게 조용히 스킵
@@ -700,16 +724,23 @@ class TradingEngine:
             return
 
         try:
-            result = await kis_overseas.order(self.client, exchange, symbol, "sell", int(qty), discounted_price)
-            kis_order_no = result.get("ODNO") or result.get("odno")
-            await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            shadow = getattr(settings, "SHADOW_MODE", False)
+            result = await meritz_overseas.order(
+                self.client, exchange, symbol, "sell", int(qty), discounted_price, shadow=shadow,
+            )
+            order_no = result.get("ODNO") or result.get("odno")
+            status = "FILLED" if shadow else "SUBMITTED"
+            await db.update_order_intent(self.conn, intent_id, status=status, kis_order_no=order_no)
             self._orders_submitted_in_cycle += 1
-        except KisApiError as e:
+            if shadow:
+                await db.record_rest_fill(self.conn, intent_id, float(qty), discounted_price)
+        except (KisApiError, MeritzApiError) as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()
+            err_msg = getattr(e, "msg1", None) or getattr(e, "rsp_msg", None) or str(e)
             await db.log_decision(
                 self.conn, cycle_id, symbol, current_weight, target_weight, current_weight - target_weight,
-                "N/A", "N/A", "SELL", qty, f"{exit_reason} 주문 거부: {e.msg1}", intent_id, context=context,
+                "N/A", "N/A", "SELL", qty, f"{exit_reason} 주문 거부: {err_msg}", intent_id, context=context,
             )
             return
 
@@ -736,49 +767,72 @@ class TradingEngine:
             await self._log_no_op(cycle_id, symbol, target_weight, "체결통보 웹소켓 비정상 - 신규주문 차단", context)
             return
 
-        price_info = await kis_overseas.get_price(self.client, exchange, symbol)
+        price_info = await meritz_overseas.get_price(self.client, exchange, symbol)
         price_foreign = float(price_info.get("last") or 0)
         context["price_foreign"] = price_foreign
         if price_foreign <= 0:
             await self._log_no_op(cycle_id, symbol, target_weight, "현재가 조회 실패", context)
             return
 
-        # 비중 계산은 KRW 기준으로 통일해야 하므로 기준환율(bass_exrt)이 필요하다 — 이미
-        # 보유 중이면 이번 사이클 시작에 조회한 present_balance 값을 재사용하고, 신규
-        # 종목(보유 없음)이면 매수가능금액조회에서 환율(exrt)만 얻어온다.
-        bass_exrt = float(holding.get("bass_exrt")) if holding and holding.get("bass_exrt") else 0.0
-        if bass_exrt <= 0:
-            exrt_probe = await kis_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
-            bass_exrt = float(exrt_probe.get("exrt") or 0)
-            context["exrt_probe"] = exrt_probe
-        if bass_exrt <= 0:
-            await self._log_no_op(cycle_id, symbol, target_weight, "환율 조회 실패", context)
-            return
+        # 메리츠 해외 계좌: 원화 환산 없이 순수 USD로 포지션 가치, 비중, 손절, 목표 수량을 계산한다.
+        # 원화(KRW)는 일체 개입하지 않으며 환율 변동으로 인한 왜곡이나 원화 자동환전을 원천 방지한다.
+        if self.is_meritz:
+            eval_price = price_foreign
+            eval_avg_price = float(holding.get("avg_unpr3") or 0) if holding else 0.0
+            qty = float(holding.get("cblc_qty13") or 0) if holding else 0.0
+            position_value = qty * eval_price
+            current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
+            price_krw = 0.0
+            avg_price_krw = 0.0
+            bass_exrt = 1.0
+            context.update({
+                "currency": "USD",
+                "price_usd": price_foreign,
+                "qty_before": qty,
+                "position_value_usd": position_value,
+                "current_weight": current_weight,
+            })
+        else:
+            # 비중 계산은 KRW 기준으로 통일해야 하므로 기준환율(bass_exrt)이 필요하다 — 이미
+            # 보유 중이면 이번 사이클 시작에 조회한 present_balance 값을 재사용하고, 신규
+            # 종목(보유 없음)이면 매수가능금액조회에서 환율(exrt)만 얻어온다.
+            bass_exrt = float(holding.get("bass_exrt")) if holding and holding.get("bass_exrt") else 0.0
+            if bass_exrt <= 0:
+                exrt_probe = await meritz_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
+                bass_exrt = float(exrt_probe.get("exrt") or 0)
+                context["exrt_probe"] = exrt_probe
+            if bass_exrt <= 0:
+                bass_exrt = await meritz_overseas.get_fx_rate(self.client, "USD")
+            if bass_exrt <= 0:
+                await self._log_no_op(cycle_id, symbol, target_weight, "환율 조회 실패", context)
+                return
 
-        price_krw = price_foreign * bass_exrt
-        qty = float(holding.get("cblc_qty13") or 0) if holding else 0.0
-        position_value = qty * price_krw
-        current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
-        context.update({
-            "bass_exrt": bass_exrt, "price_krw": price_krw, "qty_before": qty,
-            "position_value": position_value, "current_weight": current_weight,
-        })
+            eval_price = price_foreign * bass_exrt
+            price_krw = eval_price
+            avg_price_foreign = float(holding.get("avg_unpr3") or 0) if holding else 0.0
+            eval_avg_price = avg_price_foreign * bass_exrt
+            avg_price_krw = eval_avg_price
+            qty = float(holding.get("cblc_qty13") or 0) if holding else 0.0
+            position_value = qty * price_krw
+            current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
+            context.update({
+                "bass_exrt": bass_exrt, "price_krw": price_krw, "qty_before": qty,
+                "position_value": position_value, "current_weight": current_weight,
+            })
 
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그것들과 무관하게 평가한다.
         # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
-        # 체결확률을 확보한다. 가격/평단가는 원화(KRW) 기준으로 일관되게 비교한다.
+        # 체결확률을 확보한다. 메리츠 해외 계좌는 순수 USD 기준, KIS 프록시는 원화(KRW) 기준으로 일관되게 비교한다.
         df = None
         tech_signal = None
         if qty > 0:
-            avg_price_foreign = float(holding.get("avg_unpr3") or 0) if holding else 0.0
-            avg_price_krw = avg_price_foreign * bass_exrt
-            await db.update_position_peak(self.conn, symbol, price_krw)
+            await db.update_position_peak(self.conn, symbol, eval_price)
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
             atr_pct = None
             is_uptrend = False
             try:  # 일봉은 아래 시그널 계산에서도 재사용. 실패해도 폴백값으로 청산 평가는 계속한다.
-                chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
+                chart_rows = await meritz_overseas.get_daily_chart(self.client, exchange, symbol)
                 df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
                 atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
                 tech_signal = indicators.compute_technical_signal(df)
@@ -786,10 +840,10 @@ class TradingEngine:
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
             exit_decision = exit_guard.evaluate_exit(
-                avg_price_krw, peak_price, price_krw, atr_pct, is_uptrend=is_uptrend
+                eval_avg_price, peak_price, eval_price, atr_pct, is_uptrend=is_uptrend
             )
             context["exit_check"] = {
-                "avg_price_krw": avg_price_krw, "peak_price_krw": peak_price, "atr_pct": atr_pct,
+                "eval_avg_price": eval_avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
                 "is_uptrend": is_uptrend,
                 "fired": exit_decision.reason if exit_decision else None,
                 "sell_ratio": exit_decision.sell_ratio if exit_decision else None,
@@ -801,7 +855,7 @@ class TradingEngine:
                     price_foreign, price_krw, avg_price_krw, exit_decision.reason, context,
                 )
                 if sell_qty < qty:
-                    await db.reset_position_peak(self.conn, symbol, price_krw)
+                    await db.reset_position_peak(self.conn, symbol, eval_price)
                 return
 
         if not ws_ok:
@@ -816,7 +870,7 @@ class TradingEngine:
             return
 
         if df is None:
-            chart_rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol)
+            chart_rows = await meritz_overseas.get_daily_chart(self.client, exchange, symbol)
             df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
         if tech_signal is None:
             tech_signal = indicators.compute_technical_signal(df)
@@ -852,7 +906,7 @@ class TradingEngine:
             intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
             valuation_signal=valuation_signal,
-            price=price_krw,  # signal_engine의 qty 계산은 KRW 기준 total_equity와 일관되어야 함
+            price=eval_price,  # 메리츠 해외는 USD price, KIS 프록시는 KRW price로 total_equity와 100% 일치
             current_position_qty=qty,
             current_position_value=position_value,
             total_equity=total_equity,
@@ -875,7 +929,8 @@ class TradingEngine:
         context["action_before_recheck"] = {"side": action.side, "qty": action.qty, "reason": action.reason}
 
         # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
-        proxy_enabled = await get_effective_proxy_trading(self.conn)
+        # 메리츠 계좌는 직접 해외 주식을 거래하므로 대리 매매를 하지 않는다 (국내 KIS 전용).
+        proxy_enabled = (not self.is_meritz) and await get_effective_proxy_trading(self.conn)
         proxy_info = proxy_mapping.get_proxy_etf(symbol) if proxy_enabled else None
         if proxy_info:
             proxy_symbol = proxy_info["proxy_symbol"]
@@ -958,8 +1013,7 @@ class TradingEngine:
 
         # 주문 직전 항상 실시간으로 재확인 — 캐시/이전 조회 신뢰 금지.
         if action.side == "buy":
-
-            psbl = await kis_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
+            psbl = await meritz_overseas.get_buyable_cash(self.client, exchange, symbol, price_foreign)
             context["buyable_check"] = psbl
             action.qty = min(action.qty, float(psbl.get("max_ord_psbl_qty") or 0))
         else:
@@ -985,21 +1039,28 @@ class TradingEngine:
             return
 
         try:
-            result = await kis_overseas.order(
+            shadow = getattr(settings, "SHADOW_MODE", False)
+            avail_usd = float(psbl.get("ovrs_ord_psbl_amt") or 0.0) if action.side == "buy" else None
+            result = await meritz_overseas.order(
                 self.client, exchange, symbol, action.side, int(action.qty), price_foreign,
+                shadow=shadow, available_usd=avail_usd,
             )
-            kis_order_no = result.get("ODNO") or result.get("odno")
-            await db.update_order_intent(self.conn, intent_id, status="SUBMITTED", kis_order_no=kis_order_no)
+            order_no = result.get("ODNO") or result.get("odno")
+            status = "FILLED" if shadow else "SUBMITTED"
+            await db.update_order_intent(self.conn, intent_id, status=status, kis_order_no=order_no)
             self._orders_submitted_in_cycle += 1
+            if shadow:
+                await db.record_rest_fill(self.conn, intent_id, float(action.qty), price_foreign)
             if winddown_liquidating is not None:
                 await db.mark_winddown_sell_started(self.conn, symbol)
-        except KisApiError as e:
+        except (KisApiError, MeritzApiError) as e:
             await db.update_order_intent(self.conn, intent_id, status="REJECTED")
             await self.risk.record_order_rejection()
+            err_msg = getattr(e, "msg1", None) or getattr(e, "rsp_msg", None) or str(e)
             await db.log_decision(
                 self.conn, cycle_id, symbol, current_weight, target_weight,
                 current_weight - target_weight, tech_signal["direction"], str(sentiment_signal),
-                action.side.upper(), action.qty, f"주문 거부: {e.msg1}", intent_id, context=context,
+                action.side.upper(), action.qty, f"주문 거부: {err_msg}", intent_id, context=context,
             )
             return
 

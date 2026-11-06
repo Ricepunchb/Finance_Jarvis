@@ -28,17 +28,21 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
     with st.expander("⚙️ 백테스트 파라미터 설정", expanded=True):
         col_sym, col_bench = st.columns([3, 2])
         with col_sym:
-            default_symbols = "005930,000660"
+            from core.profile_manager import get_active_profile
+            active_prof = get_active_profile().lower()
+            is_meritz = (active_prof == "meritz")
+            default_symbols = "NVDA,TSLW,SPCX,SCHD,VOO,SGOV,PLTW,GLD" if is_meritz else "005930,000660"
             symbols_input = st.text_input(
                 "테스트 대상 종목코드 (쉼표 구분)",
                 value=default_symbols,
-                help="예: 005930,000660,017670 (삼성전자, SK하이닉스, SK텔레콤 등)",
+                help="예: NVDA,TSLW,SPCX,SCHD,VOO,SGOV,PLTW,GLD 또는 005930,000660",
             )
         with col_bench:
+            default_bench = "QQQ" if is_meritz else "360750"
             bench_input = st.text_input(
-                "베이스라인 벤치마크 (S&P 500 ETF)",
-                value="360750",
-                help="기본값: 360750 (TIGER 미국S&P500 - 원화 계좌 1:1 비교용 대장주 ETF)",
+                "베이스라인 벤치마크",
+                value=default_bench,
+                help="기본값: QQQ (나스닥 100) 또는 360750 (TIGER 미국S&P500)",
             )
 
         col_period, col_dates = st.columns([2, 3])

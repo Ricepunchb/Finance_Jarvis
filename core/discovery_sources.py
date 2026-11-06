@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, discovery, discovery_signals, kis_domestic, kis_overseas, master_files, quant_metrics
+from core import db, discovery, discovery_signals, kis_domestic, meritz_overseas, master_files, quant_metrics
 from core.config import get_effective_domestic_only, settings
 from core.fundamentals.naver_consensus import fetch_consensus
 from core.fundamentals.naver_research import fetch_company_research
@@ -241,29 +241,28 @@ async def source_theme_laggards(
 
 
 async def source_overseas_news_buzz(
-    client: AsyncKISClient,
+    client: Any,
     names: Dict[str, str],
     collector: Optional[Any] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """KIS 해외뉴스종합 API(HHPSTH60100C1)를 통해 미국 시장 헤드라인 표본을 수집하고 종목 언급량을 집계한다."""
-    try:
-        raw_rows = await _kis_retry(kis_overseas.get_news_titles, client, nation_cd="US")
-    except Exception:
-        logger.warning("KIS 해외 뉴스 헤드라인 표본 조회 실패", exc_info=True)
-        raw_rows = []
-
+    """해외 후보 종목들의 최근 뉴스 헤드라인(네이버 해외/Yahoo Finance)을 수집하고 종목 언급량을 집계한다."""
     headlines = []
     seen = set()
-    for row in raw_rows:
-        title = row.get("titl") or row.get("title") or row.get("hts_pbnt_titl_cntt") or ""
-        if title and title not in seen:
-            seen.add(title)
-            headlines.append({
-                "hts_pbnt_titl_cntt": title,
-                "iscd1": row.get("symb") or "",
-                "data_dt": row.get("data_dt"),
-                "data_tm": row.get("data_tm"),
-            })
+    for sym in list(names.keys())[:25]:
+        try:
+            articles = await asyncio.to_thread(fetch_recent_news, sym, 10)
+            for a in articles:
+                title = (a.get("title") or "").strip()
+                if title and title not in seen:
+                    seen.add(title)
+                    headlines.append({
+                        "hts_pbnt_titl_cntt": title,
+                        "iscd1": sym,
+                        "data_dt": "",
+                        "data_tm": "",
+                    })
+        except Exception:
+            logger.debug(f"해외 종목({sym}) 뉴스 헤드라인 조회 실패", exc_info=True)
 
     if collector is not None:
         collector.sampled_headline_count = (getattr(collector, "sampled_headline_count", 0) or 0) + len(headlines)

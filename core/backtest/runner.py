@@ -46,20 +46,29 @@ class BacktestRunner:
     async def run(self, config: BacktestConfig) -> Dict[str, Any]:
         """백테스트 전체 파이프라인 실행."""
         # 1. 포트폴리오 종목 및 벤치마크 데이터 로드
+        from core.utils.symbol_mapper import is_overseas_symbol
+
         data_by_symbol: Dict[str, pd.DataFrame] = {}
         for sym in config.symbols:
+            is_ovs = is_overseas_symbol(sym)
+            market = "overseas" if is_ovs else "domestic"
+            exchange = "AMEX" if sym.upper() == "SPY" else ("NASD" if is_ovs else None)
             df = await self.data_manager.get_ohlcv(
-                sym, config.start_date, config.end_date, market="domestic", include_padding=True
+                sym, config.start_date, config.end_date, market=market, exchange=exchange, include_padding=True
             )
             data_by_symbol[sym] = df
 
         # 벤치마크 종목 로드
+        bench_sym = config.benchmark_symbol
+        bench_is_ovs = is_overseas_symbol(bench_sym)
+        bench_market = "overseas" if bench_is_ovs else config.benchmark_market
+        bench_exchange = config.benchmark_exchange or ("AMEX" if bench_sym.upper() == "SPY" else ("NASD" if bench_is_ovs else None))
         bench_df = await self.data_manager.get_ohlcv(
-            config.benchmark_symbol,
+            bench_sym,
             config.start_date,
             config.end_date,
-            market=config.benchmark_market,
-            exchange=config.benchmark_exchange,
+            market=bench_market,
+            exchange=bench_exchange,
             include_padding=False,
         )
 

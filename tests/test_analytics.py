@@ -158,7 +158,7 @@ def test_overseas_daily_fetch_pages_backwards_until_since(monkeypatch):
         async def fake_chart(client, excd, symbol, base_date="", modified_price=True):
             seen.append(base_date)
             return [{"xymd": d, "open": "1", "high": "1", "low": "1", "clos": "10", "tvol": "1"} for d in pages.get(base_date, [])]
-        monkeypatch.setattr(daily_prices.kis_overseas, "get_daily_chart", fake_chart)
+        monkeypatch.setattr(daily_prices.meritz_overseas, "get_daily_chart", fake_chart)
         bars = await daily_prices._fetch_overseas(object(), "NASD", "TSLA", "2026-09-25")
         assert seen == ["", "20260928"] and sorted(b["date"] for b in bars)[0] == "2026-09-25"
         await conn.close()

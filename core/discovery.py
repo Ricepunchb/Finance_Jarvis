@@ -20,7 +20,7 @@ import aiosqlite
 import pandas as pd
 
 from core import (
-    db, discovery_signals, indicators, kis_domestic, kis_overseas, proxy_mapping, quant_metrics,
+    db, discovery_signals, indicators, kis_domestic, meritz_overseas, proxy_mapping, quant_metrics,
 )
 from core.config import settings
 from core.fundamentals import yfinance_client
@@ -70,7 +70,7 @@ async def validate_candidate_symbol(
             kis_name = claimed_name or clean_sym
             for ex in ["NASD", "NYSE", "AMEX"]:
                 try:
-                    price_info = await kis_overseas.get_price(client, ex, clean_sym)
+                    price_info = await meritz_overseas.get_price(client, ex, clean_sym)
                     p = float(price_info.get("last") or price_info.get("ovrs_nmix_prpr") or 0)
                     if p > 0:
                         price = p
@@ -191,7 +191,7 @@ async def _score_one(
             chart_rows = []
             for ex in ["NASD", "NYSE", "AMEX"]:
                 try:
-                    chart_rows = await kis_overseas.get_daily_chart(client, ex, symbol)
+                    chart_rows = await meritz_overseas.get_daily_chart(client, ex, symbol)
                     if chart_rows:
                         break
                 except Exception:

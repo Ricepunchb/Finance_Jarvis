@@ -208,8 +208,12 @@ for p in profiles:
     is_current_view = (front_port == current_front_port)
 
     # 테두리 및 뱃지 스타일
+    broker = p.get("broker", "kis")
+    shadow_mode = p.get("shadow_mode", False)
     card_border = "#10b981" if status_code == "running" else ("#f59e0b" if status_code != "stopped" else "rgba(127,127,127,0.25)")
     type_badge_html = '<span class="badge-mock">모의</span>' if is_mock else '<span class="badge-live">실전</span>'
+    broker_badge_html = ' <span style="background:#7c3aed; color:white; padding:3px 8px; border-radius:6px; font-size:0.76rem; font-weight:bold; margin-right:6px;">메리츠증권</span>' if broker == "meritz" else ''
+    shadow_badge_html = ' <span style="background:#0891b2; color:white; padding:3px 8px; border-radius:6px; font-size:0.76rem; font-weight:bold; margin-right:6px;">🛡️ SHADOW (드라이런)</span>' if shadow_mode else ''
     active_badge_html = ' <span class="badge-active">⭐ 기본 프로필</span>' if is_active else ''
     current_badge_html = ' <span style="background:#6366f1; color:white; padding:3px 8px; border-radius:6px; font-size:0.76rem; font-weight:bold; margin-left:6px;">📍 현재 접속 중</span>' if is_current_view else ''
 
@@ -220,6 +224,8 @@ for p in profiles:
         f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">'
         f'<div>'
         f'{type_badge_html} '
+        f'{broker_badge_html}'
+        f'{shadow_badge_html}'
         f'<strong style="font-size: 1.18rem; margin-right: 8px;">{display}</strong> '
         f'<code style="font-size: 0.88rem; color: #888;">({name})</code>'
         f'{active_badge_html}'
@@ -259,8 +265,13 @@ for p in profiles:
                     h_val = p["holdings_value"]
                     u_pnl = p["unrealized_pnl"]
                     pnl_color = "#10b981" if u_pnl > 0 else ("#ef4444" if u_pnl < 0 else "#888")
-                    st.markdown(f"**{h_val:,.0f} 원**")
-                    st.markdown(f"<span style='color:{pnl_color}; font-weight:600;'>{u_pnl:+,.0f} 원</span>", unsafe_allow_html=True)
+                    is_usd = p.get("broker") == "meritz" or p.get("name") == "meritz"
+                    if is_usd:
+                        st.markdown(f"**${h_val:,.2f}**")
+                        st.markdown(f"<span style='color:{pnl_color}; font-weight:600;'>{u_pnl:+,.2f}$</span>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"**{h_val:,.0f} 원**")
+                        st.markdown(f"<span style='color:{pnl_color}; font-weight:600;'>{u_pnl:+,.0f} 원</span>", unsafe_allow_html=True)
                 else:
                     st.markdown("<span style='color:#888;'>API 정지됨</span>", unsafe_allow_html=True)
 

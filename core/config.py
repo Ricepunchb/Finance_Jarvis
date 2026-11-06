@@ -32,11 +32,13 @@ _DEFAULT_PROFILE_PORTS = {
     "isa": (8800, 8501),
     "real": (8801, 8502),
     "mock": (8802, 8503),
+    "meritz": (8803, 8504),
 }
 _DEFAULT_PROFILE_NAMES = {
     "isa": "ISA 절세 계좌",
     "real": "실전 일반 계좌 (수수료 무료)",
     "mock": "모의투자 계좌",
+    "meritz": "메리츠 해외 실전 계좌",
     "default": "기본 계좌",
 }
 
@@ -47,12 +49,25 @@ class Settings(BaseSettings):
     API_PORT: int = _DEFAULT_PROFILE_PORTS.get(_ACTIVE_PROFILE, (8800, 8501))[0]
     FRONT_PORT: int = _DEFAULT_PROFILE_PORTS.get(_ACTIVE_PROFILE, (8800, 8501))[1]
 
-    KIS_APP_KEY: str
-    KIS_APP_SECRET: str
-    KIS_ACCOUNT_NO: str    # 예: 12345678-01
-    KIS_HTS_ID: str        # 실시간 체결통보(웹소켓) 구독에 필요한 HTS 로그인 ID
-    IS_MOCK: bool = True   # 기본값은 모의투자
-    # True면 실시간 체결통보를 위한 KIS 웹소켓 클라이언트를 구동한다.
+    # 브로커 구분: "kis"(한국투자증권 - 국내 전용) | "meritz"(메리츠증권 - 해외 전용)
+    BROKER: str = "meritz" if _ACTIVE_PROFILE == "meritz" else "kis"
+
+    KIS_APP_KEY: str = ""
+    KIS_APP_SECRET: str = ""
+    KIS_ACCOUNT_NO: str = ""    # 예: 12345678-01
+    KIS_HTS_ID: str = ""        # 실시간 체결통보(웹소켓) 구독에 필요한 HTS 로그인 ID
+    IS_MOCK: bool = True        # 기본값은 모의투자
+
+    # --- 메리츠증권 Open API (해외 계좌 전용) ---
+    MERITZ_APP_KEY: str = ""
+    MERITZ_APP_SECRET: str = ""
+    MERITZ_BASE_URL: str = "https://openapi.imeritz.com:9443"
+    MERITZ_WS_URL: str = "wss://openapi.imeritz.com:29443/websocket"
+    # 메리츠는 모의투자 서버가 없으므로 SHADOW_MODE=True(드라이런)로 시그널/주문 판단만 기록하고 실제 주문 전송을 차단할 수 있다.
+    SHADOW_MODE: bool = False
+    MAX_ORDER_NOTIONAL_USD: float = 500.0  # 해외 1회 주문 최대 금액(USD 하드캡)
+
+    # True면 실시간 체결통보를 위한 웹소켓 클라이언트를 구동한다.
     # 동일 HTS ID를 사용하는 복수 계좌(실전 일반 + ISA) 동시 구동 시 단일 세션 충돌 방지를 위해 보조 계좌는 False 권장.
     ENABLE_WEBSOCKET: bool = True
 
@@ -92,6 +107,7 @@ class Settings(BaseSettings):
     ONBOARDING_DAYS: int = 3                     # 목표금액을 이 일수로 나눈 만큼을 하루 매수 예산으로 사용 (최적화값)
     REQUIRE_UPTREND_FOR_ONBOARDING: bool = True  # 온보딩 매수 시 중기 상승 추세(SMA20 >= SMA60) 필수 (역추세 물타기 방지)
     REQUIRE_SMA20_FOR_BUY: bool = True           # 모든 신규 매수 시 단기 이평선(Close >= SMA20) 상회 필수 (칼날잡기 방지)
+    ACCUMULATION_MODE: bool = False              # True 시 적립식/자산배분 모드 (단기 30분봉 SELL 신호로 코어 자산 바닥 털림 방지)
 
     # --- 포트폴리오 종목 삭제(정리 대기): 신규매수 중단 + 매도 신호 때 전량 매도, 기한 내 신호가 없으면 강제 청산 ---
     WINDDOWN_MAX_DAYS: int = 5                   # 삭제 후 이 일수(달력일)가 지나면 신호와 무관하게 전량 청산
@@ -187,15 +203,26 @@ class Settings(BaseSettings):
     @property
     def cano(self) -> str:
         """종합계좌번호 (계좌번호 앞 8자리)"""
+        if not self.KIS_ACCOUNT_NO or "-" not in self.KIS_ACCOUNT_NO:
+            return self.KIS_ACCOUNT_NO
         return self.KIS_ACCOUNT_NO.split("-")[0]
 
     @property
     def acnt_prdt_cd(self) -> str:
         """계좌상품코드 (계좌번호 뒤 2자리)"""
+        if not self.KIS_ACCOUNT_NO or "-" not in self.KIS_ACCOUNT_NO:
+            return "01"
         return self.KIS_ACCOUNT_NO.split("-")[1]
 
     def assert_trading_allowed(self) -> None:
         """실전투자 진입에 필요한 이중 확인을 강제한다. 엔진 시작 시 항상 호출해야 한다."""
+        if self.BROKER.lower() == "meritz":
+            if not self.SHADOW_MODE and not self.I_UNDERSTAND_REAL_MONEY_RISK:
+                raise RuntimeError(
+                    "메리츠 실전주문(SHADOW_MODE=False) 상태이지만 I_UNDERSTAND_REAL_MONEY_RISK=true가 "
+                    "설정되지 않았습니다. 실거래를 의도한 것이 맞다면 .env.meritz에 명시적으로 추가하세요."
+                )
+            return
         if not self.IS_MOCK and not self.I_UNDERSTAND_REAL_MONEY_RISK:
             raise RuntimeError(
                 "실전투자(IS_MOCK=False) 상태이지만 I_UNDERSTAND_REAL_MONEY_RISK=true가 "

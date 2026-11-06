@@ -17,7 +17,7 @@ import aiosqlite
 import pandas as pd
 
 from core import (
-    db, discovery, indicators, kis_domestic, kis_overseas, macro, proxy_mapping, quant_metrics,
+    db, discovery, indicators, kis_domestic, meritz_overseas, macro, proxy_mapping, quant_metrics,
 )
 from core.ai_rebalance_guard import validate_proposal
 from core.config import get_effective_proxy_trading, settings
@@ -57,7 +57,7 @@ async def _build_current_positions(
                     chart_rows = []
                     for ex in ["NASD", "NYSE", "AMEX"]:
                         try:
-                            chart_rows = await kis_overseas.get_daily_chart(client, ex, symbol)
+                            chart_rows = await meritz_overseas.get_daily_chart(client, ex, symbol)
                             if chart_rows:
                                 break
                         except Exception:

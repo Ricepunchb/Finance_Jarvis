@@ -104,6 +104,10 @@ class BacktestEngine:
             self.target_weights = {s: eq_weight for s in symbols}
         else:
             self.target_weights = target_weights
+            # 사용자가 명시적으로 전달한 target_weights 중 기본 max_position_pct보다 큰 비중이 있는 경우 수용
+            max_tw = max(self.target_weights.values(), default=0.0)
+            if max_tw > self.max_position_pct:
+                self.max_position_pct = min(1.0, max_tw + settings.REBALANCE_BAND_PCT)
 
         self.positions: Dict[str, Position] = {}
         self.trades: List[TradeRecord] = []
@@ -232,12 +236,16 @@ class BacktestEngine:
                 if (low - peak) / peak <= -trail_pct:
                     exec_price = peak * (1.0 - trail_pct)
                     exec_price = max(exec_price, low)
-                    # 상승 추세에서는 50% 분할 익절, 그 외에는 전량 익절
-                    sell_qty = pos.qty if not is_uptrend else max(1.0, float(int(pos.qty * 0.5)))
-                    self._execute_sell(symbol, sell_qty, exec_price, cur_date, "TRAILING_TAKE_PROFIT")
-                    if symbol in self.positions:
-                        self.positions[symbol].peak_price = close_p
-                    continue
+                    # 익절(Take Profit)은 반드시 평단가 초과(수익 상태)에서만 실행 (손실 구간은 STOP_LOSS 전담)
+                    if exec_price > pos.avg_price:
+                        target_w = self.target_weights.get(symbol, 0.0)
+                        # 상승 추세이거나 코어 타겟 종목이면 50% 분할 익절, 그 외에는 전량 익절
+                        sell_ratio = 0.5 if (is_uptrend or target_w > 0) else 1.0
+                        sell_qty = max(1.0, float(int(pos.qty * sell_ratio)))
+                        self._execute_sell(symbol, sell_qty, exec_price, cur_date, "TRAILING_TAKE_PROFIT")
+                        if symbol in self.positions:
+                            self.positions[symbol].peak_price = close_p
+                        continue
 
     def _evaluate_signals_and_weights(self, cur_date: str) -> None:
         """기술적 시그널, 밴드 상한 강제축소, 분할 온보딩 매수 평가."""
@@ -334,27 +342,39 @@ class BacktestEngine:
 
             # 4. 스윙 시그널 매수/매도
             if strength >= signal_engine.SWING_SIGNAL_THRESHOLD:
-                if direction == "BUY" and allow_buy:
+                if direction == "BUY" and allow_buy and target_weight > 0:
+                    # 목표 비중 상한(target_weight + band)까지만 매수 허용
+                    ceiling_weight = min(self.max_position_pct, target_weight + settings.REBALANCE_BAND_PCT)
+                    max_allowed_val = max(0.0, (ceiling_weight * cur_total_equity) - cur_pos_val)
+                    if max_allowed_val <= 0:
+                        continue
                     # 신호 강도에 비례한 매수 금액 (최대 자산의 15%)
                     swing_budget = cur_total_equity * signal_engine.SWING_TRADE_MAX_EQUITY_FRACTION * strength
                     swing_budget = min(swing_budget, self.max_order_notional)
-                    # 비중 캡 체크
-                    max_allowed_val = (self.max_position_pct * cur_total_equity) - cur_pos_val
                     buy_val = min(swing_budget, max_allowed_val, self.cash)
 
                     buy_qty = float(int(buy_val / close_p))
                     if buy_qty <= 0 and self.allow_expensive_stock_single_share:
-                        if self.cash >= close_p and (cur_pos_val + close_p) <= (self.max_position_pct * cur_total_equity):
+                        if self.cash >= close_p and (cur_pos_val + close_p) <= (ceiling_weight * cur_total_equity):
                             if swing_budget >= close_p * 0.5:
                                 buy_qty = 1.0
 
                     if buy_qty > 0:
                         self._execute_buy(symbol, buy_qty, close_p, cur_date, f"swing_signal_buy (str={strength:.2f})")
                 elif direction == "SELL" and cur_qty > 0:
-                    sell_budget = cur_pos_val * strength
-                    sell_qty = min(cur_qty, float(int(sell_budget / close_p)))
-                    if sell_qty > 0:
-                        self._execute_sell(symbol, sell_qty, close_p, cur_date, f"swing_signal_sell (str={strength:.2f})")
+                    if target_weight > 0:
+                        # 목표 비중이 있는 코어 종목은 전술적 초과분(swing overlay)만 분할 매도
+                        excess_swing_val = max(0.0, cur_pos_val - (target_weight * cur_total_equity))
+                        if excess_swing_val > 0:
+                            sell_budget = excess_swing_val * strength
+                            sell_qty = min(cur_qty, float(int(sell_budget / close_p)))
+                            if sell_qty > 0:
+                                self._execute_sell(symbol, sell_qty, close_p, cur_date, f"swing_signal_sell (str={strength:.2f})")
+                    else:
+                        sell_budget = cur_pos_val * strength
+                        sell_qty = min(cur_qty, float(int(sell_budget / close_p)))
+                        if sell_qty > 0:
+                            self._execute_sell(symbol, sell_qty, close_p, cur_date, f"swing_signal_sell (str={strength:.2f})")
 
     def _execute_buy(self, symbol: str, qty: float, price: float, cur_date: str, reason: str) -> None:
         exec_price = price * (1.0 + self.slippage_pct)

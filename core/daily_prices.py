@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import aiosqlite
 
-from core import db, indicators, kis_domestic, kis_overseas
+from core import db, indicators, kis_domestic, meritz_overseas
 from core.config import settings
 from core.kis_client import AsyncKISClient
 from core.pnl import KST, local_date
@@ -53,12 +53,12 @@ async def _fetch_domestic(client: AsyncKISClient, symbol: str, since: str) -> Li
     return bars
 
 
-async def _fetch_overseas(client: AsyncKISClient, exchange: str, symbol: str, since: str) -> List[Dict[str, Any]]:
-    """해외 일봉은 base_date(BYMD)를 커서로 과거로 페이징한다."""
+async def _fetch_overseas(client: Any, exchange: str, symbol: str, since: str) -> List[Dict[str, Any]]:
+    """해외 일봉은 base_date(to)를 커서로 과거로 페이징한다."""
     bars: List[Dict[str, Any]] = []
     base_date = ""
     for _ in range(OVERSEAS_MAX_PAGES):
-        rows = await kis_overseas.get_daily_chart(client, exchange, symbol, base_date=base_date)
+        rows = await meritz_overseas.get_daily_chart(client, exchange, symbol, base_date=base_date)
         df = indicators.chart_rows_to_dataframe_overseas(rows)
         if df.empty:
             break

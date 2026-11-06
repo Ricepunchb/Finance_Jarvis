@@ -55,7 +55,8 @@ async def _load_trade_data(conn: aiosqlite.Connection) -> Dict[str, Any]:
     ctx_rows = await db.list_decision_contexts_with_intent(conn, 0.0)
     ctx_by_intent = {r["intent_id"]: parse_context(r["context_json"]) for r in ctx_rows}
     fx_points, equity_points = pnl.extract_points(await db.list_context_rows(conn, 0.0))
-    fx = pnl.make_fx(fx_points)
+    is_usd_account = getattr(settings, "BROKER", "kis").lower() == "meritz" or getattr(settings, "PROFILE_NAME", "") == "meritz"
+    fx = (lambda ts: 1.0) if is_usd_account else pnl.make_fx(fx_points)
 
     trades, unpriced = pnl.build_trades(intents, fills, ctx_by_intent, fx)
     markets = {t["symbol"]: t["market"] for t in trades}
@@ -156,7 +157,8 @@ async def build_overview(
         warnings.append(f"가격을 알 수 없어 제외한 체결 {len(data['unpriced'])}건")
     for sym, missing in active_mismatch.items():
         warnings.append(f"{sym}: 잔고(positions)보다 체결 매수가 {missing:g}주 많음 — 체결 이력 기준으로 계산")
-    if not data["has_fx"] and any(m == "overseas" for m in markets.values()):
+    is_usd_account = getattr(settings, "BROKER", "kis").lower() == "meritz" or getattr(settings, "PROFILE_NAME", "") == "meritz"
+    if not is_usd_account and not data["has_fx"] and any(m == "overseas" for m in markets.values()):
         warnings.append("환율 기록이 없어 해외 종목을 1:1로 환산했습니다")
     failed = [s for s, st in price_status.items() if st in ("failed", "stale")]
     if failed:

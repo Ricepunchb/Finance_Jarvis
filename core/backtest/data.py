@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import pandas as pd
 
-from core import db, indicators, kis_domestic, kis_overseas
+from core import db, indicators, kis_domestic, meritz_overseas
 from core.config import settings
 from core.kis_client import AsyncKISClient
 
@@ -101,8 +101,18 @@ class HistoricalDataManager:
         try:
             if market == "domestic":
                 bars = await self._fetch_domestic_chunks(symbol, start_date, end_date)
-            elif market == "overseas" and exchange:
-                bars = await self._fetch_overseas_chunks(exchange, symbol, start_date, end_date)
+            elif market == "overseas":
+                candidates = [exchange] if exchange else []
+                for default_cand in ["NASD", "AMEX", "NYSE"]:
+                    if default_cand not in candidates:
+                        candidates.append(default_cand)
+                for ex in candidates:
+                    try:
+                        bars = await self._fetch_overseas_chunks(ex, symbol, start_date, end_date)
+                        if bars:
+                            break
+                    except Exception:
+                        continue
         except Exception as e:
             logger.exception("과거 데이터 수집 실패 %s (%s): %s", symbol, market, e)
             return
@@ -161,7 +171,7 @@ class HistoricalDataManager:
         base_date = limit_end.strftime("%Y%m%d")
 
         for _ in range(10):  # 최대 10페이지
-            rows = await kis_overseas.get_daily_chart(self.client, exchange, symbol, base_date=base_date)
+            rows = await meritz_overseas.get_daily_chart(self.client, exchange, symbol, base_date=base_date)
             df = indicators.chart_rows_to_dataframe_overseas(rows)
             if df.empty:
                 break

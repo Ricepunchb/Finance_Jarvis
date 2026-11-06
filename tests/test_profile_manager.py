@@ -26,6 +26,8 @@ FRONT_PORT=9500
 KIS_ACCOUNT_NO="12345678-01"
 IS_MOCK=False
 DOMESTIC_ONLY=True
+BROKER=meritz
+SHADOW_MODE=True
             """.strip(),
             encoding="utf-8",
         )
@@ -38,22 +40,30 @@ DOMESTIC_ONLY=True
         assert meta["account_no"] == "12345678-01"
         assert meta["is_mock"] is False
         assert meta["domestic_only"] is True
+        assert meta["broker"] == "meritz"
+        assert meta["shadow_mode"] is True
 
 
 def test_get_all_profiles_info():
     profiles = get_all_profiles_info()
     assert isinstance(profiles, list)
-    assert len(profiles) >= 3  # isa, mock, real
+    assert len(profiles) >= 4  # isa, mock, real, meritz
     names = [p["name"] for p in profiles]
     assert "isa" in names
     assert "mock" in names
     assert "real" in names
+    assert "meritz" in names
 
     isa_prof = next(p for p in profiles if p["name"] == "isa")
     assert isa_prof["api_port"] == 8800
     assert isa_prof["front_port"] == 8501
     assert "status_desc" in isa_prof
     assert "status_code" in isa_prof
+
+    meritz_prof = next(p for p in profiles if p["name"] == "meritz")
+    assert meritz_prof["api_port"] == 8803
+    assert meritz_prof["front_port"] == 8504
+    assert meritz_prof["broker"] == "meritz"
 
 
 def test_set_and_switch_profile():

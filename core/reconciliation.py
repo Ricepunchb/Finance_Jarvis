@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from core import db, kis_domestic, kis_overseas
+from core import db, kis_domestic, meritz_overseas
 from core.config import settings
 from core.kis_client import AsyncKISClient
 
@@ -115,21 +115,28 @@ async def _find_candidates(
     return candidates
 
 
-async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
-    """KIS 잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다 (국내+해외).
+async def reconcile_positions(client: Any, conn: aiosqlite.Connection) -> None:
+    """잔고조회 결과를 ground truth로 삼아 positions 테이블을 강제 재동기화한다 (국내+해외).
     잔고에서 사라진(전량 청산된) 종목은 qty=0으로 내려 진입 상태를 초기화한다."""
-    balance = await kis_domestic.get_balance(client)
-    held = {
-        h["pdno"]: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
-        for h in balance["holdings"] if h.get("pdno")
-    }
-    await db.sync_positions_from_balance(conn, held, overseas=False)
-    logger.info(f"KIS 국내 잔고 동기화(더블 체크) 완료: {list(held.keys())} ({len(held)}종목)")
-    if settings.DOMESTIC_ONLY:
-        return  # 국내 전용: 해외 잔고는 조회하지 않고 기존 해외 positions 행도 건드리지 않는다
+    is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+
+    if not is_meritz:
+        try:
+            balance = await kis_domestic.get_balance(client)
+            held = {
+                h["pdno"]: (float(h.get("hldg_qty") or 0), float(h.get("pchs_avg_pric") or 0), "KRW")
+                for h in balance["holdings"] if h.get("pdno")
+            }
+            await db.sync_positions_from_balance(conn, held, overseas=False)
+            logger.info(f"KIS 국내 잔고 동기화(더블 체크) 완료: {list(held.keys())} ({len(held)}종목)")
+        except Exception:
+            logger.exception("국내 잔고 동기화 중 오류 발생")
+
+    if settings.DOMESTIC_ONLY and not is_meritz:
+        return  # 국내 전용 KIS 모드: 해외 잔고는 조회하지 않고 기존 해외 positions 행도 건드리지 않는다
 
     try:
-        present = await kis_overseas.get_present_balance_krw(client)
+        present = await meritz_overseas.get_present_balance_krw(client)
     except Exception:
         # 해외 잔고 조회가 실패해도(예: 보유 종목이 없어 계좌 자체가 해외 서비스 미이용) 국내
         # positions 재동기화는 이미 끝났으니 여기서 조용히 넘어간다 - 다음 재기동 때 다시 시도.
@@ -140,13 +147,13 @@ async def reconcile_positions(client: AsyncKISClient, conn: aiosqlite.Connection
         for h in present["holdings"] if h.get("pdno")
     }
     await db.sync_positions_from_balance(conn, held_overseas, overseas=True)
-    logger.info(f"KIS 해외 잔고 동기화(더블 체크) 완료: {list(held_overseas.keys())} ({len(held_overseas)}종목)")
+    logger.info(f"해외 잔고 동기화(더블 체크) 완료: {list(held_overseas.keys())} ({len(held_overseas)}종목)")
 
 
 async def reconcile_unresolved_intents(
-    client: AsyncKISClient, conn: aiosqlite.Connection, min_age_sec: float = 0.0
+    client: Any, conn: aiosqlite.Connection, min_age_sec: float = 0.0
 ) -> None:
-    """PENDING/SUBMITTED 상태로 남아있는 intent를 KIS 실제 기록과 대조하고, 체결분은 fills에 기록한다.
+    """PENDING/SUBMITTED 상태로 남아있는 intent를 실제 브로커 기록과 대조하고, 체결분은 fills에 기록한다.
 
     재기동 시(min_age_sec=0)에는 이 함수가 끝나기 전까지 엔진이 신규 주문을 절대 내지 않아야 한다.
     사이클 중에도 주기적으로 호출한다(min_age_sec>0) — 웹소켓이 체결통보를 놓쳐도 다음 사이클에
@@ -154,8 +161,10 @@ async def reconcile_unresolved_intents(
     남은 주문도 대조된다.
     """
     unresolved = await db.get_unresolved_intents(conn, min_age_sec=min_age_sec)
-    if settings.DOMESTIC_ONLY:
-        # 해외 intent는 대조하지 않는다 (조회를 안 하면 KIS 기록에 없다고 오판해 NOT_SUBMITTED로 바꿔버리기 때문)
+    is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+
+    if settings.DOMESTIC_ONLY and not is_meritz:
+        # 국내 전용 모드: 해외 intent는 대조하지 않는다 (조회를 안 하면 기록에 없다고 오판해 NOT_SUBMITTED로 바꿔버리기 때문)
         unresolved = [i for i in unresolved if (i.get("market") or "domestic") != "overseas"]
     if not unresolved:
         return
@@ -163,27 +172,45 @@ async def reconcile_unresolved_intents(
     oldest = min(i["created_at"] for i in unresolved)
     start = datetime.fromtimestamp(oldest, tz=KST).strftime("%Y%m%d")
     today = datetime.now(tz=KST).strftime("%Y%m%d")
-    domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=start, end_date=today)
+
+    domestic_rows: List[Dict[str, Any]] = []
     overseas_rows: List[Dict[str, Any]] = []
-    if not settings.DOMESTIC_ONLY:
+
+    if not is_meritz:
         try:
-            overseas_rows = await kis_overseas.get_ccnl(client, start_date=start, end_date=today)
+            domestic_rows = await kis_domestic.get_daily_ccld(client, start_date=start, end_date=today)
+        except Exception:
+            logger.warning("국내 체결내역 조회 실패")
+
+    if is_meritz or not settings.DOMESTIC_ONLY:
+        try:
+            overseas_rows = await meritz_overseas.get_ccnl(client, start_date=start, end_date=today)
         except Exception:
             logger.warning("해외 체결내역 조회 실패 - 국내 intent만 대조하고 해외는 다음 재기동에 재시도")
 
     for intent in unresolved:
+        odno = str(intent.get("kis_order_no") or "")
+        # [SHADOW 모드 처리] 가상 주문번호(SHADOW_*)는 실제 브로커 내역에 없으므로 가상 체결로 완결
+        if odno.startswith("SHADOW_"):
+            fill_qty = float(intent["qty"])
+            fill_price = float(intent.get("price") or 0.0)
+            await db.update_order_intent(conn, intent["intent_id"], status="FILLED")
+            await db.record_rest_fill(conn, intent["intent_id"], fill_qty, fill_price)
+            logger.info(f"[SHADOW MODE] 가상 체결 확정 대조: intent={intent['intent_id']}, {intent['symbol']} {fill_qty}주 @ {fill_price}")
+            continue
+
         rows = overseas_rows if intent.get("market") == "overseas" else domestic_rows
         candidates = await _find_candidates(rows, intent)
         if len(candidates) == 0:
             if intent.get("kis_order_no"):
-                # 브로커에 정상 전송되어 주문번호(odno)가 이미 발급된 건은 KIS 당일 내역 지연 등으로
+                # 브로커에 정상 전송되어 주문번호(odno)가 이미 발급된 건은 당일 내역 지연 등으로
                 # 일시 매칭이 안 될 수 있으므로, 절대 NOT_SUBMITTED로 내리지 않는다 (중복 발주 원천 차단).
                 logger.warning(
                     f"미해결 intent({intent['intent_id']})에 주문번호({intent['kis_order_no']})가 존재하나 "
-                    f"KIS 체결내역에서 찾지 못했습니다. 상태({intent.get('status', 'SUBMITTED')})를 유지합니다."
+                    f"체결내역에서 찾지 못했습니다. 상태({intent.get('status', 'SUBMITTED')})를 유지합니다."
                 )
                 continue
-            # KIS 기록에 없고 주문번호도 없음 -> 브로커에 도달하지 못했다고 결론. 재시도는 다음 사이클에 새 intent로.
+            # 기록에 없고 주문번호도 없음 -> 브로커에 도달하지 못했다고 결론. 재시도는 다음 사이클에 새 intent로.
             await db.update_order_intent(conn, intent["intent_id"], status="NOT_SUBMITTED")
         elif len(candidates) == 1:
             row = candidates[0]
@@ -204,7 +231,7 @@ async def reconcile_unresolved_intents(
             await db.update_order_intent(conn, intent["intent_id"], status="UNKNOWN")
 
 
-async def run_startup_reconciliation(client: AsyncKISClient, conn: aiosqlite.Connection) -> None:
+async def run_startup_reconciliation(client: Any, conn: aiosqlite.Connection) -> None:
     await reconcile_unresolved_intents(client, conn)
     await reconcile_positions(client, conn)
     await db.set_state(conn, "last_reconciled_at", str(time.time()))

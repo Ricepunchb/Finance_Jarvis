@@ -110,11 +110,17 @@ async def fetch_benchmark_return_series(
     start_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
     end_date = today.strftime("%Y%m%d")
     try:
-        chart_rows = await kis_domestic.get_daily_chart(client, BENCHMARK_SYMBOL, start_date, end_date)
-        df = indicators.chart_rows_to_dataframe(chart_rows)
+        is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+        if is_meritz:
+            from core import meritz_overseas
+            chart_rows = await meritz_overseas.get_daily_chart(client, "AMEX", "SPY", end_date)
+            df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
+        else:
+            chart_rows = await kis_domestic.get_daily_chart(client, BENCHMARK_SYMBOL, start_date, end_date)
+            df = indicators.chart_rows_to_dataframe(chart_rows)
         if df.empty:
             return None
         return df["close"].pct_change().dropna()
     except Exception:
-        logger.exception("벤치마크(KODEX 200) 시계열 조회 실패 - 베타 계산 없이 계속")
+        logger.exception("벤치마크 시계열 조회 실패 - 베타 계산 없이 계속")
         return None

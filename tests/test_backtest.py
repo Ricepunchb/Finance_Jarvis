@@ -326,3 +326,50 @@ def test_stop_loss_cooldown_prevents_immediate_rebuy():
         if t.side == "buy" and (pd.to_datetime(t.date) - sl_date).days <= 5 and pd.to_datetime(t.date) > sl_date
     ]
     assert len(subsequent_buys) == 0
+
+
+def test_runner_overseas_symbols_and_benchmark(monkeypatch):
+    """해외 종목(AAPL, SPY 등) 백테스트 시 overseas 마켓 자동 라우팅 및 시뮬레이션 검증."""
+    from unittest.mock import AsyncMock
+    import aiosqlite
+
+    async def run():
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript(db.SCHEMA)
+        await db._migrate_add_missing_columns(conn)
+
+        dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(20)]
+        df_aapl = _create_synthetic_ohlcv(dates, start_price=200.0, trend=0.01)
+        df_spy = _create_synthetic_ohlcv(dates, start_price=550.0, trend=0.005)
+
+        runner = BacktestRunner(conn, client=AsyncMock())
+
+        async def fake_get_ohlcv(symbol, start_date, end_date, market="domestic", exchange=None, include_padding=True):
+            if symbol == "AAPL":
+                assert market == "overseas"
+                assert exchange == "NASD"
+                return df_aapl
+            elif symbol == "SPY":
+                assert market == "overseas"
+                assert exchange == "AMEX"
+                return df_spy
+            return pd.DataFrame()
+
+        monkeypatch.setattr(runner.data_manager, "get_ohlcv", fake_get_ohlcv)
+
+        config = BacktestConfig(
+            symbols=["AAPL"],
+            benchmark_symbol="SPY",
+            start_date="2025-01-01",
+            end_date=dates[-1],
+            initial_cash=10_000.0,
+        )
+        res = await runner.run(config)
+
+        assert "metrics" in res
+        assert "chart_data" in res
+        assert res["metrics"]["strategy"]["final_equity"] > 0
+        await conn.close()
+
+    asyncio.run(run())

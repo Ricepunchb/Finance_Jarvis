@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from core import db, indicators, kis_domestic, kis_overseas
+from core import db, indicators, kis_domestic, meritz_overseas
 from core.config import settings
 from core.kis_client import AsyncKISClient
 from core.kis_common import KisApiError
@@ -74,7 +74,29 @@ def _overseas_rows_to_30min_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
     df = pd.DataFrame(rows)
-    df = df.rename(columns={"last": "close", "evol": "volume"})
+    rename_map = {}
+    if "kymd" not in df.columns and "korea_date" in df.columns:
+        rename_map["korea_date"] = "kymd"
+    if "khms" not in df.columns and "korea_hour" in df.columns:
+        rename_map["korea_hour"] = "khms"
+    if "open" not in df.columns and "oprc" in df.columns:
+        rename_map["oprc"] = "open"
+    if "high" not in df.columns and "hprc" in df.columns:
+        rename_map["hprc"] = "high"
+    if "low" not in df.columns and "lprc" in df.columns:
+        rename_map["lprc"] = "low"
+    if "close" not in df.columns:
+        if "prpr" in df.columns:
+            rename_map["prpr"] = "close"
+        elif "last" in df.columns:
+            rename_map["last"] = "close"
+    if "volume" not in df.columns:
+        if "cntg_vol" in df.columns:
+            rename_map["cntg_vol"] = "volume"
+        elif "evol" in df.columns:
+            rename_map["evol"] = "volume"
+    if rename_map:
+        df = df.rename(columns=rename_map)
     # kymd/khms(한국시각 기준)를 써서 09:00 KST 앵커 리샘플링과 타임존 혼선 없이 맞춘다.
     df["date"] = pd.to_datetime(df["kymd"] + df["khms"], format="%Y%m%d%H%M%S").dt.tz_localize(KST)
     for col in ("open", "high", "low", "close", "volume"):
@@ -169,8 +191,8 @@ async def _backfill_domestic(client: AsyncKISClient, conn, symbol: str) -> None:
         await db.save_intraday_bars(conn, symbol, "domestic", _bars_to_cache_rows(df_30min, symbol, "domestic"))
 
 
-async def _backfill_overseas(client: AsyncKISClient, conn, symbol: str, exchange: str) -> None:
-    rows = await kis_overseas.get_minute_chart(client, exchange, symbol, n_min="30", include_prev_day=True)
+async def _backfill_overseas(client: Any, conn, symbol: str, exchange: str) -> None:
+    rows = await meritz_overseas.get_minute_chart(client, exchange, symbol, n_min="30", include_prev_day=True)
     df_30min = _overseas_rows_to_30min_df(rows)
     if not df_30min.empty:
         await db.save_intraday_bars(conn, symbol, "overseas", _bars_to_cache_rows(df_30min, symbol, "overseas"))
@@ -223,7 +245,7 @@ async def get_intraday_signal_overseas(
     else:
         # 30분 네이티브라 저비용 — 매 사이클 최신 페이지 한 번으로 증분 갱신
         try:
-            rows = await kis_overseas.get_minute_chart(client, exchange, symbol, n_min="30", include_prev_day=True)
+            rows = await meritz_overseas.get_minute_chart(client, exchange, symbol, n_min="30", include_prev_day=True)
             df_30min = _overseas_rows_to_30min_df(rows)
             if not df_30min.empty:
                 await db.save_intraday_bars(conn, symbol, "overseas", _bars_to_cache_rows(df_30min, symbol, "overseas"))

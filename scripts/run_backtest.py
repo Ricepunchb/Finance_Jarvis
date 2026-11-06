@@ -7,9 +7,17 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# --profile 인자가 있으면 settings 로드 전에 환경변수 우선 주입
+for i, arg in enumerate(sys.argv):
+    if arg == "--profile" and i + 1 < len(sys.argv):
+        os.environ["JARVIS_PROFILE"] = sys.argv[i + 1].strip()
+    elif arg.startswith("--profile="):
+        os.environ["JARVIS_PROFILE"] = arg.split("=", 1)[1].strip()
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -23,10 +31,16 @@ from core.engine import TradingEngine
 def parse_args():
     parser = argparse.ArgumentParser(description="Finance Jarvis 전략 백테스팅")
     parser.add_argument(
+        "--profile",
+        type=str,
+        default="",
+        help="사용할 계좌 프로필 (예: meritz, isa, real, mock)",
+    )
+    parser.add_argument(
         "--symbols",
         type=str,
         default="005930,000660,017670",
-        help="대상 종목코드 쉼표 구분 (예: 005930,000660)",
+        help="대상 종목코드 쉼표 구분 (예: 005930,000660 또는 AAPL,NVDA,TSLA)",
     )
     parser.add_argument(
         "--days",
@@ -70,6 +84,12 @@ def parse_args():
         help=f"분할 온보딩 일수 (기본: {ob_days})",
     )
     parser.add_argument(
+        "--weights",
+        type=str,
+        default="",
+        help="종목별 목표 비중 (예: SCHD:0.50,SGOV:0.45,VOO:0.05 또는 JSON)",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="",
@@ -81,10 +101,26 @@ def parse_args():
 async def main():
     args = parse_args()
 
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if args.profile:
+        import os
+        os.environ["JARVIS_PROFILE"] = args.profile.strip()
+
+    from core.profile_manager import get_active_profile
+    active_prof = (args.profile or get_active_profile()).lower()
+    is_meritz_prof = (active_prof == "meritz")
+
+    raw_symbols = args.symbols
+    if is_meritz_prof and raw_symbols == "005930,000660,017670":
+        raw_symbols = "AAPL,NVDA,TSLA"
+
+    symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
     if not symbols:
         print("❌ 대상 종목을 최소 1개 이상 지정해야 합니다.")
         sys.exit(1)
+
+    bench = args.benchmark
+    if is_meritz_prof and bench == "360750":
+        bench = "SPY"
 
     today = datetime.now().date()
     end_date = args.end if args.end else today.strftime("%Y-%m-%d")
@@ -93,12 +129,24 @@ async def main():
     else:
         start_date = (today - timedelta(days=args.days)).strftime("%Y-%m-%d")
 
+    target_weights = None
+    if args.weights:
+        target_weights = {}
+        if args.weights.strip().startswith("{"):
+            target_weights = json.loads(args.weights)
+        else:
+            for item in args.weights.split(","):
+                if ":" in item:
+                    k, v = item.split(":", 1)
+                    target_weights[k.strip().upper()] = float(v.strip())
+
     config = BacktestConfig(
         symbols=symbols,
         start_date=start_date,
         end_date=end_date,
         initial_cash=args.cash,
-        benchmark_symbol=args.benchmark,
+        benchmark_symbol=bench,
+        target_weights=target_weights,
         stop_loss_pct=args.stop_loss,
         stop_loss_cooldown_days=args.cooldown,
         onboarding_days=args.onboarding_days,

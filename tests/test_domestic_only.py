@@ -18,16 +18,16 @@ async def _conn() -> aiosqlite.Connection:
 
 def _forbidden(name):
     async def fn(*args, **kwargs):
-        raise AssertionError(f"국내 전용 모드에서 해외 KIS 호출이 발생함: {name}")
+        raise AssertionError(f"국내 전용 모드에서 해외 브로커 호출이 발생함: {name}")
     return fn
 
 
 @pytest.fixture(autouse=True)
 def domestic_only(monkeypatch):
     monkeypatch.setattr(settings, "DOMESTIC_ONLY", True)
-    monkeypatch.setattr(reconciliation.kis_overseas, "get_ccnl", _forbidden("get_ccnl"))
-    monkeypatch.setattr(reconciliation.kis_overseas, "get_present_balance_krw", _forbidden("get_present_balance_krw"))
-    monkeypatch.setattr(daily_prices.kis_overseas, "get_daily_chart", _forbidden("get_daily_chart"))
+    monkeypatch.setattr(reconciliation.meritz_overseas, "get_ccnl", _forbidden("get_ccnl"))
+    monkeypatch.setattr(reconciliation.meritz_overseas, "get_present_balance_krw", _forbidden("get_present_balance_krw"))
+    monkeypatch.setattr(daily_prices.meritz_overseas, "get_daily_chart", _forbidden("get_daily_chart"))
 
 
 async def _intent(conn, iid, symbol, market):

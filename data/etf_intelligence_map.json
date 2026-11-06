@@ -303,5 +303,23 @@
     "macro_driven": true,
     "name": "KODEX 미국나스닥100",
     "dynamic": true
+  },
+  "365780": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "ACE 국고채10년",
+    "dynamic": true
+  },
+  "411060": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "ACE KRX금현물",
+    "dynamic": true
+  },
+  "458730": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER 미국배당다우존스",
+    "dynamic": true
   }
 }
