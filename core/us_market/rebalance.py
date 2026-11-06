@@ -173,15 +173,26 @@ async def analyze_us_portfolio_drift(
     # 잔고 조회가 실패하거나 클라이언트가 없으면 DB positions 및 state 사용
     if not holdings_dict:
         db_positions = await db.get_positions(conn)
-        for p in db_positions:
-            sym = p.symbol.upper()
-            if sym in symbols or p.market == "overseas":
+        for sym_key, p in db_positions.items():
+            sym = str(sym_key).upper()
+            mkt = p.get("market") if isinstance(p, dict) else getattr(p, "market", "overseas")
+            qty = float(p.get("qty", 0.0) if isinstance(p, dict) else getattr(p, "qty", 0.0))
+            avg_p = float(p.get("avg_entry_price", 0.0) if isinstance(p, dict) else getattr(p, "avg_entry_price", 0.0))
+            if sym in symbols or mkt == "overseas":
                 holdings_dict[sym] = {
                     "symbol": sym,
-                    "qty": p.qty,
-                    "avg_entry_price": p.avg_entry_price,
+                    "qty": qty,
+                    "avg_entry_price": avg_p,
                     "exchange": SYMBOL_EXCHANGE_MAP.get(sym, "NASD"),
                 }
+
+    if available_usd <= 0:
+        saved_cash = await db.get_state(conn, "us_last_known_available_usd")
+        if saved_cash:
+            try:
+                available_usd = float(saved_cash)
+            except Exception:
+                pass
 
     # 2. 실시간 시세 비동기 수집 (yfinance 또는 client)
     quote_tasks = [get_us_quote(sym) for sym in symbols]
