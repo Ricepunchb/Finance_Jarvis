@@ -147,6 +147,8 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
             stat_badge = "🟢 유지 (1주 단가 보호)"
         elif stat == "DEFICIT":
             stat_badge = "🔵 저비중 (-5%p 미달)"
+        elif stat == "UNMANAGED":
+            stat_badge = "⚪ 비편입 보유 (온보딩 정리 대기)"
         else:
             stat_badge = "🟢 균형 (정상)"
 
@@ -898,3 +900,4 @@ def render_us_telegram_settings_section(key_prefix: str = "us_tg") -> None:
             f"- **밴드 이탈(Band-Drift)**: 목표 대비 +5%p 초과 시 초과분 분할 매도 및 저비중 재배치\n"
             f"- **고단가 1주 보호(EXCESS_LOCKED)**: 1주 단가가 높아 초과분으로 1주를 팔 수 없는 자산 매도 원천 방지"
         )
+

@@ -150,7 +150,6 @@ async def analyze_us_portfolio_drift(
 ) -> Dict[str, Any]:
     """미국 계좌의 현재 포지션, 가용 달러, 실시간 시세를 분석하여 비중 드리프트를 진단한다."""
     targets = target_weights or await get_us_target_weights(conn)
-    symbols = list(targets.keys())
 
     # 1. 메리츠 API 연동 잔고 조회 시도
     holdings_dict: Dict[str, Dict[str, Any]] = {}
@@ -177,8 +176,8 @@ async def analyze_us_portfolio_drift(
             sym = str(sym_key).upper()
             mkt = p.get("market") if isinstance(p, dict) else getattr(p, "market", "overseas")
             qty = float(p.get("qty", 0.0) if isinstance(p, dict) else getattr(p, "qty", 0.0))
-            avg_p = float(p.get("avg_entry_price", 0.0) if isinstance(p, dict) else getattr(p, "avg_entry_price", 0.0))
-            if sym in symbols or mkt == "overseas":
+            avg_p = float(p.get("avg_price") or p.get("avg_entry_price") or 0.0)
+            if sym in targets or mkt == "overseas" or qty > 0:
                 holdings_dict[sym] = {
                     "symbol": sym,
                     "qty": qty,
@@ -193,6 +192,13 @@ async def analyze_us_portfolio_drift(
                 available_usd = float(saved_cash)
             except Exception:
                 pass
+
+    # 목표 비중에 포함된 종목 + 계좌에 실보유 중인 종목을 모두 합산 (누락 방지)
+    held_symbols = {
+        sym for sym, h in holdings_dict.items()
+        if float(h.get("cblc_qty13") or h.get("qty") or 0.0) > 0
+    }
+    symbols = sorted(set(targets.keys()) | held_symbols)
 
     # 2. 실시간 시세 비동기 수집 (yfinance 또는 client)
     quote_tasks = [get_us_quote(sym) for sym in symbols]
@@ -238,14 +244,16 @@ async def analyze_us_portfolio_drift(
 
     for sym in symbols:
         cur_val = pos_evals.get(sym, 0.0)
-        cur_w = cur_val / total_equity_usd
+        cur_w = (cur_val / total_equity_usd) if total_equity_usd > 0 else 0.0
         tgt_w = targets.get(sym, 0.0)
         drift = cur_w - tgt_w
         cur_qty = pos_qtys.get(sym, 0.0)
         cur_price = quotes.get(sym, 0.0)
         excess_val = (cur_w - (tgt_w + band_pct)) * total_equity_usd
 
-        if drift > band_pct:
+        if tgt_w == 0.0 and cur_qty > 0:
+            stat_label = "UNMANAGED"
+        elif drift > band_pct:
             # 1주 단가 보호: 초과 금액이 1주 단가보다 작거나, 보유 수량이 1주 이하인 경우 슬림화 매도 불가 (보호 유지)
             if cur_qty <= 1.0 or (cur_price > 0 and excess_val < cur_price):
                 stat_label = "EXCESS_LOCKED"

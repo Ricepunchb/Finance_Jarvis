@@ -748,6 +748,14 @@ def test_us_rebalance_api_endpoints(monkeypatch):
         "core.us_market.rebalance.analyze_us_portfolio_drift",
         AsyncMock(return_value=mock_status),
     )
+    monkeypatch.setattr(
+        "core.us_market.rebalance.set_us_target_weights",
+        AsyncMock(return_value={"VOO": 0.25, "SCHD": 0.25, "NVDA": 0.25, "SGOV": 0.25}),
+    )
+    monkeypatch.setattr(
+        "core.us_market.rebalance.execute_us_rebalance_plan",
+        AsyncMock(return_value={"status": "SUCCESS", "executed_count": 0, "orders": []}),
+    )
 
     client = TestClient(app)
 
