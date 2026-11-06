@@ -17,7 +17,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from core import db, discovery, discovery_sources, kis_domestic, portfolio_agent, proxy_mapping, rebalancer
@@ -33,8 +33,9 @@ STATE_DISCOVERY_TRIGGERED = "ai_rebalance_discovery_triggered_json"
 
 
 class PortfolioScheduler:
-    def __init__(self, client: AsyncKISClient):
+    def __init__(self, client: Any):
         self.client = client
+        self.is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
         self._stopped = True
         self._task: Optional[asyncio.Task] = None
 
@@ -63,6 +64,12 @@ class PortfolioScheduler:
                 return
 
     async def _tick(self) -> None:
+        if self.is_meritz:
+            # 메리츠 해외 계좌: 국내 종목 발굴(discovery) 및 KIS 원화 스케줄러 배제
+            # 대신 미국장 순수 USD 자산배분 드리프트 & 달러 입금 리밸런싱을 전담 처리
+            await self._tick_meritz_overseas()
+            return
+
         conn = await db.get_connection()
         try:
             refreshed = await self._maybe_refresh_discovery(conn)
@@ -331,3 +338,58 @@ class PortfolioScheduler:
             if strength >= settings.AI_REBALANCE_NEWS_TRIGGER_STRENGTH:
                 return f"{row['symbol']} 뉴스감성 강도 {strength:.2f} ({direction})"
         return None
+
+    async def _tick_meritz_overseas(self) -> None:
+        """메리츠 해외주식 전용 리밸런싱 틱.
+        국내 종목 발굴(discovery) 및 KIS 원화 스케줄러를 완전 배제하고,
+        순수 USD 가용 예수금 유입(Inflow) 및 밴드 드리프트(±5%p)만 감지하여 처리한다.
+        """
+        conn = await db.get_connection()
+        try:
+            if await db.get_state(conn, "ai_rebalance_scheduler_enabled") != "1":
+                return
+
+            last_reb_check = await db.get_state(conn, "last_rebalance_trigger_check_at")
+            if last_reb_check is not None and (time.time() - float(last_reb_check)) < REBALANCE_CHECK_INTERVAL_SEC:
+                return
+
+            await db.set_state(conn, "last_rebalance_trigger_check_at", str(time.time()))
+
+            from core.us_market.rebalance import (
+                analyze_us_portfolio_drift,
+                build_us_rebalance_plan,
+                execute_us_rebalance_plan,
+                format_us_rebalance_telegram_message,
+            )
+            from core.us_market.notifier import get_telegram_config, send_telegram_message_with_result
+
+            drift = await analyze_us_portfolio_drift(conn, client=self.client)
+            plan = build_us_rebalance_plan(drift)
+
+            if plan.items and plan.trigger_type in ("CASH_INFLOW", "BAND_DRIFT"):
+                last_alert_time_str = await db.get_state(conn, "us_last_rebalance_alerted_at")
+                last_alert_time = float(last_alert_time_str) if last_alert_time_str else 0.0
+                if (time.time() - last_alert_time) > 21600:  # 6시간 쿨다운
+                    token, chat_id = get_telegram_config()
+                    if token and chat_id:
+                        msg = format_us_rebalance_telegram_message(plan)
+                        await asyncio.to_thread(
+                            send_telegram_message_with_result, token, chat_id, msg, parse_mode=""
+                        )
+                        await db.set_state(conn, "us_last_rebalance_alerted_at", str(time.time()))
+                        logger.info(f"🇺🇸 메리츠 포트폴리오 스케줄러: {plan.trigger_type} 텔레그램 브리핑 완료")
+
+                # 자동 적용 모드인 경우 정규장 시간에 자동 집행
+                is_auto = settings.AI_REBALANCE_AUTO_APPLY
+                state_val = await db.get_state(conn, "ai_rebalance_auto_apply")
+                if state_val is not None:
+                    is_auto = (state_val == "1")
+
+                if is_auto:
+                    exec_res = await execute_us_rebalance_plan(conn, plan, client=self.client)
+                    logger.info(f"🇺🇸 메리츠 포트폴리오 스케줄러 자동 리밸런싱 집행 결과: {exec_res}")
+        except Exception as e:
+            logger.warning(f"메리츠 포트폴리오 스케줄러 틱 처리 중 예외: {e}")
+        finally:
+            await conn.close()
+

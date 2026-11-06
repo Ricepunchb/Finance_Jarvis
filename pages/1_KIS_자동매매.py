@@ -21,7 +21,11 @@ from core.config import settings
 API_BASE = os.environ.get("JARVIS_API_BASE", f"http://127.0.0.1:{settings.API_PORT}")
 KST = timezone(timedelta(hours=9))
 
-st.set_page_config(layout="wide", page_title="KIS 자동매매", page_icon="🤖")
+is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+page_title = "메리츠 해외 자동매매" if is_meritz else "KIS 자동매매"
+page_icon = "🇺🇸" if is_meritz else "🤖"
+
+st.set_page_config(layout="wide", page_title=page_title, page_icon=page_icon)
 
 # --- 스타일 -------------------------------------------------------------
 st.markdown(
@@ -144,12 +148,12 @@ def parse_sentiment(raw: str | None):
 
 # --- 사이드바 -------------------------------------------------------------
 with st.sidebar:
-    st.title("🤖 Finance Jarvis")
-    st.caption("KIS 자동매매 제어판")
+    st.title("🇺🇸 Finance Jarvis" if is_meritz else "🤖 Finance Jarvis")
+    st.caption("메리츠 해외 자동매매 관제탑" if is_meritz else "KIS 자동매매 제어판")
     st.divider()
-    auto_refresh = st.toggle("자동 새로고침", value=False)
-    refresh_sec = st.slider("주기(초)", 5, 60, 15, disabled=not auto_refresh)
-    if st.button("🔄 지금 새로고침", width='stretch'):
+    auto_refresh = st.toggle("자동 새로고침", value=False, key="main_auto_refresh")
+    refresh_sec = st.slider("주기(초)", 5, 60, 15, disabled=not auto_refresh, key="main_refresh_sec")
+    if st.button("🔄 지금 새로고침", width='stretch', key="main_btn_refresh"):
         st.rerun()
 
 status = api_get("/engine/status")
@@ -157,7 +161,7 @@ config = api_get("/engine/config")
 if status is None or config is None:
     st.error(
         "제어 플레인(FastAPI)에 연결할 수 없습니다 (타임아웃 포함). "
-        "`uvicorn api.main:app --port 8800`을 먼저 실행하세요."
+        f"`uvicorn api.main:app --port {settings.API_PORT}`을 먼저 실행하세요."
     )
     st.stop()
 
@@ -172,11 +176,11 @@ def label(symbol: str) -> str:
     return f"{name}({symbol})" if name else symbol
 
 with st.sidebar:
-    prof_name = status.get("profile_display_name") or settings.PROFILE_DISPLAY_NAME
-    acnt_no = status.get("account_no") or settings.KIS_ACCOUNT_NO
+    prof_name = status.get("profile_display_name") or ("메리츠 해외 실전" if is_meritz else settings.PROFILE_DISPLAY_NAME)
+    acnt_no = status.get("account_no") or (getattr(settings, "MERITZ_ACCOUNT_NO", "") if is_meritz else settings.KIS_ACCOUNT_NO)
     st.caption(f"📌 **{prof_name}** (`{acnt_no}`)")
     mode_class = "badge-mock" if status["is_mock"] else "badge-live"
-    mode_text = "모의투자" if status["is_mock"] else "⚠️ 실전투자"
+    mode_text = "모의투자" if status["is_mock"] else ("⚠️ 실전투자 (USD)" if is_meritz else "⚠️ 실전투자")
     st.markdown(f'<span class="jarvis-badge {mode_class}">{mode_text}</span>', unsafe_allow_html=True)
     st.markdown(
         f'<span class="jarvis-badge {"badge-buy" if status["engine_running"] else "badge-noop"}">'
@@ -186,38 +190,242 @@ with st.sidebar:
     if status["kill_switch_active"]:
         st.markdown('<span class="jarvis-badge badge-sell">Kill Switch 🔴</span>', unsafe_allow_html=True)
 
-    st.divider()
-    cur_domestic = config.get("domestic_only", True)
-    domestic_toggle = st.toggle(
-        "🇰🇷 국내 종목 전용",
-        value=cur_domestic,
-        help="ON: 국내 주식/ETF만 매매·발굴·등록합니다.\nOFF: 미국 주식(AI 전력 인프라, 비만치료제, 빅테크, 금 등) 해외 종목 파이프라인을 가동합니다.",
-        key="sidebar_domestic_only_toggle",
-    )
-    if domestic_toggle != cur_domestic:
-        api_post("/engine/domestic-only", {"domestic_only": domestic_toggle})
-        st.toast(f"모드 변경: {'국내 전용' if domestic_toggle else '국내 + 해외 종목 포함'}")
-        st.rerun()
+    if is_meritz:
+        st.divider()
+        mkt_status = api_get("/us-market/status", timeout=10) or {}
+        st.markdown("##### 🕒 미국 증시 상태")
+        status_label = mkt_status.get("status_label", "확인 불가")
+        status_code = mkt_status.get("status", "CLOSED")
+        badge_class = "badge-mkt-open" if status_code == "REGULAR" else ("badge-mkt-pre" if "PRE" in status_code or "AFTER" in status_code else "badge-mkt-closed")
+        st.html(f'<span class="badge {badge_class}">{status_label}</span>')
+        st.caption(f"🕒 뉴욕: `{mkt_status.get('ny_time_str', '-')}`")
+        st.caption(f"🇰🇷 한국: `{mkt_status.get('kst_time_str', '-')}`")
+        st.caption(f"정규장: `{mkt_status.get('kst_reg_hours', '-')}`")
 
-    cur_proxy = config.get("proxy_trading_enabled", True)
-    proxy_toggle = st.toggle(
-        "🔄 해외 발굴 ➔ 국장 대체 ETF 매매 (Proxy)",
-        value=cur_proxy,
-        help="ON: 해외 종목(GOOGL, NVDA, LLY, GLD 등)으로 글로벌 인사이트/시그널을 발굴하되, 실제 주문은 수수료가 저렴한 국장 대체 ETF(ACE 구글밸류체인, KODEX 골드선물 등)로 집행합니다.\nOFF: 해외 원주로 직접 매매합니다.",
-        key="sidebar_proxy_trading_toggle",
-    )
-    if proxy_toggle != cur_proxy:
-        api_post("/engine/proxy-trading", {"enabled": proxy_toggle})
-        st.toast(f"대리매매 변경: {'국장 대체 ETF 대리매매 활성' if proxy_toggle else '해외 원주 직접매매'}")
-        st.rerun()
+        sched_running = mkt_status.get("scheduler_running", False)
+        sched_toggle = st.toggle("30분 백그라운드 자동 스캔", value=sched_running, key="meritz_sb_sched_toggle")
+        if sched_toggle != sched_running:
+            api_post(f"/us-market/scheduler/toggle?enable={str(sched_toggle).lower()}")
+            st.toast(f"백그라운드 스케줄러: {'활성화' if sched_toggle else '비활성화'}")
+            st.rerun()
 
-    with st.expander("🌐 해외 ↔ 국장 ETF 매핑 현황"):
-        mappings = api_get("/engine/proxy-mappings")
-        if mappings:
-            for us_sym, info in mappings.items():
-                st.caption(f"**{us_sym}** ➔ {info.get('proxy_name')} (`{info.get('proxy_symbol')}`)")
+        if st.button("⚡ 지금 즉시 전체 스캔", width="stretch", type="primary", key="meritz_sb_scan_btn"):
+            with st.spinner("미국 모니터링 종목 30분 시그널 전체 스캔 중..."):
+                res = api_post("/us-market/scan", {"send_notifications": True}, timeout=60)
+                if res and res.get("status") == "ok":
+                    st.toast(f"✅ 스캔 완료: {res.get('scanned_count')}개 종목 갱신됨")
+                    time.sleep(0.5)
+                    st.rerun()
+    else:
+        st.divider()
+        cur_domestic = config.get("domestic_only", True)
+        domestic_toggle = st.toggle(
+            "🇰🇷 국내 종목 전용",
+            value=cur_domestic,
+            help="ON: 국내 주식/ETF만 매매·발굴·등록합니다.\nOFF: 미국 주식(AI 전력 인프라, 비만치료제, 빅테크, 금 등) 해외 종목 파이프라인을 가동합니다.",
+            key="sidebar_domestic_only_toggle",
+        )
+        if domestic_toggle != cur_domestic:
+            api_post("/engine/domestic-only", {"domestic_only": domestic_toggle})
+            st.toast(f"모드 변경: {'국내 전용' if domestic_toggle else '국내 + 해외 종목 포함'}")
+            st.rerun()
+
+        cur_proxy = config.get("proxy_trading_enabled", True)
+        proxy_toggle = st.toggle(
+            "🔄 해외 발굴 ➔ 국장 대체 ETF 매매 (Proxy)",
+            value=cur_proxy,
+            help="ON: 해외 종목(GOOGL, NVDA, LLY, GLD 등)으로 글로벌 인사이트/시그널을 발굴하되, 실제 주문은 수수료가 저렴한 국장 대체 ETF(ACE 구글밸류체인, KODEX 골드선물 등)로 집행합니다.\nOFF: 해외 원주로 직접 매매합니다.",
+            key="sidebar_proxy_trading_toggle",
+        )
+        if proxy_toggle != cur_proxy:
+            api_post("/engine/proxy-trading", {"enabled": proxy_toggle})
+            st.toast(f"대리매매 변경: {'국장 대체 ETF 대리매매 활성' if proxy_toggle else '해외 원주 직접매매'}")
+            st.rerun()
+
+        with st.expander("🌐 해외 ↔ 국장 ETF 매핑 현황"):
+            mappings = api_get("/engine/proxy-mappings")
+            if mappings:
+                for us_sym, info in mappings.items():
+                    st.caption(f"**{us_sym}** ➔ {info.get('proxy_name')} (`{info.get('proxy_symbol')}`)")
+            else:
+                st.caption("매핑 정보가 없습니다.")
+
+
+# --- 메리츠 해외 자동매매 대시보드 렌더러 ---
+def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
+    from ui.us_market_ui import (
+        inject_us_ui_styles,
+        render_us_rebalance_section,
+        render_us_news_surprise_section,
+        render_us_signals_board_section,
+        render_us_watchlist_manage_section,
+        render_us_history_section,
+        render_us_telegram_settings_section,
+    )
+    inject_us_ui_styles()
+
+    st.title("🇺🇸 메리츠 해외 자동매매 관제탑")
+    st.caption("순수 USD 해외 계좌 기반 스마트 자산배분, 글로벌 뉴스 서프라이즈 & 30분 시그널 올인원 관제실")
+
+    if not status.get("is_mock"):
+        st.error("⚠️ 실전투자 모드입니다 (순수 USD 해외 계좌). 실제 달러 자산이 거래됩니다.")
+
+    if status.get("kill_switch_active"):
+        st.warning(f"Kill switch 사유: {status.get('kill_switch_reason')}")
+        if st.button("Kill switch 해제 (사람이 원인 확인 후에만)", key="meritz_clear_kill"):
+            api_post("/engine/clear-kill-switch")
+            st.rerun()
+
+    tab_overview, tab_rebalance, tab_news, tab_signals, tab_settings, tab_log = st.tabs(
+        [
+            "📊 개요",
+            "⚖️ 자산배분 & 자동 리밸런싱",
+            "⚡ 글로벌 뉴스 서프라이즈",
+            "📈 30분 시그널 보드",
+            "⚙️ 설정 · 리스크",
+            "🧾 매매 로그",
+        ]
+    )
+
+    # 1. 개요 탭
+    with tab_overview:
+        reb_status = api_get("/us-market/rebalance/status", timeout=15) or {}
+        tot_eq = float(reb_status.get("total_equity_usd") or 0.0)
+        avail_usd = float(reb_status.get("available_usd") or 0.0)
+        inflow_usd = float(reb_status.get("inflow_detected_usd") or 0.0)
+        mkt_status = api_get("/us-market/status", timeout=10) or {}
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("엔진 상태", "🟢 실행 중" if status.get("engine_running") else "⚪ 정지")
+        c2.metric("미국 증시 상태", mkt_status.get("status_label", "확인 불가"))
+        c3.metric(
+            "가용 달러 (USD)",
+            f"${avail_usd:,.2f}",
+            delta=f"+${inflow_usd:,.2f} 입금 감지" if inflow_usd > 10.0 else None,
+        )
+        c4.metric("총 평가자산 (USD)", f"${tot_eq:,.2f}")
+
+        st.write("")
+        b1, b2, b3, b4 = st.columns(4)
+        if b1.button("▶️ 시작", disabled=status.get("engine_running"), width='stretch', key="meritz_start_btn"):
+            if api_post("/engine/start") is not None:
+                st.rerun()
+        if b2.button("⏸️ 정지", disabled=not status.get("engine_running"), width='stretch', key="meritz_stop_btn"):
+            api_post("/engine/stop")
+            st.rerun()
+        if b3.button("🛑 긴급정지 (전량 주문취소)", disabled=not status.get("engine_running"), width='stretch', key="meritz_kill_btn"):
+            st.session_state["confirm_kill_meritz"] = True
+        if b4.button("🔄 새로고침", width='stretch', key="meritz_rf_btn"):
+            st.rerun()
+
+        if st.session_state.get("confirm_kill_meritz"):
+            st.warning("정말 긴급정지하시겠습니까? 미체결 주문이 전부 취소됩니다.")
+            cc1, cc2 = st.columns(2)
+            if cc1.button("네, 긴급정지합니다", key="meritz_confirm_kill_yes"):
+                api_post("/engine/kill")
+                st.session_state["confirm_kill_meritz"] = False
+                st.rerun()
+            if cc2.button("취소", key="meritz_confirm_kill_no"):
+                st.session_state["confirm_kill_meritz"] = False
+                st.rerun()
+
+        st.divider()
+        pos_list = reb_status.get("positions", [])
+        if pos_list:
+            st.subheader("🇺🇸 미국장 보유 종목 자산 구성 (실시간 시가 평가액 기준)")
+            pie_rows = [
+                {"symbol": p["symbol"], "name": p.get("name", p["symbol"]), "val": float(p.get("eval_value_usd", 0.0))}
+                for p in pos_list if float(p.get("qty", 0.0)) > 0
+            ]
+            if avail_usd > 0.5:
+                pie_rows.append({"symbol": "USD Cash", "name": "가용 달러(현금)", "val": avail_usd})
+
+            if pie_rows:
+                fig = go.Figure(
+                    data=[
+                        go.Pie(
+                            labels=[f"{r['name']} ({r['symbol']})" for r in pie_rows],
+                            values=[r["val"] for r in pie_rows],
+                            hole=0.45,
+                            textinfo="label+percent",
+                            hovertemplate="%{label}<br>$%{value:,.2f} (%{percent})<extra></extra>",
+                        )
+                    ]
+                )
+                fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=340, template="plotly_dark")
+                st.plotly_chart(fig, width='stretch')
+            else:
+                st.caption("보유 주식이 없으며 전액 현금 상태입니다.")
         else:
-            st.caption("매핑 정보가 없습니다.")
+            st.caption("보유 포지션 정보가 없습니다.")
+
+    # 2. 자산배분 & 자동 리밸런싱 탭
+    with tab_rebalance:
+        render_us_rebalance_section(key_prefix="meritz_reb")
+
+    # 3. 글로벌 뉴스 서프라이즈 탭
+    with tab_news:
+        render_us_news_surprise_section(key_prefix="meritz_news")
+
+    # 4. 30분 시그널 보드 탭
+    with tab_signals:
+        render_us_signals_board_section(key_prefix="meritz_sig")
+
+    # 5. 설정 · 리스크 탭
+    with tab_settings:
+        st.markdown("#### 🛡️ 메리츠 해외 계좌 실행 파라미터 (읽기 전용)")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("계좌 모드", "⚠️ 실전투자 (순수 USD 해외 계좌)" if not status.get("is_mock") else "모의투자")
+        r2.metric("브로커 플러그인", "Meritz Securities (meritz_client)")
+        r3.metric("기준 통화", "USD (원화 자동환전 방지)")
+
+        r4, r5, r6 = st.columns(3)
+        r4.metric("리밸런스 허용 밴드", "±5.0%p")
+        r5.metric("고단가 1주 보호", "🟢 EXCESS_LOCKED 적용")
+        r6.metric("달러 입금 리밸런싱", "💡 Cash-Inflow (매도 0건 우선 매수)")
+
+        st.divider()
+        st.markdown("#### 💼 미국장 모니터링 종목 & 포지션 관리")
+        render_us_watchlist_manage_section(key_prefix="meritz_tab_manage")
+
+        st.divider()
+        st.markdown("#### 🔔 텔레그램 연동 및 시그널 가드레일")
+        render_us_telegram_settings_section(key_prefix="meritz_tab_tg")
+
+    # 6. 매매 로그 탭
+    with tab_log:
+        st.markdown("#### 🧾 미국장 30분 시그널 판정 이력")
+        render_us_history_section(key_prefix="meritz_tab_hist")
+
+        st.divider()
+        st.markdown("#### 🤖 메리츠 엔진 매매 체결 & 주문 로그")
+        limit = st.slider("표시 개수", 10, 200, 50, step=10, key="meritz_log_limit")
+        decisions = api_get("/decisions/recent", limit=limit)
+        if not decisions:
+            st.caption("아직 기록된 의사결정이 없습니다.")
+        else:
+            rows = []
+            for d in decisions:
+                badge = {"BUY": "🟢 BUY", "SELL": "🔴 SELL", "NO_OP": "⚪ NO_OP"}.get(d["action"], d["action"])
+                reason = d.get("reason") or "-"
+                rows.append({
+                    "시각": fmt_kst(d["ts"]),
+                    "종목": d["symbol"],
+                    "액션": badge,
+                    "수량": d.get("qty") or None,
+                    "현재비중": fmt_pct(d.get("current_weight")),
+                    "목표비중": fmt_pct(d.get("target_weight")),
+                    "사유": reason,
+                })
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+
+if is_meritz:
+    render_meritz_overseas_dashboard(status, config)
+    if auto_refresh:
+        time.sleep(refresh_sec)
+        st.rerun()
+    st.stop()
 
 st.title("🤖 KIS 자동매매 제어")
 

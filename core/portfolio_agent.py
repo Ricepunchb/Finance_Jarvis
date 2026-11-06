@@ -179,7 +179,8 @@ async def propose_rebalance(
             current_signals[sym] = " / ".join(parts)
 
     candidate_pool: List[Dict[str, Any]] = []
-    if client is not None:
+    is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+    if client is not None and not is_meritz:
         try:
             # 사용자가 삭제하거나 청산된 종목이 동적 발굴로 즉시 되살아나 재편입 제안되지 않도록 쿨다운 동안 제외한다.
             recently_removed = set(
