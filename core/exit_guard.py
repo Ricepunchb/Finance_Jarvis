@@ -40,12 +40,15 @@ def evaluate_exit(
     current_price: float,
     atr_pct: Optional[float] = None,
     is_uptrend: bool = False,
+    accumulation_mode: bool = False,
 ) -> Optional[ExitDecision]:
     if avg_price <= 0 or current_price <= 0:
         return None
 
-    # 1. 손절: 평단 대비 -7% 도달 시 전량(100%) 강제 청산
-    if (current_price - avg_price) / avg_price <= -settings.STOP_LOSS_PCT:
+    # 1. 손절: 평단 대비 -7% (또는 STOP_LOSS_PCT) 도달 시 전량(100%) 강제 청산.
+    # 단, 적립식/자산배분 모드(accumulation_mode=True)에서는 우량 코어 자산의 바닥 투매 방지를 위해
+    # 기계적 손절 강제 청산을 배제한다 (필요 시 알림만 제공).
+    if not accumulation_mode and (current_price - avg_price) / avg_price <= -settings.STOP_LOSS_PCT:
         return ExitDecision(reason="STOP_LOSS", sell_ratio=1.0)
 
     # 2. 트레일링 익절: 고점이 평단 대비 무장 기준 이상 오른 뒤 고점 대비 트레일링 폭만큼 하락 시 발동.

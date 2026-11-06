@@ -127,6 +127,7 @@ async def decide(
     winding_down: bool = False,
     winddown_liquidating: bool = False,
     accumulation_mode: Optional[bool] = None,
+    avg_price: float = 0.0,
 ) -> Optional[Action]:
     if price <= 0 or total_equity <= 0:
         return None
@@ -167,7 +168,12 @@ async def decide(
     ceiling_weight = target_weight + band + BAND_CEILING_BUFFER_PCT
 
     if drift.required_direction == "SELL" and current_weight > ceiling_weight:
-        # 밴드+버퍼를 넘어선 과대비중 — 시그널이 아무리 강한 BUY라도 협상 대상이 아니다.
+        # 밴드+버퍼를 넘어선 과대비중:
+        # 손실 보호(Loss Protection Guard): 평단가 대비 손실 상태(현재가 < 평단가 * 0.99)인 종목은
+        # 밴드 상한을 초과하더라도 기계적으로 강제 손실 매도하지 않는다.
+        # 신규 현금 유입(CASH_INFLOW) 시 타 과소비중 자산 매수를 통해 비중을 자연스럽게 희석한다.
+        if avg_price > 0 and price < avg_price * 0.99:
+            return None
         # 목표비중이 아니라 밴드 경계(edge_weight())까지만 축소한다(경계 안쪽은 시그널의 몫).
         side = "sell"
         qty = (current_weight - drift.edge_weight()) * total_equity / price

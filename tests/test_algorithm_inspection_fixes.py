@@ -13,7 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import pytest
 
-from core import db, pnl, signal_engine
+from core import db, exit_guard, pnl, signal_engine
 from core.ai_rebalance_guard import validate_proposal
 from core.risk import RiskManager
 from core.utils.krx_calendar import is_krx_market_open_now, is_krx_trading_day
@@ -174,3 +174,51 @@ def test_pnl_portfolio_daily_equity_base_accuracy():
     # 2. 총자산 미제공 시 (기존 하위 호환)
     daily_stock_only = pnl.portfolio_daily(mtm, axis, equity_by_date=None)
     assert abs(daily_stock_only[1]["ret"] - (-0.07)) < 1e-6
+
+
+def test_exit_guard_accumulation_mode_bypasses_stop_loss():
+    """적립식/장기 계좌(accumulation_mode=True)에서는 평단가 대비 -20% 폭락해도 기계적 STOP_LOSS 매도를 차단한다."""
+    # 1. 일반 스윙 모드 (accumulation_mode=False): -20% 시 전량 손절
+    decision_swing = exit_guard.evaluate_exit(100.0, 100.0, 80.0, accumulation_mode=False)
+    assert decision_swing is not None
+    assert decision_swing.reason == "STOP_LOSS"
+    assert decision_swing.sell_ratio == 1.0
+
+    # 2. 적립식/자산배분 모드 (accumulation_mode=True): 바닥 투매 방지를 위해 STOP_LOSS 차단 (None 반환)
+    decision_accum = exit_guard.evaluate_exit(100.0, 100.0, 80.0, accumulation_mode=True)
+    assert decision_accum is None
+
+
+def test_signal_engine_loss_protection_prevents_forced_trim():
+    """과비중(밴드 상한 초과)이어도 손실 중(현재가 < 평단가)인 종목은 강제 비중 축소 매도를 하지 않는다."""
+    async def run():
+        await db.init_db()
+        conn = await db.get_connection()
+        try:
+            risk = RiskManager(conn)
+            hold_sig = {"direction": "HOLD", "strength": 0.0}
+
+            # 1. 과비중 + 손실 상태 (현재가 80, 평단가 100, -20% 손실): 강제 매도 스킵 (None)
+            act_loss = await signal_engine.decide(
+                symbol="SPCX", current_weight=0.30, target_weight=0.10, band=0.05,
+                tech_signal=hold_sig, intraday_signal=None, sentiment_signal=None,
+                price=80.0, current_position_qty=30.0, current_position_value=2400.0,
+                total_equity=8000.0, risk=risk, accumulation_mode=True, avg_price=100.0,
+            )
+            assert act_loss is None
+
+            # 2. 과비중 + 수익 상태 (현재가 150, 평단가 100, +50% 이익): 이익 실현 차원의 강제 비중 축소 허용
+            act_profit = await signal_engine.decide(
+                symbol="NVDA", current_weight=0.30, target_weight=0.10, band=0.05,
+                tech_signal=hold_sig, intraday_signal=None, sentiment_signal=None,
+                price=150.0, current_position_qty=20.0, current_position_value=3000.0,
+                total_equity=10000.0, risk=risk, accumulation_mode=True, avg_price=100.0,
+            )
+            assert act_profit is not None
+            assert act_profit.side == "sell"
+            assert act_profit.reason == "band_ceiling_forced_trim"
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+

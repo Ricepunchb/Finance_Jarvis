@@ -534,6 +534,7 @@ class TradingEngine:
         today = datetime.now(tz=KST)
         df = None
         tech_signal = None
+        is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         if qty > 0:
             avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
             await db.update_position_peak(self.conn, symbol, price)
@@ -548,7 +549,9 @@ class TradingEngine:
                 is_uptrend = bool(tech_signal.get("is_uptrend", False))
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
-            exit_decision = exit_guard.evaluate_exit(avg_price, peak_price, price, atr_pct, is_uptrend=is_uptrend)
+            exit_decision = exit_guard.evaluate_exit(
+                avg_price, peak_price, price, atr_pct, is_uptrend=is_uptrend, accumulation_mode=is_accumulation
+            )
             context["exit_check"] = {
                 "avg_price": avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
                 "is_uptrend": is_uptrend,
@@ -622,6 +625,7 @@ class TradingEngine:
             winding_down=winddown_liquidating is not None,
             winddown_liquidating=bool(winddown_liquidating),
             accumulation_mode=is_accumulation,
+            avg_price=avg_price,
         )
 
         if action is None:
@@ -839,8 +843,9 @@ class TradingEngine:
                 is_uptrend = bool(tech_signal.get("is_uptrend", False))
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
+            is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
             exit_decision = exit_guard.evaluate_exit(
-                eval_avg_price, peak_price, eval_price, atr_pct, is_uptrend=is_uptrend
+                eval_avg_price, peak_price, eval_price, atr_pct, is_uptrend=is_uptrend, accumulation_mode=is_accumulation
             )
             context["exit_check"] = {
                 "eval_avg_price": eval_avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
@@ -914,6 +919,7 @@ class TradingEngine:
             winding_down=winddown_liquidating is not None,
             winddown_liquidating=bool(winddown_liquidating),
             accumulation_mode=is_accumulation,
+            avg_price=eval_avg_price,
         )
 
 
