@@ -24,6 +24,10 @@ KST = ZoneInfo("Asia/Seoul")
 _ALERT_COOLDOWN_SEC = 3600
 _LAST_ALERT_SENT: Dict[str, Tuple[str, float]] = {}  # symbol -> (action, timestamp)
 
+# 동일 종목 뉴스 서프라이즈 반복 발송 방지 (쿨다운 3시간)
+_NEWS_ALERT_COOLDOWN_SEC = 3600 * 3
+_LAST_NEWS_ALERT_SENT: Dict[str, Tuple[str, float]] = {}  # symbol -> (topic_key, timestamp)
+
 
 from core.config import settings
 
@@ -252,6 +256,23 @@ async def notify_news_surprise_if_needed(
         logger.info(f"'{symbol}' 서프라이즈 점수({score}점)가 임계값({threshold}점) 미만으로 텔레그램 발송 생략")
         return False, f"서프라이즈 점수({score}점)가 임계값({threshold}점) 미만"
 
+    # 3시간 이내 동일 종목 중복 알림 방지 쿨다운
+    sym_u = symbol.upper()
+    now = time.time()
+    rationale_str = str(getattr(analysis, "rationale", "") or company_name or "")
+    topic_words = {w.lower() for w in re.findall(r"\b[A-Za-z]{3,}\b", rationale_str)}
+    topic_key = "_".join(sorted(topic_words)[:4])
+
+    if sym_u in _LAST_NEWS_ALERT_SENT:
+        past_key, last_ts = _LAST_NEWS_ALERT_SENT[sym_u]
+        elapsed = now - last_ts
+        if elapsed < _NEWS_ALERT_COOLDOWN_SEC:
+            logger.info(
+                f"'{sym_u}' 최근 뉴스 알림 발송됨 ({int(elapsed / 60)}분 전) "
+                f"➔ 텔레그램 중복 발송 생략 (3시간 쿨다운)"
+            )
+            return False, f"최근 {int(elapsed / 60)}분 전 알림 발송됨 (3시간 쿨다운)"
+
     from core.us_market.surprise import format_news_surprise_telegram_message
 
     msg = format_news_surprise_telegram_message(
@@ -271,6 +292,8 @@ async def notify_news_surprise_if_needed(
         msg,
         parse_mode="",
     )
+    if ok:
+        _LAST_NEWS_ALERT_SENT[sym_u] = (topic_key, now)
     return ok, desc
 
 

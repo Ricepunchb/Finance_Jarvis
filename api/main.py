@@ -49,9 +49,13 @@ _discovery_refresh_task: Optional[asyncio.Task] = None
 async def lifespan(app: FastAPI):
     await db.init_db()
     portfolio_scheduler.start()
-    us_scheduler.start()
+    is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+    is_domestic_only = getattr(settings, "DOMESTIC_ONLY", False)
+    if is_meritz and not is_domestic_only:
+        us_scheduler.start()
     yield
-    await us_scheduler.stop()
+    if is_meritz and not is_domestic_only:
+        await us_scheduler.stop()
     await portfolio_scheduler.stop()
 
 
@@ -125,6 +129,18 @@ async def clear_kill_switch():
     finally:
         await conn.close()
     return {"status": "kill_switch_cleared"}
+
+
+@app.get("/health")
+@app.get("/")
+async def health_check():
+    """헬스체크 및 서비스 상태 엔드포인트."""
+    return {
+        "status": "ok",
+        "app": "Finance Jarvis",
+        "profile": settings.PROFILE_NAME,
+        "engine_running": engine.is_running,
+    }
 
 
 @app.get("/engine/status")
@@ -306,10 +322,28 @@ async def set_weight(req: SetWeightRequest):
 
 
 @app.get("/portfolio/weights")
-async def get_weights():
+async def get_weights(market: Optional[str] = None):
     conn = await db.get_connection()
     try:
-        return await db.get_active_target_weights(conn)
+        active = await db.get_active_target_weights(conn)
+        is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+        cur = await conn.execute("SELECT symbol, market FROM portfolio_symbols")
+        rows = await cur.fetchall()
+        market_by_sym = {r["symbol"].upper(): r["market"] for r in rows}
+
+        target_market = market
+        if target_market is None:
+            target_market = "overseas" if is_meritz else "domestic"
+
+        filtered = {}
+        for sym, w in active.items():
+            sym_u = sym.upper()
+            m = market_by_sym.get(sym_u)
+            if not m:
+                m = "domestic" if (len(sym) == 6 and sym[:5].isdigit()) else "overseas"
+            if target_market == "all" or m == target_market:
+                filtered[sym] = w
+        return filtered
     finally:
         await conn.close()
 
@@ -1321,6 +1355,15 @@ async def get_us_rebalance_status(band_pct: float = 0.05):
 @app.post("/us-market/rebalance/plan")
 async def create_us_rebalance_plan_endpoint(req: USRebalancePlanRequest):
     """드리프트 진단 기반 미국장 리밸런싱 계획 생성."""
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        return {
+            "trigger_type": "SKIPPED_DOMESTIC_ONLY",
+            "status": "SKIPPED",
+            "total_equity_usd": 0.0,
+            "available_usd": 0.0,
+            "items": [],
+            "rationale": "국내 주식 전용 계좌에서는 미국장 리밸런싱을 수립하지 않습니다.",
+        }
     from core.us_market.rebalance import analyze_us_portfolio_drift, build_us_rebalance_plan
     conn = await db.get_connection()
     try:
@@ -1335,6 +1378,8 @@ async def create_us_rebalance_plan_endpoint(req: USRebalancePlanRequest):
 @app.post("/us-market/rebalance/execute")
 async def execute_us_rebalance_endpoint(req: USRebalanceExecuteRequest):
     """수립된 미국장 리밸런싱 계획을 실제 정규장 주문으로 집행."""
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        raise HTTPException(status_code=400, detail="국내 주식 전용 계좌에서는 미국장 리밸런싱을 실행할 수 없습니다.")
     from core.us_market.rebalance import (
         analyze_us_portfolio_drift,
         build_us_rebalance_plan,
@@ -1392,7 +1437,10 @@ async def update_us_weights_endpoint(req: USWeightsUpdateRequest):
     from core.us_market.rebalance import set_us_target_weights
     conn = await db.get_connection()
     try:
-        updated = await set_us_target_weights(conn, req.weights)
+        try:
+            updated = await set_us_target_weights(conn, req.weights)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
         return {"status": "ok", "weights": updated}
     finally:
         await conn.close()

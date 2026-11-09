@@ -6,11 +6,12 @@ Redis 대신 SQLite를 쓰는 이유: 개인 단일 프로세스 시스템에서
 재기동 시 order_intents/positions 상태를 신뢰할 수 있어야 하므로, 모든 쓰기는 커밋을
 명시적으로 기다린다 (버퍼링된 채로 죽으면 reconciliation의 전제가 깨진다).
 """
+from datetime import datetime, timedelta
 import json
+from pathlib import Path
+import re
 import time
 import uuid
-from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -2190,6 +2191,43 @@ async def is_us_news_cluster_already_sent(
         (cluster_id, min_sent_at),
     )
     return (await cur.fetchone()) is not None
+
+
+async def is_us_news_duplicate_or_recent(
+    conn: aiosqlite.Connection,
+    cluster_id: str,
+    symbol: str,
+    title: str,
+    max_age_hours: float = 24.0,
+    cooldown_hours: float = 3.0,
+) -> bool:
+    """해당 클러스터가 이미 발송되었거나, 동일 종목에 대해 최근 유사 토픽 알림이 발송되었는지 검사."""
+    # 1. 동일 cluster_id 검사 (24시간)
+    if await is_us_news_cluster_already_sent(conn, cluster_id, max_age_hours=max_age_hours):
+        return True
+
+    # 2. 동일 종목 최근 cooldown_hours 이내 발송 내역 검사
+    min_sent_at = time.time() - (cooldown_hours * 3600.0)
+    cur = await conn.execute(
+        "SELECT title FROM us_news_alerts WHERE symbol = ? AND sent_at >= ?",
+        (symbol.upper(), min_sent_at),
+    )
+    rows = await cur.fetchall()
+    if not rows:
+        return False
+
+    title_words = {w.lower() for w in re.findall(r"\b[A-Za-z]{3,}\b", title)}
+    for r in rows:
+        past_title = r[0] if isinstance(r, (list, tuple)) else r["title"]
+        past_words = {w.lower() for w in re.findall(r"\b[A-Za-z]{3,}\b", past_title)}
+        if not title_words or not past_words:
+            continue
+        common = title_words & past_words
+        jaccard = len(common) / len(title_words | past_words)
+        if len(common) >= 3 or jaccard >= 0.28:
+            return True
+
+    return False
 
 
 async def list_us_news_alerts(

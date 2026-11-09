@@ -60,7 +60,7 @@ def test_yfinance_fetch_targets():
 
 
 def test_yfinance_fetch_news_fallback():
-    with patch("yfinance.Ticker") as mock_ticker_cls:
+    with patch("yfinance.Search", side_effect=Exception("search error")), patch("yfinance.Ticker") as mock_ticker_cls:
         mock_instance = MagicMock()
         mock_instance.news = [
             {

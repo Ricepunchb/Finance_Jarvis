@@ -366,7 +366,10 @@ def test_us_consensus_and_news_proxy_mapping(monkeypatch):
                 }
             ]
 
+    monkeypatch.setattr("core.us_market.client.yf.Ticker", MockTicker)
+    monkeypatch.setattr("core.us_market.client.yf.Search", lambda *args, **kwargs: MagicMock(news=[]))
     monkeypatch.setattr("yfinance.Ticker", MockTicker)
+    monkeypatch.setattr("yfinance.Search", lambda *args, **kwargs: MagicMock(news=[]))
 
     res = _fetch_consensus_and_news_sync("TSLW")
     assert "TSLA" in queried_symbols
@@ -377,6 +380,52 @@ def test_us_consensus_and_news_proxy_mapping(monkeypatch):
     assert res["target_gap_pct"] == 20.0
     assert len(res["news"]) == 1
     assert "Tesla Announces" in res["news"][0]["title"]
+
+
+def test_consensus_preserves_targets_when_news_throws_exception(monkeypatch):
+    """Yahoo Finance 뉴스 API 장애(YFDataException) 시에도 월가 목표가 및 컨센서스가 온전히 보존되는지 검증."""
+    from unittest.mock import MagicMock
+    from yfinance.exceptions import YFDataException
+    from core.us_market.client import _fetch_consensus_and_news_sync
+
+    class MockTickerWithErrorNews:
+        def __init__(self, sym):
+            self.info = {
+                "targetMeanPrice": 350.0,
+                "currentPrice": 300.0,
+                "recommendationKey": "buy",
+                "recommendationMean": 2.1,
+            }
+
+        @property
+        def news(self):
+            raise YFDataException("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***")
+
+    monkeypatch.setattr("core.us_market.client.yf.Ticker", MockTickerWithErrorNews)
+    monkeypatch.setattr("core.us_market.client.yf.Search", MagicMock(side_effect=Exception("search error")))
+
+    res = _fetch_consensus_and_news_sync("AAPL")
+    assert res["symbol"] == "AAPL"
+    assert res["target_mean"] == 350.0
+    assert res["target_gap_pct"] == round(((350.0 - 300.0) / 300.0) * 100, 2)
+    assert res["recommendation_key"] == "buy"
+    assert res["recommendation_mean"] == 2.1
+    assert res["news"] == []  # 뉴스는 빈 배열로 안전하게 폴백
+
+
+def test_health_and_root_endpoint():
+    """FastAPI /health 및 / 엔드포인트 200 응답 검증."""
+    from fastapi.testclient import TestClient
+    from api.main import app
+
+    client = TestClient(app)
+    resp_health = client.get("/health")
+    assert resp_health.status_code == 200
+    assert resp_health.json()["status"] == "ok"
+
+    resp_root = client.get("/")
+    assert resp_root.status_code == 200
+    assert resp_root.json()["status"] == "ok"
 
 
 def test_strip_all_emojis_clean():
@@ -792,6 +841,10 @@ def test_us_rebalance_plan_cash_inflow_and_band_drift():
 def test_us_rebalance_api_endpoints(monkeypatch):
     """미국장 리밸런싱 API 엔드포인트(status, plan, weights, execute) 정상 동작 검증."""
     from unittest.mock import AsyncMock
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "DOMESTIC_ONLY", False)
+    monkeypatch.setattr(settings, "BROKER", "meritz")
 
     mock_status = {
         "total_equity_usd": 5000.0,
@@ -1049,6 +1102,8 @@ def test_set_us_target_weights_real_db(tmp_path, monkeypatch):
     from core.config import settings
     test_db = str(tmp_path / "test_us_weights.db")
     monkeypatch.setattr(settings, "DB_PATH", test_db)
+    monkeypatch.setattr(settings, "DOMESTIC_ONLY", False)
+    monkeypatch.setattr(settings, "BROKER", "meritz")
 
     async def run():
         await db.init_db()
@@ -1088,6 +1143,8 @@ def test_update_us_weights_endpoint_real_db(tmp_path, monkeypatch):
     from core.config import settings
     test_db = str(tmp_path / "test_us_weights_ep.db")
     monkeypatch.setattr(settings, "DB_PATH", test_db)
+    monkeypatch.setattr(settings, "DOMESTIC_ONLY", False)
+    monkeypatch.setattr(settings, "BROKER", "meritz")
 
     async def init():
         await db.init_db()
@@ -1103,6 +1160,82 @@ def test_update_us_weights_endpoint_real_db(tmp_path, monkeypatch):
     assert resp.json()["status"] == "ok"
     assert resp.json()["weights"]["AVGO"] == 0.3
     assert resp.json()["weights"]["NVDA"] == 0.7
+
+
+def test_set_us_target_weights_blocked_on_domestic_account(tmp_path, monkeypatch):
+    """국내 주식 전용 계좌(DOMESTIC_ONLY=True 또는 BROKER=kis)에서는 미국장 목표 비중 설정이 400으로 차단되는지 검증."""
+    import asyncio
+    from core.config import settings
+    test_db = str(tmp_path / "test_us_weights_dom.db")
+    monkeypatch.setattr(settings, "DB_PATH", test_db)
+    monkeypatch.setattr(settings, "DOMESTIC_ONLY", True)
+    monkeypatch.setattr(settings, "BROKER", "kis")
+
+    async def init():
+        await db.init_db()
+
+    asyncio.run(init())
+
+    client = TestClient(app)
+    resp = client.post(
+        "/us-market/rebalance/weights",
+        json={"weights": {"VOO": 0.5, "NVDA": 0.5}},
+    )
+    assert resp.status_code == 400
+    assert "국내 전용 계좌" in resp.json()["detail"]
+
+
+def test_news_clustering_cross_ticker_and_synonyms():
+    """NVDA CEO 의혹 관련 기사들이 제목 및 티커(SPY, QQQ, NVDA)가 달라도 1개의 NVDA 클러스터로 군집화되는지 검증."""
+    from core.us_market.surprise import NewsArticle, cluster_news_articles
+    import time
+
+    now = time.time()
+    articles = [
+        NewsArticle(symbol="NVDA", title="Nvidia Board Launches Probe In CEO Jensen Huang Spying Case. The Stock Is Falling.", summary="", published_at=now),
+        NewsArticle(symbol="NVDA", title="Nvidia stock sinks 5% as chipmaker investigates CEO Jensen Huang relationship with alleged Chinese spy", summary="", published_at=now - 300),
+        NewsArticle(symbol="SPY", title="Google expands AI chip lineup as Nvidia faces CEO spy scandal", summary="", published_at=now - 600),
+        NewsArticle(symbol="QQQ", title="Stock Market Today: Dow Rallies As Oil Prices Slide; Nvidia Stock Dives On CEO Huang Probe (Live Coverage)", summary="", published_at=now - 900),
+    ]
+
+    clusters = cluster_news_articles(articles)
+    assert len(clusters) == 1
+    assert clusters[0].symbol == "NVDA"
+    assert clusters[0].count == 4
+
+
+def test_notify_news_surprise_cooldown(monkeypatch):
+    """동일 종목에 대해 3시간 이내 유사 뉴스 알림 발송 시 텔레그램 중복 발송이 차단되는지 검증."""
+    import asyncio
+    from unittest.mock import MagicMock
+    from core.us_market.notifier import notify_news_surprise_if_needed, _LAST_NEWS_ALERT_SENT
+    from core.us_market.surprise import SurpriseAnalysisResult
+
+    _LAST_NEWS_ALERT_SENT.clear()
+    mock_send = MagicMock(return_value=(True, "ok"))
+    monkeypatch.setattr("core.us_market.notifier.send_telegram_message_with_result", mock_send)
+    monkeypatch.setattr("core.us_market.notifier.get_telegram_config", lambda: ("fake_token", "fake_chat"))
+
+    analysis = SurpriseAnalysisResult(
+        surprise_score=85,
+        impact_type="악재",
+        affected_sector_theme="반도체",
+        summary_sentences=["엔비디아 CEO 젠슨 황 조사 착수."],
+        rationale="CEO 젠슨 황 스파이 의혹 조사 착수 충격",
+    )
+
+    async def run():
+        # 첫 번째 알림: 정상 발송
+        ok1, desc1 = await notify_news_surprise_if_needed(symbol="NVDA", analysis=analysis)
+        assert ok1 is True
+
+        # 1분 뒤 두 번째 알림 (유사 사건): 쿨다운으로 차단
+        ok2, desc2 = await notify_news_surprise_if_needed(symbol="NVDA", analysis=analysis)
+        assert ok2 is False
+        assert "쿨다운" in desc2
+
+    asyncio.run(run())
+
 
 
 

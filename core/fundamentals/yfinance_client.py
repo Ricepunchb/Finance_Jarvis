@@ -96,8 +96,19 @@ def fetch_recent_news_yfinance(ticker: str, max_items: int = 5) -> List[Dict[str
         return []
 
     try:
-        t = yf.Ticker(clean_ticker)
-        raw_news = getattr(t, "news", []) or []
+        raw_news = []
+        try:
+            s = yf.Search(clean_ticker, news_count=max_items)
+            raw_news = getattr(s, "news", []) or []
+        except Exception:
+            pass
+
+        if not raw_news:
+            try:
+                t = yf.Ticker(clean_ticker)
+                raw_news = getattr(t, "news", []) or []
+            except Exception:
+                pass
         articles = []
         for item in raw_news[:max_items]:
             content = item.get("content") or item

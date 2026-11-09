@@ -32,7 +32,42 @@ _STOPWORDS = {
     "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "are",
     "was", "were", "with", "as", "by", "from", "it", "its", "that", "this", "after",
     "before", "about", "says", "said", "new", "stock", "shares", "inc", "corp", "co",
+    "today", "market", "live", "coverage", "update", "updates", "breaking",
     "오늘", "미국", "증시", "주가", "관련", "기사", "보도", "발표",
+}
+
+# 금융 뉴스 유사어/어근 정규화 사전
+_SYNONYMS = {
+    "probes": "probe", "probing": "probe", "investigates": "probe", "investigating": "probe",
+    "investigation": "probe", "investigative": "probe", "scrutinizes": "probe", "scrutiny": "probe", "inquiry": "probe",
+    "spying": "spy", "spies": "spy", "espionage": "spy",
+    "scandals": "scandal",
+    "slump": "drop", "drops": "drop", "dropping": "drop", "plunges": "drop", "plunging": "drop",
+    "sinks": "drop", "sinking": "drop", "falls": "drop", "falling": "drop", "dives": "drop",
+    "diving": "drop", "craters": "drop", "cratering": "drop", "rout": "drop", "tumbles": "drop",
+    "shares": "stock", "stocks": "stock",
+    "alleged": "allege", "allegations": "allege", "allegation": "allege",
+    "lawsuits": "lawsuit", "sues": "lawsuit", "suing": "lawsuit",
+}
+
+# 지수 ETF 기사에서 개별 주도주 추출을 위한 엔티티 매핑
+_COMPANY_ENTITY_MAP = {
+    "nvidia": "NVDA", "nvda": "NVDA", "jensen": "NVDA", "huang": "NVDA",
+    "tesla": "TSLA", "tsla": "TSLA", "musk": "TSLA",
+    "apple": "AAPL", "aapl": "AAPL",
+    "microsoft": "MSFT", "msft": "MSFT",
+    "amazon": "AMZN", "amzn": "AMZN",
+    "google": "GOOGL", "googl": "GOOGL", "alphabet": "GOOGL",
+    "meta": "META", "zuckerberg": "META",
+    "broadcom": "AVGO", "avgo": "AVGO",
+    "palantir": "PLTR", "pltr": "PLTR", "karp": "PLTR",
+    "amd": "AMD",
+    "eaton": "ETN", "etn": "ETN",
+}
+
+_HIGH_IMPACT_TOPIC_WORDS = {
+    "probe", "spy", "scandal", "lawsuit", "allege", "ceo", "fraud", "sec", "doj",
+    "strike", "tariff", "subpoena", "breach", "antitrust", "recall",
 }
 
 
@@ -63,10 +98,39 @@ class SurpriseAnalysisResult(BaseModel):
 
 
 def _clean_text_for_tokens(text: str) -> Set[str]:
-    """기사 제목에서 핵심 단어 및 숫자/퍼센트 토큰 추출."""
-    words = re.findall(r"[\w%$\.]+", text.lower())
-    tokens = {w for w in words if len(w) > 1 and w not in _STOPWORDS}
+    """기사 제목에서 핵심 단어 및 숫자/퍼센트 토큰 추출 및 정규화."""
+    words = re.findall(r"\b[A-Za-z]{2,}\b", text.lower())
+    tokens: Set[str] = set()
+    for w in words:
+        if w in _STOPWORDS:
+            continue
+        w = _SYNONYMS.get(w, w)
+        if w.endswith("ies"):
+            w = w[:-3] + "y"
+        elif w.endswith("es") and len(w) > 4:
+            w = w[:-2]
+        elif w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+            w = w[:-1]
+        elif w.endswith("ing") and len(w) > 5:
+            w = w[:-3]
+        elif w.endswith("ed") and len(w) > 4:
+            w = w[:-2]
+        w = _SYNONYMS.get(w, w)
+        if w not in _STOPWORDS and len(w) > 2:
+            tokens.add(w)
     return tokens
+
+
+def _infer_article_primary_symbol(article: NewsArticle) -> str:
+    """SPY, QQQ 등 지수 ETF 기사에서 특정 대형주가 주어인 경우 개별주 티커로 정규화."""
+    orig = article.symbol.upper()
+    if orig not in ("SPY", "QQQ", "VOO", "IWM", "DIA"):
+        return orig
+    text = f"{article.title} {article.summary}".lower()
+    for kw, sym in _COMPANY_ENTITY_MAP.items():
+        if re.search(r"\b" + re.escape(kw) + r"\b", text):
+            return sym
+    return orig
 
 
 def _compute_jaccard_similarity(set_a: Set[str], set_b: Set[str]) -> float:
@@ -79,8 +143,8 @@ def _compute_jaccard_similarity(set_a: Set[str], set_b: Set[str]) -> float:
 
 def cluster_news_articles(
     articles: List[NewsArticle],
-    similarity_threshold: float = 0.38,
-    time_window_hours: float = 6.0,
+    similarity_threshold: float = 0.25,
+    time_window_hours: float = 8.0,
 ) -> List[NewsCluster]:
     """동일 종목 및 유사 시간대에 보도된 같은 사건(Event) 기사들을 단일 클러스터로 군집화한다."""
     if not articles:
@@ -97,17 +161,25 @@ def cluster_news_articles(
             continue
 
         assigned_indices.add(i)
+        lead_sym = _infer_article_primary_symbol(lead)
         lead_tokens = _clean_text_for_tokens(lead.title)
         cluster_articles = [lead]
         cluster_sources = [lead.source] if lead.source else ["News"]
+        effective_symbol = lead_sym
 
         for j in range(i + 1, len(sorted_articles)):
             if j in assigned_indices:
                 continue
 
             cand = sorted_articles[j]
-            # 같은 종목이어야 함
-            if cand.symbol.upper() != lead.symbol.upper():
+            cand_sym = _infer_article_primary_symbol(cand)
+
+            # 티커 일치 검사 (동일 티커이거나, 한쪽이 지수 ETF이면서 상대방 개별 기업 언급 시 통합)
+            sym_match = (cand_sym == lead_sym) or (
+                {cand.symbol.upper(), lead.symbol.upper()} & {"SPY", "QQQ", "VOO"}
+                and (cand_sym == lead_sym or cand_sym in (lead.symbol.upper(), lead_sym))
+            )
+            if not sym_match:
                 continue
 
             # 시간차가 지정된 윈도우 이내여야 함
@@ -116,24 +188,40 @@ def cluster_news_articles(
                 continue
 
             cand_tokens = _clean_text_for_tokens(cand.title)
+            inter = lead_tokens & cand_tokens
             sim = _compute_jaccard_similarity(lead_tokens, cand_tokens)
 
-            # 유사도가 임계치 이상이거나 제목이 부분 일치하면 동일 사건으로 묶음
-            if sim >= similarity_threshold or (cand.title in lead.title) or (lead.title in cand.title):
+            # 유사도가 임계치 이상이거나, 제목 부분 일치, 또는 핵심 사건 토픽(Probe/Spy/Scandal 등) 중복 시 동일 사건으로 묶음
+            is_same_event = (
+                sim >= similarity_threshold
+                or (cand.title.strip().lower() in lead.title.strip().lower())
+                or (lead.title.strip().lower() in cand.title.strip().lower())
+                or (len(inter) >= 3 and any(w in inter for w in _HIGH_IMPACT_TOPIC_WORDS))
+                or (("ceo" in inter or "huang" in inter) and any(w in inter for w in {"probe", "spy", "scandal"}))
+            )
+
+            if is_same_event:
                 assigned_indices.add(j)
                 cluster_articles.append(cand)
                 if cand.source and cand.source not in cluster_sources:
                     cluster_sources.append(cand.source)
+                # 개별주 티커 우선 적용 (SPY/QQQ 대신 NVDA 등으로 승격)
+                if effective_symbol in ("SPY", "QQQ", "VOO") and cand_sym not in ("SPY", "QQQ", "VOO"):
+                    effective_symbol = cand_sym
 
-        # 클러스터 ID 생성 (종목명 + 날짜 + 핵심 토큰 해시)
-        anchor_title = lead.title.strip()
-        hash_seed = f"{lead.symbol}_{anchor_title[:40]}_{datetime.fromtimestamp(lead.published_at, tz=KST).strftime('%Y%m%d')}"
+        # 클러스터 ID 생성 (종목명 + 날짜 + 핵심 토픽 토큰 해시)
+        key_tokens = sorted(lead_tokens & _HIGH_IMPACT_TOPIC_WORDS)
+        if not key_tokens:
+            key_tokens = sorted(lead_tokens)[:3]
+        topic_key = "_".join(key_tokens[:3])
+        date_str = datetime.fromtimestamp(lead.published_at, tz=KST).strftime('%Y%m%d')
+        hash_seed = f"{effective_symbol}_{topic_key}_{date_str}"
         cluster_id = hashlib.sha256(hash_seed.encode("utf-8")).hexdigest()[:16]
 
         clusters.append(
             NewsCluster(
                 cluster_id=cluster_id,
-                symbol=lead.symbol.upper(),
+                symbol=effective_symbol,
                 anchor=lead,
                 articles=cluster_articles,
                 sources=cluster_sources,

@@ -253,9 +253,12 @@ async def scan_us_market_news(
         alerted_clusters: List[Dict[str, Any]] = []
 
         for cl in clusters:
-            # 24시간 이내 이미 발송된 클러스터인지 확인
-            is_sent = await db.is_us_news_cluster_already_sent(conn, cl.cluster_id, max_age_hours=24.0)
+            # 24시간 이내 이미 발송된 클러스터 또는 3시간 이내 동일 종목 유사 사건인지 확인
+            is_sent = await db.is_us_news_duplicate_or_recent(
+                conn, cl.cluster_id, cl.symbol, cl.anchor.title, max_age_hours=24.0, cooldown_hours=3.0
+            )
             if is_sent:
+                logger.info(f"'{cl.symbol}' 클러스터({cl.cluster_id}) 또는 최근 유사 이슈 이미 발송됨 ➔ 알림 생략")
                 continue
 
             current_change = price_changes.get(cl.symbol)
@@ -401,34 +404,37 @@ class USMarketMonitorScheduler:
                     news_res = await scan_us_market_news(threshold=75, send_notifications=True)
                     logger.info(f"🇺🇸 글로벌 뉴스 스캔 완료: {news_res.get('alerted_count', 0)}건 서프라이즈 알림 발송")
 
-                    # 미국장 포트폴리오 리밸런싱 트리거 자동 진단 (신규 달러 입금 or 밴드 이탈)
-                    try:
-                        from core.us_market.rebalance import (
-                            analyze_us_portfolio_drift,
-                            build_us_rebalance_plan,
-                            format_us_rebalance_telegram_message,
-                        )
-                        from core.us_market.notifier import get_telegram_config, send_telegram_message_with_result
-                        reb_conn = await db.get_connection()
+                    # 미국장 포트폴리오 리밸런싱 트리거 자동 진단 (해외 실전 계좌에서만 실행)
+                    is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+                    is_domestic = getattr(settings, "DOMESTIC_ONLY", False)
+                    if is_meritz and not is_domestic:
                         try:
-                            drift_res = await analyze_us_portfolio_drift(reb_conn)
-                            plan = build_us_rebalance_plan(drift_res)
-                            if plan.items and plan.trigger_type in ("CASH_INFLOW", "BAND_DRIFT"):
-                                last_alert_time_str = await db.get_state(reb_conn, "us_last_rebalance_alerted_at")
-                                last_alert_time = float(last_alert_time_str) if last_alert_time_str else 0.0
-                                if (time.time() - last_alert_time) > 43200:  # 12시간 쿨다운
-                                    token, chat_id = get_telegram_config()
-                                    if token and chat_id:
-                                        msg = format_us_rebalance_telegram_message(plan)
-                                        await asyncio.to_thread(
-                                            send_telegram_message_with_result, token, chat_id, msg, parse_mode=""
-                                        )
-                                        await db.set_state(reb_conn, "us_last_rebalance_alerted_at", str(time.time()))
-                                        logger.info(f"🇺🇸 미국장 리밸런싱 계획({plan.trigger_type}) 텔레그램 알림 전송 완료")
-                        finally:
-                            await reb_conn.close()
-                    except Exception as reb_err:
-                        logger.warning(f"미국장 리밸런싱 진단 중 오류: {reb_err}")
+                            from core.us_market.rebalance import (
+                                analyze_us_portfolio_drift,
+                                build_us_rebalance_plan,
+                                format_us_rebalance_telegram_message,
+                            )
+                            from core.us_market.notifier import get_telegram_config, send_telegram_message_with_result
+                            reb_conn = await db.get_connection()
+                            try:
+                                drift_res = await analyze_us_portfolio_drift(reb_conn)
+                                plan = build_us_rebalance_plan(drift_res)
+                                if plan.items and plan.trigger_type in ("CASH_INFLOW", "BAND_DRIFT"):
+                                    last_alert_time_str = await db.get_state(reb_conn, "us_last_rebalance_alerted_at")
+                                    last_alert_time = float(last_alert_time_str) if last_alert_time_str else 0.0
+                                    if (time.time() - last_alert_time) > 43200:  # 12시간 쿨다운
+                                        token, chat_id = get_telegram_config()
+                                        if token and chat_id:
+                                            msg = format_us_rebalance_telegram_message(plan)
+                                            await asyncio.to_thread(
+                                                send_telegram_message_with_result, token, chat_id, msg, parse_mode=""
+                                            )
+                                            await db.set_state(reb_conn, "us_last_rebalance_alerted_at", str(time.time()))
+                                            logger.info(f"🇺🇸 미국장 리밸런싱 계획({plan.trigger_type}) 텔레그램 알림 전송 완료")
+                            finally:
+                                await reb_conn.close()
+                        except Exception as reb_err:
+                            logger.warning(f"미국장 리밸런싱 진단 중 오류: {reb_err}")
             except Exception:
                 logger.exception("미국장 정기 스케줄러 루프 오류 발생")
 

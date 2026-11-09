@@ -123,7 +123,11 @@ class USRebalancePlan(BaseModel):
 
 
 async def get_us_target_weights(conn) -> Dict[str, float]:
-    """DB에 저장된 미국장 종목들의 목표 비중을 조회한다. 없으면 기본값을 세팅."""
+    """DB에 저장된 미국장 종목들의 목표 비중을 조회한다. 없으면 기본값을 세팅(메리츠 해외 전용 계좌일 때만)."""
+    # 국내 전용 계좌(DOMESTIC_ONLY=True 또는 BROKER != 'meritz')에서는 미국장 비중 자동 주입 및 조회를 원천 차단
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        return {}
+
     active = await db.get_active_target_weights(conn)
     # overseas 종목만 필터
     overseas_symbols = set(DEFAULT_US_TARGET_WEIGHTS.keys())
@@ -137,7 +141,7 @@ async def get_us_target_weights(conn) -> Dict[str, float]:
 
     us_weights = {k.upper(): v for k, v in active.items() if k.upper() in overseas_symbols and v > 0}
     if not us_weights:
-        # 기본값 저장 및 반환
+        # 메리츠 해외 전용 계좌일 때만 초기 기본값 저장 및 반환
         for sym, w in DEFAULT_US_TARGET_WEIGHTS.items():
             prop_id = await db.propose_target_weight(
                 conn, sym, w, proposed_by="system", rationale="미국장 기본 자산배분 목표 비중"
@@ -149,6 +153,9 @@ async def get_us_target_weights(conn) -> Dict[str, float]:
 
 async def set_us_target_weights(conn, weights: Dict[str, float]) -> Dict[str, float]:
     """미국장 포트폴리오 목표 비중을 업데이트하고 정규화한다 (신규 편입 종목은 portfolio_symbols/us_watchlist에 자동 등록)."""
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        raise ValueError("국내 전용 계좌에서는 미국장 목표 비중을 설정할 수 없습니다.")
+
     clean = {k.strip().upper(): max(0.0, float(v)) for k, v in weights.items() if k.strip()}
     total = sum(clean.values())
     if total > 0:
@@ -196,6 +203,21 @@ async def analyze_us_portfolio_drift(
     target_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """미국 계좌의 현재 포지션, 가용 달러, 실시간 시세를 분석하여 비중 드리프트를 진단한다."""
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        return {
+            "status": "SKIPPED",
+            "message": "국내 전용 계좌에서는 미국장 리밸런싱을 지원하지 않습니다.",
+            "total_equity_usd": 0.0,
+            "total_stock_eval_usd": 0.0,
+            "available_usd": 0.0,
+            "inflow_detected_usd": 0.0,
+            "positions": [],
+            "excess_positions": [],
+            "deficit_positions": [],
+            "balanced_positions": [],
+            "band_pct": band_pct,
+        }
+
     targets = target_weights or await get_us_target_weights(conn)
 
     # 1. 메리츠 API 연동 잔고 조회 시도

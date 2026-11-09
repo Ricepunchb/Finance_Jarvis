@@ -335,12 +335,17 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
             if target_mean and current_price and current_price > 0:
                 target_gap_pct = round(((target_mean - current_price) / current_price) * 100, 2)
 
-            # 뉴스: yf.Ticker.news 우선 확인 후 빈 리스트면 yf.Search로 안정적 폴백
-            raw_news = getattr(t, "news", []) or []
+            # 뉴스: yf.Search 신규 엔드포인트 우선 수집 (t.news 장애 및 YFDataException 격리)
+            raw_news = []
+            try:
+                search_obj = yf.Search(target_sym, news_count=5)
+                raw_news = getattr(search_obj, "news", []) or []
+            except Exception:
+                pass
+
             if not raw_news:
                 try:
-                    search_obj = yf.Search(target_sym, news_count=5)
-                    raw_news = getattr(search_obj, "news", []) or []
+                    raw_news = getattr(t, "news", []) or []
                 except Exception:
                     pass
 
@@ -391,12 +396,17 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
                 if rm:
                     recomm_means.append(float(rm))
 
-                # 앵커별 최신 뉴스 2건 수집
-                raw_news = getattr(t, "news", []) or []
+                # 앵커별 최신 뉴스 2건 수집 (yf.Search 우선, 예외 격리)
+                raw_news = []
+                try:
+                    search_obj = yf.Search(anchor, news_count=3)
+                    raw_news = getattr(search_obj, "news", []) or []
+                except Exception:
+                    pass
+
                 if not raw_news:
                     try:
-                        search_obj = yf.Search(anchor, news_count=3)
-                        raw_news = getattr(search_obj, "news", []) or []
+                        raw_news = getattr(t, "news", []) or []
                     except Exception:
                         pass
 
