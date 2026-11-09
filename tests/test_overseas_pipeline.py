@@ -59,8 +59,29 @@ def test_yfinance_fetch_targets():
         assert targets["recomm_mean"] == 2.1
 
 
+def test_yfinance_fetch_news_search():
+    with patch("yfinance.Search") as mock_search_cls:
+        mock_s = MagicMock()
+        mock_s.news = [
+            {
+                "title": "Apple unveils new M4 chips",
+                "summary": "Apple announced new lineup...",
+                "canonicalUrl": {"url": "https://finance.yahoo.com/news/apple-m4"},
+                "pubDate": 1700000000.0,
+            }
+        ]
+        mock_search_cls.return_value = mock_s
+
+        news = yfinance_client.fetch_recent_news_yfinance("AAPL", max_items=2)
+        assert len(news) == 1
+        assert news[0]["symbol"] == "AAPL"
+        assert news[0]["source"] == "yfinance_news"
+        assert news[0]["title"] == "Apple unveils new M4 chips"
+        assert news[0]["published_at"] == 1700000000.0
+
+
 def test_yfinance_fetch_news_fallback():
-    with patch("yfinance.Search", side_effect=Exception("search error")), patch("yfinance.Ticker") as mock_ticker_cls:
+    with patch("yfinance.Search", side_effect=Exception("search down")), patch("yfinance.Ticker") as mock_ticker_cls:
         mock_instance = MagicMock()
         mock_instance.news = [
             {
