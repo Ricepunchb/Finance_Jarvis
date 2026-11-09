@@ -119,6 +119,7 @@ class USRebalancePlan(BaseModel):
     projected_residual_usd: float = 0.0
     positions: List[USPositionStatus] = Field(default_factory=list)
     rationale: str = ""
+    warning: Optional[str] = None
     created_at: float = Field(default_factory=time.time)
 
 
@@ -158,7 +159,12 @@ async def set_us_target_weights(conn, weights: Dict[str, float]) -> Dict[str, fl
 
     clean = {k.strip().upper(): max(0.0, float(v)) for k, v in weights.items() if k.strip()}
     total = sum(clean.values())
-    if total > 0:
+    if total <= 0:
+        raise ValueError("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+
+    # 합계가 1.0(또는 100%)이 아닌 경우 경고 로깅 및 100% 비례 정규화
+    if abs(total - 1.0) > 0.0001:
+        logger.info(f"미국장 목표 비중 입력 합계({total*100:.2f}%) ➔ 100.0%로 비례 정규화하여 저장합니다.")
         clean = {k: round(v / total, 4) for k, v in clean.items()}
 
     existing_wl = {it["symbol"].upper(): it for it in await db.list_us_watchlist(conn)}
@@ -219,6 +225,17 @@ async def analyze_us_portfolio_drift(
         }
 
     targets = target_weights or await get_us_target_weights(conn)
+
+    # 목표 비중 총합 검증: 100%가 아닌 경우 (예: 105%) 드리프트 왜곡 방지를 위해 100%로 보정
+    total_target_w = sum(targets.values()) if targets else 0.0
+    target_weight_warning: Optional[str] = None
+    if total_target_w > 0 and abs(total_target_w - 1.0) > 0.005:
+        target_weight_warning = (
+            f"설정된 목표 비중의 합계({total_target_w*100:.1f}%)가 100%가 아닙니다. "
+            f"100%로 비례 정규화하여 리밸런싱 계획을 산출합니다."
+        )
+        logger.warning(target_weight_warning)
+        targets = {k: v / total_target_w for k, v in targets.items()}
 
     # 1. 메리츠 API 연동 잔고 조회 시도
     holdings_dict: Dict[str, Dict[str, Any]] = {}
@@ -370,6 +387,8 @@ async def analyze_us_portfolio_drift(
         "excess_positions": excess_list,
         "deficit_positions": deficit_list,
         "quotes": quotes,
+        "target_weight_warning": target_weight_warning,
+        "target_weights_sum": round(total_target_w, 4),
     }
 
 
@@ -385,6 +404,8 @@ def build_us_rebalance_plan(
     excess_positions: List[USPositionStatus] = drift_data["excess_positions"]
     deficit_positions: List[USPositionStatus] = drift_data["deficit_positions"]
     band_pct = drift_data["band_pct"]
+
+    target_weight_warning = drift_data.get("target_weight_warning")
 
     # 트리거 판별
     items: List[USRebalanceItem] = []
@@ -441,6 +462,7 @@ def build_us_rebalance_plan(
             items=[],
             positions=positions,
             rationale=rationale,
+            warning=target_weight_warning,
         )
 
     # 매수 예산 계산 = 현재 가용 달러 + 매도 예상 회수 달러
@@ -504,6 +526,7 @@ def build_us_rebalance_plan(
         projected_residual_usd=projected_residual,
         positions=positions,
         rationale=rationale,
+        warning=target_weight_warning,
     )
 
 

@@ -1437,11 +1437,18 @@ async def update_us_weights_endpoint(req: USWeightsUpdateRequest):
     from core.us_market.rebalance import set_us_target_weights
     conn = await db.get_connection()
     try:
+        raw_sum = sum(req.weights.values()) if req.weights else 0.0
         try:
             updated = await set_us_target_weights(conn, req.weights)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
-        return {"status": "ok", "weights": updated}
+        was_norm = abs(raw_sum - 1.0) > 0.001 and abs(raw_sum - 100.0) > 0.1
+        return {
+            "status": "ok",
+            "weights": updated,
+            "raw_sum": round(raw_sum, 4),
+            "was_normalized": was_norm,
+        }
     finally:
         await conn.close()
 

@@ -127,9 +127,16 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
 
     st.divider()
 
+    # 목표 비중 총합 왜곡 경고 안내
+    if reb_status.get("target_weight_warning"):
+        st.warning(f"⚠️ {reb_status['target_weight_warning']}")
+
     # 2. 포트폴리오 비중 현황 테이블
     st.markdown("##### 📊 종목별 현재 비중 vs 목표 비중 현황")
     rows = []
+    tot_cur_w = 0.0
+    tot_tgt_w = 0.0
+
     for p in pos_list:
         sym = p.get("symbol", "")
         name = p.get("name", sym)
@@ -140,6 +147,9 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
         tgt_w = p.get("target_weight", 0.0) * 100
         drift = p.get("drift_pct", 0.0) * 100
         stat = p.get("status", "BALANCED")
+
+        tot_cur_w += cur_w
+        tot_tgt_w += tgt_w
 
         pnl_val = p.get("pnl_pct", 0.0)
         avg_prc = p.get("avg_price", 0.0)
@@ -172,8 +182,33 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
             "괴리(Drift)": f"{drift:+.1f}%p",
             "상태": stat_badge,
         })
+
     if rows:
+        cash_w = (avail_usd / tot_eq * 100) if tot_eq > 0 else 0.0
+        tot_drift = (tot_cur_w + cash_w) - tot_tgt_w
+        tgt_status = "✅ 100% 정상" if abs(tot_tgt_w - 100.0) < 0.1 else f"⚠️ 합계 {tot_tgt_w:.1f}%"
+
+        rows.append({
+            "티커": "자산 합계",
+            "종목명": f"{len(pos_list)}종목 (주식 {tot_cur_w:.1f}% + 달러 {cash_w:.1f}%)",
+            "보유 수량": "-",
+            "내 평단가": "-",
+            "현재가": "-",
+            "수익률": "-",
+            "평가액": f"${tot_eq:,.2f}",
+            "현재 비중": f"{(tot_cur_w + cash_w):.1f}%",
+            "목표 비중": f"{tot_tgt_w:.1f}%",
+            "괴리(Drift)": f"{tot_drift:+.1f}%p",
+            "상태": tgt_status,
+        })
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        if abs(tot_tgt_w - 100.0) >= 0.5:
+            st.warning(
+                f"⚠️ 현재 등록된 목표 비중의 합계가 **{tot_tgt_w:.1f}%**입니다. "
+                f"목표 비중의 합이 100%가 되지 않으면 리밸런싱 계획에 왜곡이 발생할 수 있습니다. "
+                f"아래 [목표 비중 편집기]에서 [100% 자동 비례 정규화]를 클릭해 합계를 100%로 맞추세요."
+            )
     else:
         st.info("현재 등록된 미국장 포트폴리오 종목이 없습니다.")
 
@@ -214,6 +249,9 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
                 st.error(f"집행 실패: {detail}")
 
     # 계획 표시
+    if plan_res and plan_res.get("warning"):
+        st.warning(f"⚠️ {plan_res['warning']}")
+
     if plan_res and plan_res.get("items"):
         trigger_t = plan_res.get("trigger_type", "")
         if trigger_t == "CASH_INFLOW":
@@ -269,7 +307,7 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
 
     # 4. 목표 비중 편집기
     with st.expander("⚙️ 미국장 포트폴리오 목표 비중(Target Weights) 편집", expanded=False):
-        st.caption("각 종목의 목표 비중을 백분율(%)로 입력하세요. 총합은 자동으로 100%로 정규화됩니다.")
+        st.caption("각 종목의 목표 비중을 백분율(%)로 입력하세요. 총합이 100%여야 의도한 비율대로 리밸런싱 계획이 수립됩니다.")
         cur_targets = {p["symbol"]: round(p["target_weight"] * 100, 1) for p in pos_list}
         w_inputs = {}
 
@@ -286,17 +324,53 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
                     key=f"{key_prefix}_target_w_{sym}",
                 )
 
-        if st.button("💾 목표 비중 저장 및 적용", type="primary", key=f"{key_prefix}_save_weights_btn"):
-            total_w = sum(w_inputs.values())
-            if total_w <= 0:
-                st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
-            else:
-                norm_weights = {k: v / total_w for k, v in w_inputs.items()}
-                res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
-                if res and res.get("status") == "ok":
-                    st.success("✅ 미국장 목표 비중이 성공적으로 저장되었습니다!")
-                    time.sleep(1)
-                    st.rerun()
+        current_sum = sum(w_inputs.values())
+        diff = round(current_sum - 100.0, 1)
+
+        if abs(diff) < 0.05:
+            st.success(f"📊 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 정상 일치 ✅)")
+        elif diff > 0:
+            st.warning(
+                f"⚠️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **+{diff:.1f}%p 초과**)<br>"
+                f"합계가 100%를 초과하면 계획 수립 시 100%로 임시 정규화되거나 초과 매수가 추천될 수 있습니다. "
+                f"아래 **[⚖️ 100% 자동 비례 정규화]** 버튼을 눌러 100%로 맞추거나 직접 수치를 조정하세요.",
+                icon="⚠️",
+            )
+        else:
+            st.info(
+                f"ℹ️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **{-diff:.1f}%p 미달**)<br>"
+                f"잔여 {abs(diff):.1f}%는 현금(USD)으로 유지하거나 다른 종목에 배분할 수 있습니다.",
+                icon="ℹ️",
+            )
+
+        btn_w1, btn_w2 = st.columns(2)
+        with btn_w1:
+            if st.button("⚖️ 100% 자동 비례 정규화", width="stretch", key=f"{key_prefix}_auto_norm_btn"):
+                if current_sum <= 0:
+                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+                else:
+                    norm_weights = {k: round(v / current_sum, 4) for k, v in w_inputs.items()}
+                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
+                    if res and res.get("status") == "ok":
+                        st.success(f"✅ 입력 합계 {current_sum:.1f}%를 100.0%로 비례 정규화하여 저장했습니다!")
+                        time.sleep(1)
+                        st.rerun()
+
+        with btn_w2:
+            if st.button("💾 목표 비중 저장 및 적용", type="primary", width="stretch", key=f"{key_prefix}_save_weights_btn"):
+                total_w = sum(w_inputs.values())
+                if total_w <= 0:
+                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+                else:
+                    norm_weights = {k: round(v / total_w, 4) for k, v in w_inputs.items()}
+                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
+                    if res and res.get("status") == "ok":
+                        if abs(diff) >= 0.1:
+                            st.info(f"💡 입력 합계({total_w:.1f}%)를 100.0%로 비례 정규화하여 저장했습니다.")
+                        else:
+                            st.success("✅ 미국장 목표 비중이 성공적으로 저장되었습니다!")
+                        time.sleep(1)
+                        st.rerun()
 
 
 # =========================================================================

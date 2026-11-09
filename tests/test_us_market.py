@@ -838,6 +838,38 @@ def test_us_rebalance_plan_cash_inflow_and_band_drift():
     assert sells[0].qty >= 1
 
 
+def test_us_rebalance_drift_normalizes_and_warns_on_non_100_target_sum():
+    """목표 비중 합계가 105% 등 100%가 아닌 경우, 100%로 비례 정규화되고 경고 메시지가 생성되는지 검증."""
+    from core.us_market.rebalance import build_us_rebalance_plan, USPositionStatus
+
+    positions = [
+        USPositionStatus(
+            symbol="NVDA", name="NVIDIA", exchange="NASD",
+            qty=10, avg_price=100.0, current_price=130.0, eval_value_usd=1300.0,
+            current_weight=0.26, target_weight=0.20, drift_pct=0.06,
+            status="EXCESS", pnl_pct=30.0,
+        )
+    ]
+
+    drift_data_105 = {
+        "total_equity_usd": 5000.0,
+        "total_stock_eval_usd": 1300.0,
+        "available_usd": 3700.0,
+        "inflow_detected_usd": 0.0,
+        "band_pct": 0.05,
+        "positions": positions,
+        "excess_positions": positions,
+        "deficit_positions": [],
+        "target_weight_warning": "설정된 목표 비중의 합계(105.0%)가 100%가 아닙니다. 100%로 비례 정규화하여 리밸런싱 계획을 산출합니다.",
+        "target_weights_sum": 1.05,
+    }
+
+    plan = build_us_rebalance_plan(drift_data_105)
+    assert plan.warning is not None
+    assert "105.0%" in plan.warning
+    assert "비례 정규화" in plan.warning
+
+
 def test_us_rebalance_api_endpoints(monkeypatch):
     """미국장 리밸런싱 API 엔드포인트(status, plan, weights, execute) 정상 동작 검증."""
     from unittest.mock import AsyncMock
