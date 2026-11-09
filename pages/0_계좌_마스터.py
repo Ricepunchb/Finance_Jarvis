@@ -102,7 +102,7 @@ with header_col1:
 
 with header_col2:
     st.write("")
-    if st.button("🔄 전체 상태 새로고침", use_container_width=True, type="secondary"):
+    if st.button("🔄 전체 상태 새로고침", width="stretch", type="secondary"):
         st.rerun()
 
 # --- 프로필 데이터 조회 ---
@@ -160,7 +160,7 @@ with toolbar_col1:
     st.subheader("📋 계좌별 실시간 관제 및 제어")
 
 with toolbar_col2:
-    if st.button("🚀 미실행 계좌 일괄 기동", use_container_width=True, help="정지되어 있는 모든 계좌를 즉시 기동합니다."):
+    if st.button("🚀 미실행 계좌 일괄 기동", width="stretch", help="정지되어 있는 모든 계좌를 즉시 기동합니다."):
         with st.spinner("미실행 프로필을 기동하는 중..."):
             started_names = []
             for p in profiles:
@@ -184,7 +184,7 @@ with toolbar_col3:
             unsafe_allow_html=True,
         )
     else:
-        if st.button("🏢 마스터 포털(:8500) 기동", use_container_width=True, help="모든 계좌를 꺼도 유지되는 24/7 전용 관제 포털을 기동합니다."):
+        if st.button("🏢 마스터 포털(:8500) 기동", width="stretch", help="모든 계좌를 꺼도 유지되는 24/7 전용 관제 포털을 기동합니다."):
             ok, msg = start_master_portal()
             if ok:
                 st.success(msg)
@@ -282,7 +282,7 @@ for p in profiles:
             # 기동 / 중지 버튼
             with btn_c1:
                 if status_code != "running":
-                    if st.button("🟢 기동", key=f"start_{name}", use_container_width=True, type="primary"):
+                    if st.button("🟢 기동", key=f"start_{name}", width="stretch", type="primary"):
                         with st.spinner(f"[{display}] 기동 중..."):
                             ok, msg = start_profile(name)
                             if ok:
@@ -292,7 +292,7 @@ for p in profiles:
                             time.sleep(1)
                             st.rerun()
                 else:
-                    if st.button("🔴 중지", key=f"stop_{name}", use_container_width=True):
+                    if st.button("🔴 중지", key=f"stop_{name}", width="stretch"):
                         if is_current_view:
                             st.warning("⚠️ 현재 접속 중인 대시보드입니다. 중지 시 본 화면과의 연결이 종료됩니다.")
                         with st.spinner(f"[{display}] 중지 중..."):
@@ -306,7 +306,7 @@ for p in profiles:
 
             # 재기동 버튼
             with btn_c2:
-                if st.button("🔄 재기동", key=f"restart_{name}", use_container_width=True, help="엔진 및 대시보드를 재부팅합니다."):
+                if st.button("🔄 재기동", key=f"restart_{name}", width="stretch", help="엔진 및 대시보드를 재부팅합니다."):
                     with st.spinner(f"[{display}] 재기동 중..."):
                         ok, msg = restart_profile(name)
                         if ok:
@@ -319,7 +319,7 @@ for p in profiles:
             # 기본 프로필 전환
             with btn_c3:
                 if not is_active:
-                    if st.button("⭐ 지정", key=f"switch_{name}", use_container_width=True, help="기본 활성 프로필(.env)로 전환"):
+                    if st.button("⭐ 지정", key=f"switch_{name}", width="stretch", help="기본 활성 프로필(.env)로 전환"):
                         ok, msg = switch_profile(name)
                         if ok:
                             st.toast(f"기본 프로필을 [{name}]으로 변경했습니다.", icon="⭐")
@@ -328,7 +328,7 @@ for p in profiles:
                         else:
                             st.error(msg)
                 else:
-                    st.button("⭐ 기본", key=f"active_lbl_{name}", use_container_width=True, disabled=True)
+                    st.button("⭐ 기본", key=f"active_lbl_{name}", width="stretch", disabled=True)
 
             # 대시보드 열기 링크
             with btn_c4:
@@ -341,7 +341,7 @@ for p in profiles:
                         unsafe_allow_html=True,
                     )
                 else:
-                    st.button("🔗 꺼짐", key=f"dash_off_{name}", use_container_width=True, disabled=True)
+                    st.button("🔗 꺼짐", key=f"dash_off_{name}", width="stretch", disabled=True)
 
         # 고급 세부 제어 Expander
         with st.expander(f"⚙️ [{display}] 세부 제어 및 진단 (컴포넌트 분리 관리)"):
@@ -350,12 +350,12 @@ for p in profiles:
             with adv_c1:
                 st.markdown("**엔진 프로세스 (FastAPI)**")
                 if not p["engine_running"]:
-                    if st.button("⚡ 엔진만 켜기", key=f"adv_start_eng_{name}", use_container_width=True):
+                    if st.button("⚡ 엔진만 켜기", key=f"adv_start_eng_{name}", width="stretch"):
                         start_component(name, "engine")
                         time.sleep(0.8)
                         st.rerun()
                 else:
-                    if st.button("🛑 엔진만 끄기", key=f"adv_stop_eng_{name}", use_container_width=True):
+                    if st.button("🛑 엔진만 끄기", key=f"adv_stop_eng_{name}", width="stretch"):
                         stop_component(name, "engine")
                         time.sleep(0.8)
                         st.rerun()
@@ -363,12 +363,12 @@ for p in profiles:
             with adv_c2:
                 st.markdown("**대시보드 (Streamlit)**")
                 if not p["front_running"]:
-                    if st.button("📊 대시보드만 켜기", key=f"adv_start_front_{name}", use_container_width=True):
+                    if st.button("📊 대시보드만 켜기", key=f"adv_start_front_{name}", width="stretch"):
                         start_component(name, "front")
                         time.sleep(0.8)
                         st.rerun()
                 else:
-                    if st.button("🛑 대시보드만 끄기", key=f"adv_stop_front_{name}", use_container_width=True):
+                    if st.button("🛑 대시보드만 끄기", key=f"adv_stop_front_{name}", width="stretch"):
                         stop_component(name, "front")
                         time.sleep(0.8)
                         st.rerun()
@@ -377,7 +377,7 @@ for p in profiles:
                 st.markdown("**트레이딩 루프 (엔진)**")
                 if p["api_online"]:
                     if not p["engine_loop_running"]:
-                        if st.button("▶️ 루프 시작", key=f"adv_loop_start_{name}", use_container_width=True):
+                        if st.button("▶️ 루프 시작", key=f"adv_loop_start_{name}", width="stretch"):
                             ok, msg = trigger_engine_loop(api_port, "start")
                             if ok:
                                 st.success(msg)
@@ -386,7 +386,7 @@ for p in profiles:
                             time.sleep(0.5)
                             st.rerun()
                     else:
-                        if st.button("⏸️ 루프 일시정지", key=f"adv_loop_stop_{name}", use_container_width=True):
+                        if st.button("⏸️ 루프 일시정지", key=f"adv_loop_stop_{name}", width="stretch"):
                             ok, msg = trigger_engine_loop(api_port, "stop")
                             if ok:
                                 st.info(msg)
@@ -401,7 +401,7 @@ for p in profiles:
                 st.markdown("**안전 가드 / 킬스위치**")
                 if p["kill_switch"]:
                     st.error("🚨 킬스위치 활성화 상태")
-                    if st.button("🔓 킬스위치 해제", key=f"adv_clear_kill_{name}", use_container_width=True):
+                    if st.button("🔓 킬스위치 해제", key=f"adv_clear_kill_{name}", width="stretch"):
                         ok, msg = clear_kill_switch(api_port)
                         if ok:
                             st.success(msg)
@@ -430,7 +430,7 @@ if tmux_sessions:
         log_lines = st.selectbox("출력 줄 수", [30, 50, 100, 200], index=1)
     with log_col3:
         st.write("")
-        refresh_logs = st.button("🔄 로그 새로고침", use_container_width=True)
+        refresh_logs = st.button("🔄 로그 새로고침", width="stretch")
 
     session_log_content = get_session_output(selected_session, lines=log_lines)
     escaped_log = html.escape(session_log_content)

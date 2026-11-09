@@ -173,7 +173,7 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
             "상태": stat_badge,
         })
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.info("현재 등록된 미국장 포트폴리오 종목이 없습니다.")
 
@@ -184,11 +184,11 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
     col_act1, col_act2, col_act3 = st.columns([1.5, 1.5, 2])
 
     with col_act1:
-        btn_plan = st.button("🔍 리밸런싱 계획 수립/새로고침", use_container_width=True, type="secondary", key=f"{key_prefix}_btn_plan")
+        btn_plan = st.button("🔍 리밸런싱 계획 수립/새로고침", width="stretch", type="secondary", key=f"{key_prefix}_btn_plan")
     with col_act2:
-        btn_notify = st.button("📨 텔레그램 브리핑 발송", use_container_width=True, key=f"{key_prefix}_btn_notify")
+        btn_notify = st.button("📨 텔레그램 브리핑 발송", width="stretch", key=f"{key_prefix}_btn_notify")
     with col_act3:
-        btn_execute = st.button("🚀 리밸런싱 즉시 실행 (정규장 주문)", use_container_width=True, type="primary", key=f"{key_prefix}_btn_exec")
+        btn_execute = st.button("🚀 리밸런싱 즉시 실행 (정규장 주문)", width="stretch", type="primary", key=f"{key_prefix}_btn_exec")
 
     # 계획 수립
     plan_res = api_post("/us-market/rebalance/plan", {"force_inflow_rebalance": False})
@@ -326,7 +326,7 @@ def render_us_news_surprise_section(key_prefix: str = "us_news") -> None:
     with ctrl_col3:
         st.write("")
         st.write("")
-        if st.button("⚡ 뉴스 즉시 스캔 & 분석", type="primary", use_container_width=True, key=f"{key_prefix}_btn_scan"):
+        if st.button("⚡ 뉴스 즉시 스캔 & 분석", type="primary", width="stretch", key=f"{key_prefix}_btn_scan"):
             with st.spinner("글로벌 뉴스 수집, 사건 군집화 및 AI 서프라이즈 점수 산출 중..."):
                 scan_res = api_post(
                     "/us-market/scan-news",
@@ -686,7 +686,7 @@ def render_us_signals_board_section(key_prefix: str = "us_board") -> None:
                     template="plotly_dark",
                     showlegend=False,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.caption("차트 데이터를 불러오는 중이거나 데이터가 부족합니다.")
 
@@ -801,7 +801,7 @@ def render_us_watchlist_manage_section(key_prefix: str = "us_manage") -> None:
                 "알림": "🔔 ON" if it.get("alert_enabled", 1) else "🔕 OFF",
                 "메모": it.get("notes") or "",
             })
-        st.dataframe(pd.DataFrame(rows_to_render), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows_to_render), width="stretch", hide_index=True)
 
         # 종목 삭제 버튼
         del_col1, del_col2 = st.columns([3, 1])
@@ -857,7 +857,7 @@ def render_us_history_section(key_prefix: str = "us_hist") -> None:
         df_hist["판단 근거"] = df_hist["reason"]
 
         display_cols = ["시각 (KST)", "종목", "현재가", "등락률", "최종 시그널", "판단 근거"]
-        st.dataframe(df_hist[display_cols], use_container_width=True, hide_index=True)
+        st.dataframe(df_hist[display_cols], width="stretch", hide_index=True)
     else:
         st.info("아직 누적된 시그널 기록이 없습니다.")
 
@@ -941,7 +941,7 @@ def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
         force_rf = st.button(
             "🔄 글로벌 섹터 & 종목 점수 재계산",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key=f"{key_prefix}_btn_refresh",
         )
 
@@ -975,7 +975,7 @@ def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
                 "SPY 대비 3M 상대강도": f"{s.get('rel_strength_3m', 0):+.2f}%p",
                 "추세": "📈 정배열 상승" if s.get("is_uptrend") else "➖ 조정/횡보",
             })
-        st.dataframe(pd.DataFrame(sec_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(sec_rows), width="stretch", hide_index=True)
 
     st.divider()
 
@@ -1056,7 +1056,7 @@ def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
         })
 
     if cand_rows:
-        st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cand_rows), width="stretch", hide_index=True)
     else:
         st.info("조건에 부합하는 종목이 없습니다.")
 
@@ -1106,7 +1106,7 @@ def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
                 "비중 조정폭": f"{it.get('delta_weight', 0)*100:+.1f}%p",
                 "핵심 투자 근거": it.get("thesis", ""),
             })
-        st.dataframe(pd.DataFrame(prop_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(prop_rows), width="stretch", hide_index=True)
 
         with p_col3:
             st.write("")
@@ -1114,7 +1114,7 @@ def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
             if st.button(
                 "🚀 발굴 종목 포함 목표비중 즉시 적용",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key=f"{key_prefix}_apply_evolution_btn",
             ):
                 proposed_weights = proposal.get("proposed_weights", {})

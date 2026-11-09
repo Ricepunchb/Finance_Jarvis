@@ -125,7 +125,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
                 help="단기 급락 중인 종목의 칼날잡기를 차단합니다.",
             )
 
-        run_btn = st.button("🚀 백테스트 실행", type="primary", use_container_width=True)
+        run_btn = st.button("🚀 백테스트 실행", type="primary", width="stretch")
 
     if run_btn:
         symbols_list = [s.strip() for s in symbols_input.split(",") if s.strip()]
@@ -276,7 +276,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             margin=dict(l=20, r=20, t=30, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_equity, use_container_width=True)
+        st.plotly_chart(fig_equity, width="stretch")
 
         st.markdown("#### 🌊 언더워터 낙폭 차트 (Drawdown %)")
         fig_dd = go.Figure()
@@ -306,7 +306,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             margin=dict(l=20, r=20, t=30, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_dd, use_container_width=True)
+        st.plotly_chart(fig_dd, width="stretch")
 
     # 4. 상세 매매 일지
     st.markdown("#### 📜 시뮬레이션 매매 일지")
@@ -330,7 +330,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
         }
         st.dataframe(
             tdf[display_cols].rename(columns=col_rename),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=320,
         )

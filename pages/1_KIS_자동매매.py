@@ -790,16 +790,16 @@ with tab_ai:
             f"에이전트 자체 결정 쿨다운: {scheduler_status['min_interval_sec'] // 3600}시간"
         )
         sb1, sb2, sb3, sb4 = st.columns(4)
-        if sb1.button("🟢 스케줄러 켜기", disabled=scheduler_status["enabled"], use_container_width=True):
+        if sb1.button("🟢 스케줄러 켜기", disabled=scheduler_status["enabled"], width="stretch"):
             api_post("/ai-rebalance/scheduler", {"enabled": True})
             st.rerun()
-        if sb2.button("⚪ 스케줄러 끄기", disabled=not scheduler_status["enabled"], use_container_width=True):
+        if sb2.button("⚪ 스케줄러 끄기", disabled=not scheduler_status["enabled"], width="stretch"):
             api_post("/ai-rebalance/scheduler", {"enabled": False})
             st.rerun()
-        if sb3.button("⚡ Auto-Apply 켜기", disabled=is_auto, use_container_width=True):
+        if sb3.button("⚡ Auto-Apply 켜기", disabled=is_auto, width="stretch"):
             api_post("/ai-rebalance/scheduler", {"auto_apply": True})
             st.rerun()
-        if sb4.button("🔒 Auto-Apply 끄기", disabled=not is_auto, use_container_width=True):
+        if sb4.button("🔒 Auto-Apply 끄기", disabled=not is_auto, width="stretch"):
             api_post("/ai-rebalance/scheduler", {"auto_apply": False})
             st.rerun()
 
