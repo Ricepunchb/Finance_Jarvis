@@ -218,37 +218,7 @@ with st.sidebar:
                     st.rerun()
     else:
         st.divider()
-        cur_domestic = config.get("domestic_only", True)
-        domestic_toggle = st.toggle(
-            "🇰🇷 국내 종목 전용",
-            value=cur_domestic,
-            help="ON: 국내 주식/ETF만 매매·발굴·등록합니다.\nOFF: 미국 주식(AI 전력 인프라, 비만치료제, 빅테크, 금 등) 해외 종목 파이프라인을 가동합니다.",
-            key="sidebar_domestic_only_toggle",
-        )
-        if domestic_toggle != cur_domestic:
-            api_post("/engine/domestic-only", {"domestic_only": domestic_toggle})
-            st.toast(f"모드 변경: {'국내 전용' if domestic_toggle else '국내 + 해외 종목 포함'}")
-            st.rerun()
-
-        cur_proxy = config.get("proxy_trading_enabled", True)
-        proxy_toggle = st.toggle(
-            "🔄 해외 발굴 ➔ 국장 대체 ETF 매매 (Proxy)",
-            value=cur_proxy,
-            help="ON: 해외 종목(GOOGL, NVDA, LLY, GLD 등)으로 글로벌 인사이트/시그널을 발굴하되, 실제 주문은 수수료가 저렴한 국장 대체 ETF(ACE 구글밸류체인, KODEX 골드선물 등)로 집행합니다.\nOFF: 해외 원주로 직접 매매합니다.",
-            key="sidebar_proxy_trading_toggle",
-        )
-        if proxy_toggle != cur_proxy:
-            api_post("/engine/proxy-trading", {"enabled": proxy_toggle})
-            st.toast(f"대리매매 변경: {'국장 대체 ETF 대리매매 활성' if proxy_toggle else '해외 원주 직접매매'}")
-            st.rerun()
-
-        with st.expander("🌐 해외 ↔ 국장 ETF 매핑 현황"):
-            mappings = api_get("/engine/proxy-mappings")
-            if mappings:
-                for us_sym, info in mappings.items():
-                    st.caption(f"**{us_sym}** ➔ {info.get('proxy_name')} (`{info.get('proxy_symbol')}`)")
-            else:
-                st.caption("매핑 정보가 없습니다.")
+        st.caption("🇰🇷 **국내 주식/ETF 전용 계좌** (미국장 종목은 메리츠 해외 계좌에서 독립 운용)")
 
 
 # --- 메리츠 해외 자동매매 대시보드 렌더러 ---
@@ -256,6 +226,7 @@ def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
     from ui.us_market_ui import (
         inject_us_ui_styles,
         render_us_rebalance_section,
+        render_us_discovery_section,
         render_us_news_surprise_section,
         render_us_signals_board_section,
         render_us_watchlist_manage_section,
@@ -265,7 +236,7 @@ def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
     inject_us_ui_styles()
 
     st.title("🇺🇸 메리츠 해외 자동매매 관제탑")
-    st.caption("순수 USD 해외 계좌 기반 스마트 자산배분, 글로벌 뉴스 서프라이즈 & 30분 시그널 올인원 관제실")
+    st.caption("순수 USD 해외 계좌 기반 스마트 자산배분, 5대 팩터 글로벌 유망 종목 발굴, 뉴스 서프라이즈 & 30분 시그널 올인원 관제실")
 
     if not status.get("is_mock"):
         st.error("⚠️ 실전투자 모드입니다 (순수 USD 해외 계좌). 실제 달러 자산이 거래됩니다.")
@@ -276,10 +247,11 @@ def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
             api_post("/engine/clear-kill-switch")
             st.rerun()
 
-    tab_overview, tab_rebalance, tab_news, tab_signals, tab_settings, tab_log = st.tabs(
+    tab_overview, tab_rebalance, tab_discovery, tab_news, tab_signals, tab_settings, tab_log = st.tabs(
         [
             "📊 개요",
             "⚖️ 자산배분 & 자동 리밸런싱",
+            "🚀 글로벌 유망 종목 발굴",
             "⚡ 글로벌 뉴스 서프라이즈",
             "📈 30분 시그널 보드",
             "⚙️ 설정 · 리스크",
@@ -363,7 +335,11 @@ def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
     with tab_rebalance:
         render_us_rebalance_section(key_prefix="meritz_reb")
 
-    # 3. 글로벌 뉴스 서프라이즈 탭
+    # 3. 글로벌 유망 종목 발굴 탭
+    with tab_discovery:
+        render_us_discovery_section(key_prefix="meritz_disc")
+
+    # 4. 글로벌 뉴스 서프라이즈 탭
     with tab_news:
         render_us_news_surprise_section(key_prefix="meritz_news")
 
@@ -546,18 +522,6 @@ with tab_settings:
     l6.metric(
         "펀더멘털 밸류에이션",
         "✅ 활성" if config["enable_fundamental_valuation"] else "⏸️ 비활성 (국내 종목만 지원)",
-    )
-
-    st.divider()
-    st.markdown("#### 🌐 글로벌 인사이트 · 국장 대체 ETF 대리 매매 (Proxy)")
-    p1, p2 = st.columns(2)
-    p1.metric(
-        "국내 전용 모드",
-        "🇰🇷 국내 종목 전용" if config.get("domestic_only", True) else "🌐 국내 + 해외 종목 포함",
-    )
-    p2.metric(
-        "해외 ➔ 국장 대체 ETF 매매",
-        "✅ 활성 (수수료 절감)" if config.get("proxy_trading_enabled", True) else "해외 원주 직접매매",
     )
 
     st.divider()

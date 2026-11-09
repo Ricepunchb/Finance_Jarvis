@@ -84,8 +84,8 @@ def fetch_upgrades_downgrades(ticker: str, max_items: int = 5) -> List[Dict[str,
                 "read_count": 0,
             })
         return results
-    except Exception:
-        logger.warning(f"yfinance 투자의견 변동 이력 조회 실패 ({clean_ticker})", exc_info=True)
+    except Exception as e:
+        logger.debug(f"yfinance 투자의견 변동 이력 조회 생략/실패 ({clean_ticker}): {e}")
         return []
 
 

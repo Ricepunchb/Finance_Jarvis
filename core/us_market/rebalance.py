@@ -130,13 +130,40 @@ async def get_us_target_weights(conn) -> Dict[str, float]:
 
 
 async def set_us_target_weights(conn, weights: Dict[str, float]) -> Dict[str, float]:
-    """미국장 포트폴리오 목표 비중을 업데이트하고 정규화한다."""
-    clean = {k.strip().upper(): max(0.0, float(v)) for k, v in weights.items()}
+    """미국장 포트폴리오 목표 비중을 업데이트하고 정규화한다 (신규 편입 종목은 portfolio_symbols/us_watchlist에 자동 등록)."""
+    clean = {k.strip().upper(): max(0.0, float(v)) for k, v in weights.items() if k.strip()}
     total = sum(clean.values())
     if total > 0:
         clean = {k: round(v / total, 4) for k, v in clean.items()}
 
+    existing_wl = {it["symbol"].upper(): it for it in await db.list_us_watchlist(conn)}
     for sym, w in clean.items():
+        if w > 0:
+            exch = US_EXCHANGE_MAP.get(sym, "NASD")
+            await db.add_portfolio_symbol(conn, sym, market="overseas", exchange=exch)
+            if sym not in existing_wl:
+                await db.upsert_us_watchlist_item(
+                    conn=conn,
+                    symbol=sym,
+                    name=sym,
+                    sector="AI 발굴 편입",
+                    target_weight=w,
+                    alert_enabled=True,
+                )
+            else:
+                it = existing_wl[sym]
+                await db.upsert_us_watchlist_item(
+                    conn=conn,
+                    symbol=sym,
+                    name=it.get("name") or sym,
+                    sector=it.get("sector"),
+                    avg_entry_price=it.get("avg_entry_price"),
+                    held_qty=it.get("held_qty"),
+                    target_weight=w,
+                    alert_enabled=bool(it.get("alert_enabled", True)),
+                    notes=it.get("notes"),
+                )
+
         prop_id = await db.propose_target_weight(
             conn, sym, w, proposed_by="user", rationale="미국장 포트폴리오 목표 비중 설정"
         )

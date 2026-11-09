@@ -207,31 +207,66 @@ async def analyze_news_surprise(
 
     # Fallback 휴리스틱 분석 (LLM 미연결 또는 장애 시)
     title_lower = title.lower()
-    positive_words = ["beats", "surge", "record", "upgrade", "outperform", "soar", "profit", "jump", "상회", "급등", "수주"]
-    negative_words = ["misses", "plunge", "downgrade", "probe", "lawsuit", "cut", "warning", "ban", "하회", "급락", "규제", "소송"]
 
-    pos_hit = any(w in title_lower for w in positive_words)
-    neg_hit = any(w in title_lower for w in negative_words)
+    # 1. 초대형 쇼크/블랙스완 키워드 (Base: 74~76점 - 실제 시장 충격 사건)
+    major_pos_shock = [
+        "blowout", "blockbuster", "historic revenue", "massive beat",
+        "all-time high", "breakthrough", "takeover bid", "buyout offer",
+        "대형 수주", "사상 최대 실적", "어닝 서프라이즈", "인수합병",
+    ]
+    major_neg_shock = [
+        "sec probe", "fraud", "criminal", "investigation", "bankrupt", "bankruptcy",
+        "halt", "delisting", "subpoena", "default", "collapse", "massive miss",
+        "분식회계", "거래정지", "파산", "횡령", "검찰 수사", "상장폐지",
+    ]
 
-    if pos_hit and not neg_hit:
-        impact = "호재"
-        score = 72
-    elif neg_hit and not pos_hit:
+    # 2. 통상적 시황/공시/등락 키워드 (Base: 50~54점 - 일상적 뉴스 노이즈)
+    moderate_pos = [
+        "beats", "surge", "record", "upgrade", "outperform", "soar", "profit", "jump",
+        "상회", "급등", "수주", "호실적", "목표가 상향", "매수 추천",
+    ]
+    moderate_neg = [
+        "misses", "plunge", "downgrade", "probe", "lawsuit", "cut", "warning", "ban",
+        "하회", "급락", "규제", "소송", "목표가 하향", "경고", "매도 추천",
+    ]
+
+    is_major_pos = any(w in title_lower for w in major_pos_shock)
+    is_major_neg = any(w in title_lower for w in major_neg_shock)
+    is_mod_pos = any(w in title_lower for w in moderate_pos)
+    is_mod_neg = any(w in title_lower for w in moderate_neg)
+
+    if is_major_neg:
         impact = "악재"
+        score = 76
+    elif is_major_pos:
+        impact = "호재"
         score = 74
+    elif is_mod_neg and not is_mod_pos:
+        impact = "악재"
+        score = 54
+    elif is_mod_pos and not is_mod_neg:
+        impact = "호재"
+        score = 52
     else:
         impact = "중립"
-        score = 45
+        score = 40
 
-    if current_price_change_pct and abs(current_price_change_pct) >= 3.0:
-        score = min(100, score + 15)
+    # 3. 당일 주가 반응 연동 (단순 3%에 일괄 +15점이 아닌, 3% 이상부터 점진 가산, 최대 +8점 캡)
+    if current_price_change_pct is not None:
+        abs_change = abs(current_price_change_pct)
+        if abs_change >= 7.0:
+            score = min(100, score + 8)
+        elif abs_change >= 4.5:
+            score = min(100, score + 5)
+        elif abs_change >= 3.0:
+            score = min(100, score + 2)
 
     return SurpriseAnalysisResult(
         surprise_score=score,
         impact_type=impact,
         affected_sector_theme=f"{sym} 관련 산업 및 테마",
         summary_sentences=[title[:120]],
-        rationale="키워드 및 가격 변동 기반 정량 산출",
+        rationale=f"정량 휴리스틱 산출 (키워드/가격반응 반영: {score}점)",
     )
 
 

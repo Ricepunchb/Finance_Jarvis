@@ -1158,6 +1158,12 @@ class USWeightsUpdateRequest(BaseModel):
     weights: Dict[str, float]
 
 
+class USDiscoveryProposalRequest(BaseModel):
+    max_new_additions: int = 2
+    new_pick_weight_each: float = 0.08
+    min_discovery_score: float = 67.5
+
+
 class USTelegramTestRequest(BaseModel):
     token: Optional[str] = None
     chat_id: Optional[str] = None
@@ -1388,6 +1394,35 @@ async def update_us_weights_endpoint(req: USWeightsUpdateRequest):
     try:
         updated = await set_us_target_weights(conn, req.weights)
         return {"status": "ok", "weights": updated}
+    finally:
+        await conn.close()
+
+
+@app.get("/us-market/discovery")
+async def get_us_discovery_endpoint(refresh: bool = False):
+    """점수 기반 글로벌 유망 종목 발굴 랭킹(5대 멀티팩터 100점 만점) 및 S&P 500 주도 섹터 리더보드 조회."""
+    from core.us_market.discovery import score_us_discovery_universe
+    conn = await db.get_connection()
+    try:
+        data = await score_us_discovery_universe(conn, force_refresh=refresh)
+        return data
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/discovery/propose-weights")
+async def propose_us_discovery_weights_endpoint(req: USDiscoveryProposalRequest):
+    """현재 고정 포트폴리오(Init)에 발굴 엔진 상위 글로벌 주도주를 편입(ADD)하는 진화 비중 제안 생성."""
+    from core.us_market.discovery import propose_us_discovery_portfolio_weights
+    conn = await db.get_connection()
+    try:
+        proposal = await propose_us_discovery_portfolio_weights(
+            conn,
+            max_new_additions=req.max_new_additions,
+            new_pick_weight_each=req.new_pick_weight_each,
+            min_discovery_score=req.min_discovery_score,
+        )
+        return proposal.model_dump()
     finally:
         await conn.close()
 

@@ -242,6 +242,11 @@ async def scan_us_market_news(
 
         # 2. 동일 사건(Event) 군집화 (Jaccard 토큰 유사도 기반)
         clusters = cluster_news_articles(all_articles, similarity_threshold=0.38, time_window_hours=6.0)
+        # 중요도 순으로 정렬 (다수 언론사 보도 클러스터 및 주가 급등락 종목 우선 분석)
+        clusters.sort(
+            key=lambda c: (c.count > 1, abs(price_changes.get(c.symbol, 0.0)) >= 2.0),
+            reverse=True,
+        )
 
         # 3. 클러스터별 Surprise 점수 산출 및 임계치 검사
         processed_clusters: List[Dict[str, Any]] = []
@@ -259,6 +264,9 @@ async def scan_us_market_news(
                 llm_provider=llm,
                 current_price_change_pct=current_change,
             )
+            # LLM API 속도 제한(RPM) 보호용 미세 딜레이
+            if llm is not None:
+                await asyncio.sleep(0.3)
 
             cluster_summary_data = {
                 "cluster_id": cl.cluster_id,
@@ -309,12 +317,24 @@ async def scan_us_market_news(
                 )
                 alerted_clusters.append(cluster_summary_data)
 
+        scores = [c["surprise_score"] for c in processed_clusters]
+        avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+        min_score = min(scores) if scores else 0
+        max_score = max(scores) if scores else 0
+        filtered_count = len(processed_clusters) - len(alerted_clusters)
+
         return {
             "scanned_symbols": len(symbols),
             "total_articles": len(all_articles),
             "clusters_count": len(clusters),
-            "processed_clusters": processed_clusters,
+            "processed_count": len(processed_clusters),
+            "filtered_count": filtered_count,
             "alerted_count": len(alerted_clusters),
+            "average_score": avg_score,
+            "min_score": min_score,
+            "max_score": max_score,
+            "threshold": threshold,
+            "processed_clusters": processed_clusters,
             "alerted_clusters": alerted_clusters,
         }
     finally:

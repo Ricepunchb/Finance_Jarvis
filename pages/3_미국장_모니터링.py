@@ -16,6 +16,7 @@ from ui.common import api_get, api_post, fmt_kst
 from ui.us_market_ui import (
     inject_us_ui_styles,
     render_us_rebalance_section,
+    render_us_discovery_section,
     render_us_news_surprise_section,
     render_us_signals_board_section,
     render_us_watchlist_manage_section,
@@ -96,9 +97,10 @@ if is_meritz:
     )
 
 # 탭 구성
-tab_rebalance, tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
+tab_rebalance, tab_discovery, tab_news, tab_board, tab_manage, tab_history, tab_settings = st.tabs(
     [
         "⚖️ 자산배분 & 자동 리밸런싱",
+        "🚀 글로벌 유망 종목 발굴",
         "⚡ 글로벌 뉴스 서프라이즈",
         "📊 30분 실시간 시그널 보드",
         "💼 관심 & 보유 종목 관리",
@@ -109,6 +111,9 @@ tab_rebalance, tab_news, tab_board, tab_manage, tab_history, tab_settings = st.t
 
 with tab_rebalance:
     render_us_rebalance_section(key_prefix="room_reb")
+
+with tab_discovery:
+    render_us_discovery_section(key_prefix="room_disc")
 
 with tab_news:
     render_us_news_surprise_section(key_prefix="room_news")

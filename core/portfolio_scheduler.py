@@ -340,12 +340,19 @@ class PortfolioScheduler:
         return None
 
     async def _tick_meritz_overseas(self) -> None:
-        """메리츠 해외주식 전용 리밸런싱 틱.
+        """메리츠 해외주식 전용 리밸런싱 & 글로벌 유망 종목 발굴 틱.
         국내 종목 발굴(discovery) 및 KIS 원화 스케줄러를 완전 배제하고,
-        순수 USD 가용 예수금 유입(Inflow) 및 밴드 드리프트(±5%p)만 감지하여 처리한다.
+        미국장 5대 멀티팩터 종목 발굴 캐시 갱신 및 순수 USD 가용 예수금 유입(Inflow)/밴드 드리프트(±5%p)를 처리한다.
         """
         conn = await db.get_connection()
         try:
+            # 1) 미국장 글로벌 유망 종목 발굴 스코어링 주기적 갱신 (내부 4시간 캐시 TTL 적용)
+            try:
+                from core.us_market.discovery import score_us_discovery_universe
+                await score_us_discovery_universe(conn, force_refresh=False)
+            except Exception as disc_err:
+                logger.warning(f"미국장 발굴 엔진 백그라운드 스코어링 갱신 실패: {disc_err}")
+
             if await db.get_state(conn, "ai_rebalance_scheduler_enabled") != "1":
                 return
 

@@ -22,12 +22,9 @@
 
   {"symbol": "096770", "name": "SK이노베이션", "universe_tag": "KR_ENERGY_COMMODITY"},
   {"symbol": "010950", "name": "S-Oil", "universe_tag": "KR_ENERGY_COMMODITY"},
-  {"symbol": "474800", "name": "KIWOOM 미국원유에너지기업", "universe_tag": "KR_ENERGY_COMMODITY"},
   {"symbol": "411060", "name": "ACE KRX금현물", "universe_tag": "KR_ENERGY_COMMODITY"},
 
-  {"symbol": "455030", "name": "KODEX 미국달러SOFR금리액티브(합성)", "universe_tag": "KR_SAFE_HAVEN"},
   {"symbol": "365780", "name": "ACE 국고채10년", "universe_tag": "KR_SAFE_HAVEN"},
-  {"symbol": "0085P0", "name": "ACE 미국10년국채액티브", "universe_tag": "KR_SAFE_HAVEN"},
 
   {"symbol": "105560", "name": "KB금융", "universe_tag": "KR_DIVIDEND_FINANCE"},
   {"symbol": "055550", "name": "신한지주", "universe_tag": "KR_DIVIDEND_FINANCE"},
@@ -35,34 +32,5 @@
   {"symbol": "032830", "name": "삼성생명", "universe_tag": "KR_DIVIDEND_FINANCE"},
   {"symbol": "000810", "name": "삼성화재", "universe_tag": "KR_DIVIDEND_FINANCE"},
   {"symbol": "005830", "name": "DB손해보험", "universe_tag": "KR_DIVIDEND_FINANCE"},
-  {"symbol": "466940", "name": "TIGER 은행고배당플러스TOP10", "universe_tag": "KR_DIVIDEND_FINANCE"},
-
-  {"symbol": "360750", "name": "TIGER 미국S&P500", "universe_tag": "KR_GLOBAL_ETF"},
-  {"symbol": "133690", "name": "TIGER 미국나스닥100", "universe_tag": "KR_GLOBAL_ETF"},
-  {"symbol": "458730", "name": "TIGER 미국배당다우존스", "universe_tag": "KR_GLOBAL_ETF"},
-
-  {"symbol": "AAPL", "name": "Apple Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "MSFT", "name": "Microsoft Corp.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "NVDA", "name": "NVIDIA Corp.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "GOOGL", "name": "Alphabet Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "AMZN", "name": "Amazon.com Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "TSLA", "name": "Tesla Inc.", "universe_tag": "US_TECH", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust", "universe_tag": "US_INDEX", "market": "overseas", "exchange": "AMEX"},
-  {"symbol": "QQQ", "name": "Invesco QQQ Trust", "universe_tag": "US_INDEX", "market": "overseas", "exchange": "NASD"},
-
-  {"symbol": "VST", "name": "Vistra Corp.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "CEG", "name": "Constellation Energy Corp.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NASD"},
-  {"symbol": "GEV", "name": "GE Vernova Inc.", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "ETN", "name": "Eaton Corp. plc", "universe_tag": "US_AI_POWER", "market": "overseas", "exchange": "NYSE"},
-
-  {"symbol": "LLY", "name": "Eli Lilly and Co.", "universe_tag": "US_HEALTHCARE", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "NVO", "name": "Novo Nordisk A/S ADR", "universe_tag": "US_HEALTHCARE", "market": "overseas", "exchange": "NYSE"},
-
-  {"symbol": "GLD", "name": "SPDR Gold Shares", "universe_tag": "US_COMMODITY", "market": "overseas", "exchange": "AMEX"},
-
-  {"symbol": "KO", "name": "Coca-Cola Co.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "PG", "name": "Procter & Gamble Co.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "JNJ", "name": "Johnson & Johnson", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "NEE", "name": "NextEra Energy Inc.", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "NYSE"},
-  {"symbol": "XLU", "name": "Utilities Select Sector SPDR", "universe_tag": "US_DEFENSIVE", "market": "overseas", "exchange": "AMEX"}
+  {"symbol": "466940", "name": "TIGER 은행고배당플러스TOP10", "universe_tag": "KR_DIVIDEND_FINANCE"}
 ]

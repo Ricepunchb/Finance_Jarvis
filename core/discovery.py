@@ -213,12 +213,14 @@ async def _score_one(
         "symbol": symbol, "name": candidate["name"], "universe_tag": candidate["universe_tag"],
         "tech": tech_signal, "sources": sources,
     }
-    proxy_info = proxy_mapping.get_proxy_etf(symbol)
-    if proxy_info:
-        entry["proxy_symbol"] = proxy_info["proxy_symbol"]
-        entry["proxy_name"] = proxy_info["proxy_name"]
-        entry["proxy_type"] = proxy_info.get("type")
-        entry["proxy_desc"] = proxy_info.get("description")
+    from core.config import get_effective_proxy_trading
+    if await get_effective_proxy_trading(conn):
+        proxy_info = proxy_mapping.get_proxy_etf(symbol)
+        if proxy_info:
+            entry["proxy_symbol"] = proxy_info["proxy_symbol"]
+            entry["proxy_name"] = proxy_info["proxy_name"]
+            entry["proxy_type"] = proxy_info.get("type")
+            entry["proxy_desc"] = proxy_info.get("description")
 
     entry.update(quant_metrics.compute_price_based_metrics(df, benchmark_returns))
     entry.update(indicators.compute_technical_detail(df))
@@ -268,7 +270,14 @@ async def score_candidates(
     """candidate_universe 전체(시드+수동+동적)를 점수 매겨 캐시에 저장한다. 모의투자 1req/sec에서
     종목당 KIS 2~4회(일봉 + 밸류에이션 캐시 미스 시 재무비율/2년 일봉)라 수십 종목이면 수 분
     걸린다 — 평소에는 하루 1회 갱신 작업에서만 돌고, screen_candidates는 캐시를 읽는다."""
+    from core.config import get_effective_domestic_only
+    domestic_only = await get_effective_domestic_only(conn)
     candidates = await db.list_candidate_universe(conn)
+    if domestic_only:
+        candidates = [
+            c for c in candidates
+            if c.get("market") != "overseas" and not symbol_mapper.is_overseas_symbol(c["symbol"])
+        ]
     if broker_reports is None:
         reports = await asyncio.to_thread(fetch_company_research, 2)
         broker_reports = discovery_signals.group_research_reports(
@@ -303,12 +312,6 @@ MACRO_ROTATION_TAGS = {
     "KR_ENERGY_COMMODITY",
     "KR_SAFE_HAVEN",
     "KR_DIVIDEND_FINANCE",
-    "KR_GLOBAL_ETF",
-    "US_INDEX",
-    "US_COMMODITY",
-    "US_DEFENSIVE",
-    "US_AI_POWER",
-    "US_HEALTHCARE",
 }
 MACRO_RESERVE_SLOTS = 5
 
@@ -320,9 +323,11 @@ async def screen_candidates(
     benchmark_returns: Optional[pd.Series] = None,
 ) -> List[Dict[str, Any]]:
     """아직 보유하지 않은 후보 중 관점별 할당(저평가/조기신호/모멘텀/증권사)을 지켜 상위
-    DISCOVERY_TOP_N개를 LLM 숏리스트로 반환한다. 또한 국면별 로테이션(방산/에너지/달러·국채/
-    배당금융/지수ETF) 후보가 PER/리포트 부재로 인해 숏리스트에서 누락되지 않도록 상위 매크로
+    DISCOVERY_TOP_N개를 LLM 숏리스트로 반환한다. 또한 국면별 로테이션(방산/에너지/국채/
+    배당금융) 후보가 PER/리포트 부재로 인해 숏리스트에서 누락되지 않도록 상위 매크로
     후보를 함께 공급한다."""
+    from core.config import get_effective_domestic_only
+    domestic_only = await get_effective_domestic_only(conn)
     cache = await load_scored_cache(conn)
     fresh = cache is not None and (time.time() - cache["scored_at"]) < settings.DISCOVERY_SHORTLIST_TTL_HOURS * 3600
     if fresh:
@@ -330,6 +335,9 @@ async def screen_candidates(
         entries = [e for e in cache["entries"] if e["symbol"] in enabled]
     else:
         entries = await score_candidates(conn, client, benchmark_returns=benchmark_returns)
+
+    if domestic_only:
+        entries = [e for e in entries if not symbol_mapper.is_overseas_symbol(e["symbol"])]
 
     exclude_set = set(exclude_symbols)
     chosen = discovery_signals.select_with_quota(

@@ -239,6 +239,7 @@ def test_us_watchlist_last_alert_key_persistence():
         conn = await aiosqlite.connect(":memory:")
         conn.row_factory = aiosqlite.Row
         await conn.executescript(db.SCHEMA)
+        await db._migrate_add_missing_columns(conn)
 
         # 1. 종목 등록
         await db.upsert_us_watchlist_item(conn, "AAPL", name="Apple Inc")
@@ -451,6 +452,65 @@ def test_cluster_news_articles():
     assert aapl_cluster.sources == ["CNBC"]
 
 
+def test_heuristic_surprise_score_calibration():
+    """휴리스틱 점수 산출 시 일상 시황 기사가 80점대로 과대평가되지 않고, 실제 쇼크 기사만 고득점 받는지 검증."""
+    import asyncio
+    from core.us_market.surprise import NewsArticle, NewsCluster, analyze_news_surprise
+
+    async def _run():
+        # 1. 일상 시황 기사 (기존 87점 버그 대상: "record" 키워드 + 주가 3.5% 상승)
+        art_routine = NewsArticle(
+            symbol="ETN",
+            title="Can Eaton Convert Its Record Backlog Into Stronger Earnings?",
+            summary="Analysis on backlog.",
+            source="Motley Fool",
+            published_at=1700000000,
+        )
+        cl_routine = NewsCluster(
+            cluster_id="c1", symbol="ETN", anchor=art_routine,
+            articles=[art_routine], sources=["Motley Fool"], count=1
+        )
+        res_routine = await analyze_news_surprise(cl_routine, llm_provider=None, current_price_change_pct=3.5)
+        # 기존에는 87점이었으나, 이제는 50점대(일상 시황)로 정상 산출되어 임계값(75) 미만이어야 함
+        assert 50 <= res_routine.surprise_score <= 60
+        assert res_routine.impact_type == "호재"
+
+        # 2. 단순 목표가/경고 기사 (기존 89점 버그 대상: "warning" 키워드 + 주가 -3.2% 하락)
+        art_warn = NewsArticle(
+            symbol="PLTR",
+            title="Wall Street May Have Lost $2.5 Trillion, but This 30% Warning Could Be an Issue",
+            summary="Warning market column.",
+            source="Bloomberg",
+            published_at=1700000000,
+        )
+        cl_warn = NewsCluster(
+            cluster_id="c2", symbol="PLTR", anchor=art_warn,
+            articles=[art_warn], sources=["Bloomberg"], count=1
+        )
+        res_warn = await analyze_news_surprise(cl_warn, llm_provider=None, current_price_change_pct=-3.2)
+        assert 50 <= res_warn.surprise_score <= 65
+        assert res_warn.impact_type == "악재"
+
+        # 3. 진짜 초대형 쇼크 기사 ("SEC probe", 주가 -7.5% 폭락)
+        art_shock = NewsArticle(
+            symbol="NVDA",
+            title="Nvidia faces formal SEC probe into CEO over foreign investigation",
+            summary="Formal probe opened.",
+            source="Reuters",
+            published_at=1700000000,
+        )
+        cl_shock = NewsCluster(
+            cluster_id="c3", symbol="NVDA", anchor=art_shock,
+            articles=[art_shock], sources=["Reuters"], count=1
+        )
+        res_shock = await analyze_news_surprise(cl_shock, llm_provider=None, current_price_change_pct=-7.5)
+        # 초대형 악재 + 급락으로 80점 이상 정상 발동
+        assert res_shock.surprise_score >= 80
+        assert res_shock.impact_type == "악재"
+
+    asyncio.run(_run())
+
+
 def test_format_news_surprise_telegram_message():
     """텔레그램 메시지 서식이 이모지 없이 최대 3문장 요약, 호재/악재, 섹터, Surprise 점수를 포함하는지 검증."""
     from core.us_market.surprise import (
@@ -507,6 +567,7 @@ def test_db_news_alerts_and_deduplication():
         conn = await aiosqlite.connect(":memory:")
         conn.row_factory = aiosqlite.Row
         await conn.executescript(db.SCHEMA)
+        await db._migrate_add_missing_columns(conn)
 
         cluster_id = "test_cluster_nvda_001"
 
@@ -782,6 +843,205 @@ def test_us_rebalance_api_endpoints(monkeypatch):
     r4 = client.post("/us-market/rebalance/execute", json={"shadow_mode": True})
     assert r4.status_code == 200
     assert "status" in r4.json()
+
+
+def test_domestic_candidate_seed_strictly_korean_only():
+    """국장 시드 파일(candidate_universe_seed.json)에 해외 종목 및 미국 지수 추종 프록시 ETF가 완전 제거되었는지 검증."""
+    import json
+    from pathlib import Path
+    from core.config import settings
+
+    assert settings.OVERSEAS_PROXY_TRADING_ENABLED is False
+    seed_path = Path("data/candidate_universe_seed.json")
+    seeds = json.loads(seed_path.read_text(encoding="utf-8"))
+    assert len(seeds) > 0
+    deprecated_us_etfs = {"360750", "133690", "458730", "474800", "455030", "0085P0"}
+    for item in seeds:
+        assert item.get("market", "domestic") == "domestic", f"해외 종목 발견: {item}"
+        assert item["symbol"].isdigit(), f"국내 종목코드가 아님: {item}"
+        assert item["symbol"] not in deprecated_us_etfs, f"미국 프록시 ETF 미제거: {item}"
+
+
+def test_us_discovery_5factor_scoring_and_portfolio_evolution(monkeypatch):
+    """5대 멀티팩터(퀀트25+월가25+섹터20+밸류15+뉴스15) 미국 종목 발굴 및 Init 포트폴리오 진화 제안 검증."""
+    import asyncio
+    import aiosqlite
+    from unittest.mock import AsyncMock
+    from core import db
+    from core.us_market.discovery import (
+        USSectorLeaderItem,
+        _evaluate_single_us_candidate,
+        propose_us_discovery_portfolio_weights,
+        score_us_discovery_universe,
+    )
+
+    dates = pd.date_range("2026-01-01", periods=70, freq="B")
+    # 꾸준한 우상향 일봉 데이터 생성
+    df_up = pd.DataFrame({
+        "date": dates,
+        "open": [100.0 + i * 0.6 for i in range(70)],
+        "high": [101.0 + i * 0.6 for i in range(70)],
+        "low": [99.5 + i * 0.6 for i in range(70)],
+        "close": [100.5 + i * 0.6 for i in range(70)],
+        "volume": [2_000_000.0] * 69 + [3_500_000.0],
+    })
+
+    monkeypatch.setattr("core.us_market.discovery.get_us_daily_bars", AsyncMock(return_value=df_up))
+    monkeypatch.setattr(
+        "core.us_market.discovery.get_us_quote",
+        AsyncMock(return_value={"price": 142.0, "change_pct": 2.1, "name": "Broadcom Inc."}),
+    )
+    monkeypatch.setattr(
+        "core.us_market.discovery.fetch_overseas_consensus",
+        lambda sym, exch: {
+            "target_price_mean": 185.0,
+            "recommendation_mean": 1.6,
+            "per": 24.5,
+            "pbr": 5.2,
+            "high_52w": 150.0,
+        },
+    )
+    monkeypatch.setattr(
+        "core.us_market.discovery.fetch_overseas_research",
+        lambda sym: [
+            {"title": f"{sym} AI ASIC Demand Surge", "broker": "Goldman"},
+            {"title": f"{sym} Outperform Maintained", "broker": "MS"},
+        ],
+    )
+
+    async def _run():
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript(db.SCHEMA)
+        await db._migrate_add_missing_columns(conn)
+
+        # 초기(Init) 포트폴리오 비중 설정 (VOO 50%, NVDA 50%)
+        p1 = await db.propose_target_weight(conn, "VOO", 0.50, proposed_by="test")
+        await db.decide_target_weight(conn, p1, True)
+        p2 = await db.propose_target_weight(conn, "NVDA", 0.50, proposed_by="test")
+        await db.decide_target_weight(conn, p2, True)
+
+        # 단일 종목(AVGO) 5대 팩터 채점 테스트
+        sec_map = {
+            "XLK": USSectorLeaderItem(
+                sector_etf="XLK",
+                sector_name="AI & 테크놀로지",
+                sector_score=85.0,
+                is_uptrend=True,
+                regime_label="🔥 주도 섹터",
+            )
+        }
+        alerts_map = {
+            "AVGO": {
+                "symbol": "AVGO",
+                "title": "Broadcom wins custom AI chip order",
+                "surprise_score": 82,
+                "impact_type": "호재",
+            }
+        }
+        cand = await _evaluate_single_us_candidate(
+            item={
+                "symbol": "AVGO",
+                "name": "Broadcom",
+                "sector": "AI 반도체",
+                "sector_etf": "XLK",
+                "universe_tag": "US_AI_SEMI",
+                "exchange": "NASD",
+            },
+            sector_map=sec_map,
+            active_weights={"VOO": 0.5, "NVDA": 0.5},
+            recent_alerts_by_sym=alerts_map,
+        )
+        assert cand is not None
+        assert cand.symbol == "AVGO"
+        assert cand.quant_tech_pts > 15.0
+        assert cand.consensus_pts >= 20.0
+        assert cand.sector_macro_pts >= 15.0
+        assert cand.news_surprise_pts == 15.0
+        assert cand.total_score >= 80.0
+        assert cand.grade.startswith("S")
+        assert cand.is_in_portfolio is False
+
+        # 후보 시드를 3종목으로 축소 모킹하여 전체 스코어링 및 진화 제안 검증
+        monkeypatch.setattr(
+            "core.us_market.discovery.load_us_seed_candidates",
+            lambda: [
+                {"symbol": "VOO", "name": "Vanguard S&P 500", "sector": "글로벌 코어 ETF", "sector_etf": "SPY", "universe_tag": "US_CORE_ETF", "exchange": "AMEX"},
+                {"symbol": "NVDA", "name": "NVIDIA", "sector": "AI 반도체", "sector_etf": "XLK", "universe_tag": "US_AI_SEMI", "exchange": "NASD"},
+                {"symbol": "AVGO", "name": "Broadcom", "sector": "AI 반도체", "sector_etf": "XLK", "universe_tag": "US_AI_SEMI", "exchange": "NASD"},
+                {"symbol": "MSFT", "name": "Microsoft", "sector": "빅테크 플랫폼", "sector_etf": "XLK", "universe_tag": "US_BIG_TECH", "exchange": "NASD"},
+            ],
+        )
+
+        scored = await score_us_discovery_universe(conn, force_refresh=True)
+        assert scored["total_evaluated"] == 4
+        assert len(scored["top_new_picks"]) >= 2
+
+        proposal = await propose_us_discovery_portfolio_weights(
+            conn, max_new_additions=2, new_pick_weight_each=0.10, min_discovery_score=67.5
+        )
+        assert proposal.base_portfolio_count == 2
+        assert proposal.proposed_portfolio_count == 4
+        assert set(proposal.added_symbols) == {"AVGO", "MSFT"}
+        assert set(proposal.retained_symbols) == {"VOO", "NVDA"}
+        assert abs(sum(proposal.proposed_weights.values()) - 1.0) < 1e-4
+        assert proposal.proposed_weights["AVGO"] == 0.10
+        assert proposal.proposed_weights["MSFT"] == 0.10
+        assert proposal.proposed_weights["VOO"] == 0.40
+        assert proposal.proposed_weights["NVDA"] == 0.40
+
+        await conn.close()
+
+    asyncio.run(_run())
+
+
+def test_us_discovery_api_endpoints(monkeypatch):
+    """미국장 유망 종목 발굴 API 엔드포인트(/us-market/discovery, /us-market/discovery/propose-weights) 검증."""
+    from unittest.mock import AsyncMock
+    from core.us_market.discovery import USPortfolioEvolutionProposal
+
+    mock_disc = {
+        "scored_at": 1700000000.0,
+        "total_evaluated": 2,
+        "sector_leaders": [],
+        "candidates": [
+            {"symbol": "AVGO", "name": "Broadcom", "total_score": 88.5, "is_in_portfolio": False},
+            {"symbol": "NVDA", "name": "NVIDIA", "total_score": 86.0, "is_in_portfolio": True},
+        ],
+        "top_new_picks": [{"symbol": "AVGO", "name": "Broadcom", "total_score": 88.5}],
+    }
+    mock_prop = USPortfolioEvolutionProposal(
+        base_portfolio_count=1,
+        proposed_portfolio_count=2,
+        added_symbols=["AVGO"],
+        retained_symbols=["NVDA"],
+        proposed_weights={"NVDA": 0.90, "AVGO": 0.10},
+        items=[],
+        summary_reason="AVGO 편입 제안",
+    )
+
+    monkeypatch.setattr(
+        "core.us_market.discovery.score_us_discovery_universe",
+        AsyncMock(return_value=mock_disc),
+    )
+    monkeypatch.setattr(
+        "core.us_market.discovery.propose_us_discovery_portfolio_weights",
+        AsyncMock(return_value=mock_prop),
+    )
+
+    client = TestClient(app)
+    r1 = client.get("/us-market/discovery")
+    assert r1.status_code == 200
+    assert r1.json()["total_evaluated"] == 2
+
+    r2 = client.post(
+        "/us-market/discovery/propose-weights",
+        json={"max_new_additions": 1, "new_pick_weight_each": 0.10, "min_discovery_score": 74.0},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["added_symbols"] == ["AVGO"]
+    assert r2.json()["proposed_weights"]["AVGO"] == 0.10
+
 
 
 

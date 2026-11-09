@@ -65,9 +65,9 @@ def test_get_set_effective_proxy_trading():
             conn.row_factory = aiosqlite.Row
             await conn.executescript(db.SCHEMA)
 
-            # 기본값 확인
+            # 기본값 확인 (Deprecated 되어 기본값 False)
             val = await get_effective_proxy_trading(conn)
-            assert val is True  # 기본값 True
+            assert val is False
 
             # 비활성화
             await set_effective_proxy_trading(conn, False)

@@ -71,6 +71,87 @@ def get_us_market_status(now_dt: Optional[datetime] = None) -> Dict[str, Any]:
     }
 
 
+def _fetch_naver_quote_fallback(clean_sym: str) -> Optional[Dict[str, Any]]:
+    """yfinance 레이트리밋(HTTP 429) 또는 장애 시 네이버 해외주식 API로 현재가를 조회한다."""
+    import requests
+    from core.utils.symbol_mapper import ticker_to_reuters_code
+
+    rc = ticker_to_reuters_code(clean_sym)
+    for cand_rc in [rc, clean_sym, f"{clean_sym}.O", f"{clean_sym}.N"]:
+        try:
+            resp = requests.get(
+                f"https://api.stock.naver.com/stock/{cand_rc}/basic",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                data = resp.json() or {}
+                raw_p = str(data.get("closePrice") or data.get("closePriceRaw") or "").replace(",", "")
+                if not raw_p:
+                    continue
+                price = float(raw_p)
+                raw_chg = str(data.get("compareToPreviousClosePrice") or "0").replace(",", "")
+                raw_pct = str(data.get("fluctuationsRatio") or "0").replace(",", "")
+                chg = float(raw_chg) if raw_chg else 0.0
+                chg_pct = float(raw_pct) if raw_pct else 0.0
+                prev_close = round(price - chg, 4) if price > chg else price
+                return {
+                    "symbol": clean_sym,
+                    "name": data.get("stockNameEng") or data.get("stockName") or clean_sym,
+                    "sector": "US Equity",
+                    "price": price,
+                    "prev_close": prev_close,
+                    "change": round(chg, 4),
+                    "change_pct": round(chg_pct, 2),
+                    "w52_high": None,
+                    "w52_low": None,
+                    "market_cap": None,
+                    "currency": "USD",
+                }
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_naver_daily_bars_fallback(clean_sym: str) -> pd.DataFrame:
+    """yfinance 레이트리밋(HTTP 429) 시 네이버 해외주식 일봉 차트 API로 폴백한다."""
+    import requests
+    from core.utils.symbol_mapper import ticker_to_reuters_code
+
+    rc = ticker_to_reuters_code(clean_sym)
+    start_str = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d0000")
+    end_str = (datetime.now() + timedelta(days=2)).strftime("%Y%m%d0000")
+
+    for cand_rc in [rc, clean_sym, f"{clean_sym}.O", f"{clean_sym}.N"]:
+        try:
+            resp = requests.get(
+                f"https://api.stock.naver.com/chart/foreign/item/{cand_rc}/day?startDateTime={start_str}&endDateTime={end_str}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                rows = resp.json()
+                if isinstance(rows, list) and len(rows) > 0:
+                    df = pd.DataFrame(rows)
+                    df = df.rename(columns={
+                        "localDate": "date",
+                        "openPrice": "open",
+                        "highPrice": "high",
+                        "lowPrice": "low",
+                        "closePrice": "close",
+                        "accumulatedTradingVolume": "volume",
+                    })
+                    for c in ("open", "high", "low", "close", "volume"):
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
+                    df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+                    return df
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+
 def _fetch_quote_sync(symbol: str) -> Dict[str, Any]:
     """단일 종목 현재가 및 기본 정보 동기 조회."""
     clean_sym = symbol.strip().upper()
@@ -89,7 +170,8 @@ def _fetch_quote_sync(symbol: str) -> Dict[str, Any]:
                 prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else last_price
 
         if last_price is None:
-            return {"symbol": clean_sym, "error": "가격 정보 없음"}
+            fb = _fetch_naver_quote_fallback(clean_sym)
+            return fb if fb else {"symbol": clean_sym, "error": "가격 정보 없음"}
 
         change = last_price - prev_close if prev_close else 0.0
         change_pct = (change / prev_close * 100) if prev_close else 0.0
@@ -99,19 +181,10 @@ def _fetch_quote_sync(symbol: str) -> Dict[str, Any]:
         mkt_cap = getattr(fast, "market_cap", None)
         currency = getattr(fast, "currency", "USD")
 
-        # 이름 조회 (fast_info에 없으면 info에서 보강)
-        name = clean_sym
-        try:
-            info = t.info or {}
-            name = info.get("shortName") or info.get("longName") or clean_sym
-            sector = info.get("sector") or "US Equity"
-        except Exception:
-            sector = "US Equity"
-
         return {
             "symbol": clean_sym,
-            "name": name,
-            "sector": sector,
+            "name": clean_sym,
+            "sector": "US Equity",
             "price": float(last_price),
             "prev_close": float(prev_close) if prev_close else float(last_price),
             "change": round(float(change), 4),
@@ -122,6 +195,9 @@ def _fetch_quote_sync(symbol: str) -> Dict[str, Any]:
             "currency": currency or "USD",
         }
     except Exception as e:
+        fb = _fetch_naver_quote_fallback(clean_sym)
+        if fb:
+            return fb
         logger.warning(f"yfinance 현재가 조회 오류 ({clean_sym}): {e}")
         return {"symbol": clean_sym, "error": str(e)}
 
@@ -180,7 +256,7 @@ def _fetch_daily_bars_sync(symbol: str, period: str = "3mo") -> pd.DataFrame:
         t = yf.Ticker(clean_sym)
         df = t.history(interval="1d", period=period)
         if df.empty:
-            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+            return _fetch_naver_daily_bars_fallback(clean_sym)
 
         df = df.reset_index()
         date_col = "Date" if "Date" in df.columns else ("Datetime" if "Datetime" in df.columns else df.columns[0])
@@ -199,6 +275,9 @@ def _fetch_daily_bars_sync(symbol: str, period: str = "3mo") -> pd.DataFrame:
         df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["close"]).reset_index(drop=True)
         return df
     except Exception as e:
+        fb_df = _fetch_naver_daily_bars_fallback(clean_sym)
+        if not fb_df.empty:
+            return fb_df
         logger.warning(f"yfinance 일봉 수집 오류 ({clean_sym}): {e}")
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 

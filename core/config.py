@@ -229,8 +229,9 @@ class Settings(BaseSettings):
                 "설정되지 않았습니다. 실거래를 의도한 것이 맞다면 .env에 명시적으로 추가하세요."
             )
 
-    # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) ---
-    OVERSEAS_PROXY_TRADING_ENABLED: bool = True  # 해외 종목 발굴 시 국장 대체 ETF로 매매
+    # --- 해외 원주 발굴 ➔ 국내 대체 ETF 대리 매매 (Proxy Trading) [Deprecated] ---
+    # 국장(국내 계좌)에서는 미장 종목을 직접이든 간접(프록시 ETF)이든 다루지 않도록 기본 비활성화.
+    OVERSEAS_PROXY_TRADING_ENABLED: bool = False
 
     # --- 텔레그램 모바일 푸시 알림 ---
     TELEGRAM_BOT_TOKEN: str = ""

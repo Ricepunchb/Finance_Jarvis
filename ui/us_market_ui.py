@@ -341,9 +341,11 @@ def render_us_news_surprise_section(key_prefix: str = "us_news") -> None:
                     alerted = scan_res.get("alerted_count", 0)
                     total_art = scan_res.get("total_articles", 0)
                     clusters_n = scan_res.get("clusters_count", 0)
+                    filtered = scan_res.get("filtered_count", 0)
+                    avg_s = scan_res.get("average_score", 0.0)
                     st.success(
-                        f"스캔 완료: 총 {total_art}개 기사 수집 ➔ {clusters_n}개 사건 군집화 ➔ "
-                        f"기준선({threshold_slider}점) 이상 {alerted}건 서프라이즈 알림 발송!"
+                        f"스캔 완료: 총 {total_art}개 기사 ➔ {clusters_n}개 사건 군집화 (평균 {avg_s}점) | "
+                        f"기준선({threshold_slider}점) 이상 {alerted}건 서프라이즈 포착 (일상 시황 {filtered}건 정상 제외)"
                     )
                     time.sleep(1)
                     st.rerun()
@@ -909,4 +911,225 @@ def render_us_telegram_settings_section(key_prefix: str = "us_tg") -> None:
             f"- **밴드 이탈(Band-Drift)**: 목표 대비 +5%p 초과 시 초과분 분할 매도 및 저비중 재배치\n"
             f"- **고단가 1주 보호(EXCESS_LOCKED)**: 1주 단가가 높아 초과분으로 1주를 팔 수 없는 자산 매도 원천 방지"
         )
+
+
+# =========================================================================
+# 7. 🚀 점수 기반 글로벌 유망 종목 발굴 & 포트폴리오 진화 컴포넌트
+# =========================================================================
+def render_us_discovery_section(key_prefix: str = "us_disc") -> None:
+    """5대 멀티팩터(0~100점) 기반 글로벌 주도 섹터 및 유망 종목 발굴 & 포트폴리오 진화 제안 섹션."""
+    st.subheader("🚀 점수 기반 글로벌 유망 종목 발굴 & 포트폴리오 진화 엔진")
+    st.caption(
+        "현재의 **고정종목관리 + 리밸런싱**을 초기값(`Init`)으로 삼아, "
+        "**5대 멀티팩터 스코어링(총 100점 만점)**을 통해 글로벌 주도 섹터 및 유망 미국 종목을 능동적으로 발굴하고 "
+        "포트폴리오 목표비중 진화(`Init ➔ AI 발굴 편입`)를 제안합니다."
+    )
+    st.markdown(
+        '<div style="background:rgba(16,185,129,0.08); border-left:4px solid #10b981; border-radius:8px; padding:10px 14px; font-size:0.88rem; margin-bottom:14px;">'
+        '<b>📐 [5대 멀티팩터 채점 체계 (총 100점 만점)]</b><br>'
+        '① <b>퀀트 & 기술적 모멘텀 (25점)</b>: 추세 정배열(SMA20/60), 위험조정 샤프지수, 3개월 모멘텀, RSI/거래량 수급 &nbsp;|&nbsp; '
+        '② <b>월가 컨센서스 & 리포트 (25점)</b>: 목표주가 괴리율(Upside %), 투자의견(Strong Buy/Buy), 리서치 커버리지 &nbsp;|&nbsp; '
+        '③ <b>글로벌 판 & 주도 섹터 상대강도 (20점)</b>: S&P 500 섹터 ETF의 SPY 대비 초과수익률(RS) &nbsp;|&nbsp; '
+        '④ <b>펀더멘털 밸류에이션 (15점)</b>: PER 적정성 및 52주 고점 대비 위치 &nbsp;|&nbsp; '
+        '⑤ <b>뉴스 속보 & AI Surprise (15점)</b>: 최신 외신 군집화 호재/악재 및 서프라이즈 점수 반영'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    c_top1, c_top2, c_top3 = st.columns([2, 2, 1.5])
+    with c_top3:
+        force_rf = st.button(
+            "🔄 글로벌 섹터 & 종목 점수 재계산",
+            type="primary",
+            use_container_width=True,
+            key=f"{key_prefix}_btn_refresh",
+        )
+
+    with st.spinner("글로벌 섹터 상대강도 및 미국 유망 후보군 5대 멀티팩터 스코어링 분석 중..."):
+        disc_url = "/us-market/discovery?refresh=true" if force_rf else "/us-market/discovery"
+        disc_data = api_get(disc_url, timeout=90)
+
+    if not disc_data or not disc_data.get("candidates"):
+        st.warning("미국장 발굴 스코어링 데이터를 불러올 수 없습니다. 잠시 후 새로고침해 주세요.")
+        return
+
+    scored_at = disc_data.get("scored_at")
+    sector_leaders = disc_data.get("sector_leaders", [])
+    candidates = disc_data.get("candidates", [])
+    top_new_picks = disc_data.get("top_new_picks", [])
+
+    # 1. 글로벌 판 & S&P 500 주도 섹터 리더보드
+    st.markdown(f"##### 🌍 글로벌 판 진단: S&P 500 섹터 상대강도(vs SPY) 리더보드 (기준: {fmt_kst(scored_at)})")
+    if sector_leaders:
+        sec_rows = []
+        for s in sector_leaders:
+            sec_rows.append({
+                "순위": f"#{s.get('rank', '-')}",
+                "섹터 ETF": s.get("sector_etf", ""),
+                "글로벌 섹터/테마": s.get("sector_name", ""),
+                "섹터 점수(100)": f"{s.get('sector_score', 0):.1f}점",
+                "국면 판정": s.get("regime_label", ""),
+                "1개월 수익률": f"{s.get('return_1m_pct', 0):+.2f}%",
+                "SPY 대비 1M 상대강도": f"{s.get('rel_strength_1m', 0):+.2f}%p",
+                "3개월 수익률": f"{s.get('return_3m_pct', 0):+.2f}%",
+                "SPY 대비 3M 상대강도": f"{s.get('rel_strength_3m', 0):+.2f}%p",
+                "추세": "📈 정배열 상승" if s.get("is_uptrend") else "➖ 조정/횡보",
+            })
+        st.dataframe(pd.DataFrame(sec_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # 2. 신규 발굴 Top 추천 카드 (미보유 주도주)
+    if top_new_picks:
+        st.markdown("##### 🌟 AI 발굴 엔진 포착 — 신규 편입 유망 글로벌 주도주 Top Picks (현재 미보유)")
+        cols_pick = st.columns(min(3, len(top_new_picks)))
+        for idx, pick in enumerate(top_new_picks[:3]):
+            with cols_pick[idx]:
+                upside_str = f"{pick['target_upside_pct']:+.1f}%" if pick.get("target_upside_pct") is not None else "-"
+                tgt_p_str = f"${pick['target_mean_price']:,.2f}" if pick.get("target_mean_price") else "-"
+                card_html = (
+                    f'<div style="background:rgba(127,127,127,0.06); border:1px solid rgba(16,185,129,0.45); '
+                    f'border-radius:12px; padding:14px 16px; margin-bottom:10px;">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                    f'<span style="font-size:1.2rem; font-weight:800;">#{pick.get("rank")} {pick["symbol"]}</span>'
+                    f'<span class="badge badge-buy-strong">{pick.get("total_score", 0):.1f}점 ({pick.get("grade", "A").split()[0]})</span>'
+                    f'</div>'
+                    f'<div style="font-size:0.88rem; color:#9ca3af; margin-top:2px;">{pick.get("name")} · {pick.get("sector")}</div>'
+                    f'<div style="margin-top:8px; font-size:0.9rem;">'
+                    f'현재가: <b>${pick.get("current_price", 0):,.2f}</b> (3M: {pick.get("return_3m_pct", 0):+.1f}%)<br>'
+                    f'월가 목표가: <b>{tgt_p_str}</b> (괴리율 <b>{upside_str}</b>)'
+                    f'</div>'
+                    f'<div style="margin-top:6px; font-size:0.78rem; color:#d1d5db;">'
+                    f'팩터: 퀀트 {pick.get("quant_tech_pts")}/25 · 월가 {pick.get("consensus_pts")}/25 · '
+                    f'섹터 {pick.get("sector_macro_pts")}/20 · 밸류 {pick.get("valuation_pts")}/15 · 뉴스 {pick.get("news_surprise_pts")}/15'
+                    f'</div>'
+                    f'<div style="margin-top:8px; background:rgba(16,185,129,0.1); padding:6px 10px; border-radius:6px; font-size:0.82rem;">'
+                    f'💡 {pick.get("thesis", "")}'
+                    f'</div>'
+                    f'</div>'
+                )
+                st.html(card_html)
+
+    # 3. 전체 종목 5대 팩터 스코어링 랭킹 테이블
+    st.markdown("##### 🏆 미국 유망 종목 5대 멀티팩터 스코어링 전체 랭킹")
+    all_sectors = ["전체 섹터"] + sorted({c.get("sector", "기타") for c in candidates})
+    with c_top1:
+        sel_sector = st.selectbox("섹터별 필터", all_sectors, key=f"{key_prefix}_sec_filter")
+    with c_top2:
+        sel_hold = st.selectbox(
+            "보유 상태 필터",
+            ["전체 종목", "🌟 신규 발굴 후보 (미보유)", "🛡️ 현재 포트폴리오 보유 (Init)"],
+            key=f"{key_prefix}_hold_filter",
+        )
+
+    filtered_cands = []
+    for c in candidates:
+        if sel_sector != "전체 섹터" and c.get("sector") != sel_sector:
+            continue
+        if sel_hold == "🌟 신규 발굴 후보 (미보유)" and c.get("is_in_portfolio"):
+            continue
+        if sel_hold == "🛡️ 현재 포트폴리오 보유 (Init)" and not c.get("is_in_portfolio"):
+            continue
+        filtered_cands.append(c)
+
+    cand_rows = []
+    for c in filtered_cands:
+        upside = c.get("target_upside_pct")
+        cand_rows.append({
+            "순위": c.get("rank", 0),
+            "티커": c.get("symbol", ""),
+            "종목명": c.get("name", ""),
+            "섹터": c.get("sector", ""),
+            "종합점수(100)": c.get("total_score", 0.0),
+            "등급": c.get("grade", ""),
+            "포트폴리오": f"🛡️ 보유 ({c.get('current_target_weight', 0)*100:.1f}%)" if c.get("is_in_portfolio") else "🌟 미보유 후보",
+            "퀀트(25)": c.get("quant_tech_pts", 0.0),
+            "월가컨센(25)": c.get("consensus_pts", 0.0),
+            "섹터(20)": c.get("sector_macro_pts", 0.0),
+            "밸류(15)": c.get("valuation_pts", 0.0),
+            "뉴스(15)": c.get("news_surprise_pts", 0.0),
+            "현재가": f"${c.get('current_price', 0):,.2f}",
+            "3M 수익률": f"{c.get('return_3m_pct', 0):+.1f}%",
+            "샤프지수": f"{c.get('sharpe_ratio', 0):.2f}",
+            "목표가 괴리율": f"{upside:+.1f}%" if upside is not None else "-",
+            "핵심 투자포인트 (Thesis)": c.get("thesis", ""),
+        })
+
+    if cand_rows:
+        st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("조건에 부합하는 종목이 없습니다.")
+
+    st.divider()
+
+    # 4. 포트폴리오 진화 제안 (Init 고정 종목 ➔ AI 발굴 유망주 편입)
+    st.markdown("##### 🧬 스마트 포트폴리오 진화 제안 (`Init 고정포트` ➔ `AI 발굴 유망주 편입`)")
+    st.caption(
+        "기존 보유 종목(Init)은 강제 손절/청산 없이 코어로 안전하게 유지하면서, "
+        "발굴 엔진이 찾아낸 최상위 글로벌 주도주를 목표 비중에 편입(ADD)하여 향후 달러 입금분 및 리밸런싱 재원이 자연스럽게 유입되도록 설계합니다."
+    )
+
+    p_col1, p_col2, p_col3 = st.columns([1.5, 1.5, 2])
+    with p_col1:
+        max_add = st.slider("신규 편입할 발굴 종목 수", min_value=1, max_value=4, value=2, step=1, key=f"{key_prefix}_max_add")
+    with p_col2:
+        each_w_pct = st.slider("신규 종목당 초기 목표비중 (%)", min_value=4, max_value=15, value=8, step=1, key=f"{key_prefix}_each_w")
+
+    proposal = api_post(
+        "/us-market/discovery/propose-weights",
+        {
+            "max_new_additions": max_add,
+            "new_pick_weight_each": each_w_pct / 100.0,
+            "min_discovery_score": 67.5,
+        },
+    )
+
+    if proposal and proposal.get("items"):
+        st.markdown(
+            f'<div class="recommendation-box" style="margin-bottom:12px;">'
+            f'<b>💡 포트폴리오 진화 제안 요약</b><br>'
+            f'<span style="font-size:0.9rem;">{proposal.get("summary_reason", "")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        prop_rows = []
+        for it in proposal["items"]:
+            prop_rows.append({
+                "티커": it["symbol"],
+                "종목명": it.get("name", it["symbol"]),
+                "섹터": it.get("sector", ""),
+                "구분": it.get("action", ""),
+                "발굴 점수": f"{it.get('total_score', 0):.1f}점 ({it.get('grade', '-')})",
+                "기존 비중 (Init)": f"{it.get('prev_weight', 0)*100:.1f}%",
+                "진화 비중 (Proposed)": f"{it.get('new_weight', 0)*100:.1f}%",
+                "비중 조정폭": f"{it.get('delta_weight', 0)*100:+.1f}%p",
+                "핵심 투자 근거": it.get("thesis", ""),
+            })
+        st.dataframe(pd.DataFrame(prop_rows), use_container_width=True, hide_index=True)
+
+        with p_col3:
+            st.write("")
+            st.write("")
+            if st.button(
+                "🚀 발굴 종목 포함 목표비중 즉시 적용",
+                type="primary",
+                use_container_width=True,
+                key=f"{key_prefix}_apply_evolution_btn",
+            ):
+                proposed_weights = proposal.get("proposed_weights", {})
+                if proposed_weights:
+                    with st.spinner("발굴 종목을 포트폴리오 및 모니터링 워치리스트에 편입하고 목표 비중을 업데이트 중..."):
+                        res = api_post("/us-market/rebalance/weights", {"weights": proposed_weights})
+                        if res and res.get("status") == "ok":
+                            added_str = ", ".join(proposal.get("added_symbols", []))
+                            st.success(
+                                f"✅ 포트폴리오 진화 완료! 신규 발굴 종목({added_str})이 목표 비중 및 워치리스트에 편입되었습니다. "
+                                f"[⚖️ 자산배분 & 자동 리밸런싱] 탭에서 리밸런싱 계획을 바로 확인하실 수 있습니다."
+                            )
+                            time.sleep(1.2)
+                            st.rerun()
+                        else:
+                            st.error("목표 비중 업데이트에 실패했습니다.")
+
 
