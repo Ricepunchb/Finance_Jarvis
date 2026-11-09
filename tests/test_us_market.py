@@ -1043,6 +1043,71 @@ def test_us_discovery_api_endpoints(monkeypatch):
     assert r2.json()["proposed_weights"]["AVGO"] == 0.10
 
 
+def test_set_us_target_weights_real_db(tmp_path, monkeypatch):
+    """set_us_target_weights가 NameError 없이 SYMBOL_EXCHANGE_MAP과 DB를 정상 갱신하는지 검증."""
+    import asyncio
+    from core.config import settings
+    test_db = str(tmp_path / "test_us_weights.db")
+    monkeypatch.setattr(settings, "DB_PATH", test_db)
+
+    async def run():
+        await db.init_db()
+        conn = await db.get_connection()
+        try:
+            from core.us_market.rebalance import set_us_target_weights
+            weights = {"AAPL": 0.5, "TSM": 0.5}
+            result = await set_us_target_weights(conn, weights)
+            assert result == {"AAPL": 0.5, "TSM": 0.5}
+
+            # portfolio_symbols 테이블 검증
+            cur = await conn.execute("SELECT symbol, market, exchange FROM portfolio_symbols")
+            rows = await cur.fetchall()
+            sym_map = {r["symbol"]: (r["market"], r["exchange"]) for r in rows}
+            assert sym_map["AAPL"] == ("overseas", "NASD")
+            assert sym_map["TSM"] == ("overseas", "NYSE")
+
+            # active_target_weights 테이블 검증
+            active = await db.get_active_target_weights(conn)
+            assert active["AAPL"] == 0.5
+            assert active["TSM"] == 0.5
+
+            # us_watchlist 등록 검증
+            wl = await db.list_us_watchlist(conn)
+            wl_syms = {item["symbol"]: item["target_weight"] for item in wl}
+            assert wl_syms["AAPL"] == 0.5
+            assert wl_syms["TSM"] == 0.5
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_update_us_weights_endpoint_real_db(tmp_path, monkeypatch):
+    """FastAPI POST /us-market/rebalance/weights 엔드포인트가 실제 set_us_target_weights를 에러 없이 실행하는지 검증."""
+    import asyncio
+    from core.config import settings
+    test_db = str(tmp_path / "test_us_weights_ep.db")
+    monkeypatch.setattr(settings, "DB_PATH", test_db)
+
+    async def init():
+        await db.init_db()
+
+    asyncio.run(init())
+
+    client = TestClient(app)
+    resp = client.post(
+        "/us-market/rebalance/weights",
+        json={"weights": {"AVGO": 0.3, "NVDA": 0.7}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert resp.json()["weights"]["AVGO"] == 0.3
+    assert resp.json()["weights"]["NVDA"] == 0.7
+
+
+
+
+
 
 
 

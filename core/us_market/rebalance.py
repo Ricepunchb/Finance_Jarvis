@@ -19,6 +19,7 @@ from datetime import datetime
 import json
 import logging
 import math
+from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -47,19 +48,36 @@ DEFAULT_US_TARGET_WEIGHTS: Dict[str, float] = {
 # 기본 허용 오차 밴드 (±5.0%p)
 DEFAULT_REBALANCE_BAND_PCT = 0.05
 
-# 종목별 기본 거래소 매핑
-SYMBOL_EXCHANGE_MAP: Dict[str, str] = {
-    "NVDA": "NASD",
-    "PLTR": "NASD",
-    "SPCX": "NASD",
-    "VOO": "AMEX",
-    "SCHD": "AMEX",
-    "TSLW": "AMEX",
-    "SGOV": "AMEX",
-    "GLD": "AMEX",
-    "SPY": "AMEX",
-    "QQQ": "NASD",
-}
+# 종목별 기본 거래소 매핑 (seed 파일 동적 로드 + 기본값)
+def _load_symbol_exchange_map() -> Dict[str, str]:
+    mapping: Dict[str, str] = {
+        "NVDA": "NASD",
+        "PLTR": "NASD",
+        "SPCX": "NASD",
+        "VOO": "AMEX",
+        "SCHD": "AMEX",
+        "TSLW": "AMEX",
+        "SGOV": "AMEX",
+        "GLD": "AMEX",
+        "SPY": "AMEX",
+        "QQQ": "NASD",
+    }
+    seed_path = Path("data/us_candidate_universe_seed.json")
+    if seed_path.exists():
+        try:
+            with open(seed_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for item in data:
+                    sym = item.get("symbol")
+                    ex = item.get("exchange")
+                    if sym and ex:
+                        mapping[sym.strip().upper()] = ex.strip().upper()
+        except Exception as e:
+            logger.warning("Failed to load US candidate seed exchange map: %s", e)
+    return mapping
+
+
+SYMBOL_EXCHANGE_MAP: Dict[str, str] = _load_symbol_exchange_map()
 
 
 class USPositionStatus(BaseModel):
@@ -139,7 +157,7 @@ async def set_us_target_weights(conn, weights: Dict[str, float]) -> Dict[str, fl
     existing_wl = {it["symbol"].upper(): it for it in await db.list_us_watchlist(conn)}
     for sym, w in clean.items():
         if w > 0:
-            exch = US_EXCHANGE_MAP.get(sym, "NASD")
+            exch = SYMBOL_EXCHANGE_MAP.get(sym, "NASD")
             await db.add_portfolio_symbol(conn, sym, market="overseas", exchange=exch)
             if sym not in existing_wl:
                 await db.upsert_us_watchlist_item(
