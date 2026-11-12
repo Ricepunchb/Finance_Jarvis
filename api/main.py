@@ -40,6 +40,11 @@ us_scheduler = USMarketMonitorScheduler()
 # (엔진의 KIS 클라이언트를 그대로 재사용 — 대시보드 표시용으로 별도 토큰을 새로 발급하지 않기 위함).
 _symbol_name_cache: dict[str, str] = {}
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 logger = logging.getLogger(__name__)
 # create_task 결과를 참조로 붙잡아 두지 않으면 실행 도중 GC될 수 있다
 _discovery_refresh_task: Optional[asyncio.Task] = None

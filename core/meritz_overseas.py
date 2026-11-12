@@ -75,8 +75,13 @@ def _resolve_vndr_idno(ovrs_excg_cd: str) -> str:
 
 
 def _format_order_price(price: float) -> str:
-    """메리츠 해외 주문 단가는 소수점 이하 4자리까지 허용 (초과 시 IGW50002 거절)."""
-    formatted = f"{float(price):.4f}"
+    """메리츠 해외 주문 단가 포맷팅.
+    미국 거래소 규정: $1.00 이상 종목은 호가 단위가 0.01달러(소수점 2자리)여야 하며,
+    $1.00 미만 종목만 최대 소수점 4자리까지 허용됨. (초과 시 거래소 '호가 단위 확인' 거절)."""
+    p = float(price)
+    if p >= 1.0:
+        return f"{round(p, 2):.2f}"
+    formatted = f"{round(p, 4):.4f}"
     if "." in formatted:
         formatted = formatted.rstrip("0").rstrip(".")
     return formatted or "0"
@@ -433,10 +438,11 @@ async def order(
     is_shadow = settings.SHADOW_MODE if shadow is None else shadow
     clean_sym = symbol.strip().upper()
     vndr_idno = _resolve_vndr_idno(ovrs_excg_cd)
-    price_str = _format_order_price(price)
+    price_adjusted = round(float(price), 2) if float(price) >= 1.0 else round(float(price), 4)
+    price_str = _format_order_price(price_adjusted)
 
     if side == "buy":
-        notional_usd = float(qty) * float(price)
+        notional_usd = float(qty) * price_adjusted
         if settings.MAX_ORDER_NOTIONAL_USD > 0 and notional_usd > settings.MAX_ORDER_NOTIONAL_USD + 1e-6:
             raise MeritzApiError(
                 rsp_cd="MAX_NOTIONAL_EXCEEDED",

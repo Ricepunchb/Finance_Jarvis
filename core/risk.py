@@ -141,11 +141,28 @@ class RiskManager:
 
     # --- 주문 크기 클램프 (베토가 아니라 한도 안으로 축소) ---
 
-    def clamp_qty_to_notional(self, qty: float, price: float) -> float:
+    def clamp_qty_to_notional(
+        self,
+        qty: float,
+        price: float,
+        symbol: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> float:
         if price <= 0:
             return qty
-        is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
-        if is_meritz and getattr(settings, "MAX_ORDER_NOTIONAL_USD", 0) > 0:
+        is_overseas = False
+        if market == "overseas":
+            is_overseas = True
+        elif market == "domestic":
+            is_overseas = False
+        elif symbol:
+            from core.utils.symbol_mapper import is_overseas_symbol
+            is_overseas = is_overseas_symbol(symbol)
+        else:
+            is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+            is_overseas = is_meritz and price < 3000.0
+
+        if is_overseas and getattr(settings, "MAX_ORDER_NOTIONAL_USD", 0) > 0:
             max_qty = settings.MAX_ORDER_NOTIONAL_USD / price
         else:
             max_qty = settings.MAX_ORDER_NOTIONAL_KRW / price

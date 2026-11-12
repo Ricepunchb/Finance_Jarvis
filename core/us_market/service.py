@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core import db
+from core.config import settings
 from core.us_market.client import (
     get_us_30m_bars,
     get_us_consensus_and_news,

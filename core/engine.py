@@ -527,6 +527,7 @@ class TradingEngine:
         position_value = qty * price
         current_weight = (position_value / total_equity) if total_equity > 0 else 0.0
         context.update({"qty_before": qty, "position_value": position_value, "current_weight": current_weight})
+        avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
 
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그리고 그것들과 무관하게 평가한다.
         # 이 두 게이트는 "새로운 재량매매"를 막기 위한 것이지 손실을 줄이는 강제청산을 막기
@@ -536,7 +537,6 @@ class TradingEngine:
         tech_signal = None
         is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         if qty > 0:
-            avg_price = float(holding.get("pchs_avg_pric") or 0) if holding else 0.0
             await db.update_position_peak(self.conn, symbol, price)
             position_row = await db.get_position(self.conn, symbol)
             peak_price = position_row["peak_price_since_entry"] if position_row else None
@@ -1035,9 +1035,11 @@ class TradingEngine:
             await self._log_no_op(cycle_id, symbol, target_weight, "주문가능수량 0", context)
             return
 
+        clean_overseas_price = float(adjust_to_tick_size(price_foreign, market="overseas"))
+
         try:
             intent_id = await db.create_order_intent(
-                self.conn, cycle_id, symbol, action.side, action.qty, "limit", price_foreign,
+                self.conn, cycle_id, symbol, action.side, action.qty, "limit", clean_overseas_price,
                 action.reason, market="overseas",
             )
         except aiosqlite.IntegrityError:
@@ -1048,7 +1050,7 @@ class TradingEngine:
             shadow = getattr(settings, "SHADOW_MODE", False)
             avail_usd = float(psbl.get("ovrs_ord_psbl_amt") or 0.0) if action.side == "buy" else None
             result = await meritz_overseas.order(
-                self.client, exchange, symbol, action.side, int(action.qty), price_foreign,
+                self.client, exchange, symbol, action.side, int(action.qty), clean_overseas_price,
                 shadow=shadow, available_usd=avail_usd,
             )
             order_no = result.get("ODNO") or result.get("odno")
@@ -1056,7 +1058,7 @@ class TradingEngine:
             await db.update_order_intent(self.conn, intent_id, status=status, kis_order_no=order_no)
             self._orders_submitted_in_cycle += 1
             if shadow:
-                await db.record_rest_fill(self.conn, intent_id, float(action.qty), price_foreign)
+                await db.record_rest_fill(self.conn, intent_id, float(action.qty), clean_overseas_price)
             if winddown_liquidating is not None:
                 await db.mark_winddown_sell_started(self.conn, symbol)
         except (KisApiError, MeritzApiError) as e:

@@ -203,8 +203,29 @@ async def reconcile_unresolved_intents(
         candidates = await _find_candidates(rows, intent)
         if len(candidates) == 0:
             if intent.get("kis_order_no"):
-                # 브로커에 정상 전송되어 주문번호(odno)가 이미 발급된 건은 당일 내역 지연 등으로
-                # 일시 매칭이 안 될 수 있으므로, 절대 NOT_SUBMITTED로 내리지 않는다 (중복 발주 원천 차단).
+                # 주문 생성 후 24시간 이상 경과한 과거 주문인데 당일 체결내역에 없는 경우:
+                # 잔고에 이미 수량이 반영되어 있는지 확인하여 FILLED 종결 또는 CANCELLED 처리
+                age_hours = (time.time() - float(intent.get("created_at") or time.time())) / 3600.0
+                if age_hours > 24.0:
+                    pos = await db.get_position(conn, intent["symbol"])
+                    if pos and float(pos.get("qty") or 0) >= float(intent["qty"]):
+                        logger.info(
+                            f"과거 주문(intent={intent['intent_id']}, odno={intent['kis_order_no']})은 당일 내역에 없으나 "
+                            f"계좌 잔고({pos['qty']}주)에 체결 반영되어 있어 FILLED로 확정 처리합니다."
+                        )
+                        await db.update_order_intent(conn, intent["intent_id"], status="FILLED")
+                        await db.record_rest_fill(
+                            conn, intent["intent_id"], float(intent["qty"]), float(intent.get("price") or 0.0)
+                        )
+                    else:
+                        logger.warning(
+                            f"과거 주문(intent={intent['intent_id']}, odno={intent['kis_order_no']})이 24시간 이상 경과하고 "
+                            f"체결내역 및 잔고에 미반영 상태이므로 CANCELLED로 종결합니다."
+                        )
+                        await db.update_order_intent(conn, intent["intent_id"], status="CANCELLED")
+                    continue
+
+                # 당일 주문 건: 지연 등으로 일시 매칭이 안 될 수 있으므로 상태 유지
                 logger.warning(
                     f"미해결 intent({intent['intent_id']})에 주문번호({intent['kis_order_no']})가 존재하나 "
                     f"체결내역에서 찾지 못했습니다. 상태({intent.get('status', 'SUBMITTED')})를 유지합니다."

@@ -195,7 +195,7 @@ async def get_valuation_signal(
         try:
             financial_ratio_rows = await kis_domestic.get_financial_ratio(client, symbol)
         except Exception:
-            logger.warning(f"'{symbol}' 재무비율 조회 실패 - PER/PBR 백분위 컴포넌트 생략", exc_info=True)
+            logger.debug(f"'{symbol}' 재무비율 조회 불가(API 미지원/종료) - PER/PBR 백분위 컴포넌트 생략")
 
         if financial_ratio_rows:
             end_date = datetime.now(tz=KST).strftime("%Y%m%d")

@@ -318,11 +318,21 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
                     is_etf_proxy = True
                     is_thematic = True
 
+        KNOWN_INDEX_ETFS = {
+            "VOO", "SPY", "QQQ", "SCHD", "SGOV", "SHV", "BIL", "GLD", "IAU",
+            "TLT", "IEF", "BND", "AGG", "TSLW", "IVV", "VTI"
+        }
+
         # 단일 종목 / SINGLE_STOCK인 경우
         if not is_thematic:
             target_sym = target_symbols[0]
             t = yf.Ticker(target_sym)
-            info = t.info or {}
+            info = {}
+            if target_sym not in KNOWN_INDEX_ETFS:
+                try:
+                    info = t.info or {}
+                except Exception:
+                    info = {}
 
             target_mean = info.get("targetMeanPrice")
             target_high = info.get("targetHighPrice")
@@ -387,7 +397,12 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
         for anchor in target_symbols:
             try:
                 t = yf.Ticker(anchor)
-                info = t.info or {}
+                info = {}
+                if anchor not in KNOWN_INDEX_ETFS:
+                    try:
+                        info = t.info or {}
+                    except Exception:
+                        info = {}
                 tm = info.get("targetMeanPrice")
                 cp = info.get("currentPrice") or info.get("regularMarketPrice")
                 if tm and cp and cp > 0:
@@ -437,11 +452,12 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
 
         # 대표 1위 앵커의 목표가
         first_info = {}
-        try:
-            first_t = yf.Ticker(target_symbols[0])
-            first_info = first_t.info or {}
-        except Exception:
-            pass
+        if target_symbols and target_symbols[0] not in KNOWN_INDEX_ETFS:
+            try:
+                first_t = yf.Ticker(target_symbols[0])
+                first_info = first_t.info or {}
+            except Exception:
+                pass
 
         return {
             "symbol": clean_sym,

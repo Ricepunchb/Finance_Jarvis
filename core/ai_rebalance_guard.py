@@ -38,6 +38,11 @@ def validate_proposal(
     if not proposed_weights:
         return ValidationResult(False, "제안된 비중이 비어 있음")
 
+    # LLM이 종목 청산/제외 의도로 0.0 대신 0.001(0.1%) 등의 극소 비중을 출력한 경우, 0.0(제외)으로 스냅
+    for s, w in list(proposed_weights.items()):
+        if 0 < w < 0.005:
+            proposed_weights[s] = 0.0
+
     # 현금 보유(미배분)는 정상 상태다 (예: 라이브 포트폴리오도 3종목 x 15% = 45%만 배분,
     # 나머지 55%는 의도적 현금 — REBALANCE_BAND_PCT/MAX_POSITION_PCT 기반 보수적 운용).
     # 합이 1.0을 넘는 것만 반려한다(그 종목들의 실제 비중 합이 100%를 초과할 수는 없으므로).

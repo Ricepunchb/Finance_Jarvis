@@ -97,7 +97,7 @@ async def _onboarding_action(
     if trade_value <= 0:
         return None
 
-    qty = risk.clamp_qty_to_notional(trade_value / price, price)
+    qty = risk.clamp_qty_to_notional(trade_value / price, price, symbol=symbol)
     qty = risk.clamp_buy_qty_to_position_cap(qty, price, current_position_value, total_equity)
     qty = float(int(qty))
     # 1주가 1회 주문 한도보다 비싼 종목도 편입은 가능해야 한다 — 한도의 2배까지는 1주를 허용.
@@ -145,7 +145,7 @@ async def decide(
             combined = combine_signals(tech_signal, intraday_signal, sentiment_signal, valuation_signal)
             if combined["direction"] != "SELL":
                 return None
-        qty = risk.clamp_qty_to_notional(current_position_qty, price)
+        qty = risk.clamp_qty_to_notional(current_position_qty, price, symbol=symbol)
         qty = float(max(1, int(min(qty, current_position_qty))))
         reason = "winddown_liquidation" if winddown_liquidating else "winddown_signal_sell"
         return Action(side="sell", qty=qty, order_type="limit", price=price, reason=reason)
@@ -159,7 +159,7 @@ async def decide(
             return None
         side = "sell"
         # 주문 한도보다 비싼 종목(1주 > 한도)도 청산은 되어야 하므로 최소 1주는 허용한다.
-        qty = risk.clamp_qty_to_notional(current_position_qty, price)
+        qty = risk.clamp_qty_to_notional(current_position_qty, price, symbol=symbol)
         qty = float(max(1, int(min(qty, current_position_qty))))
         return Action(side=side, qty=qty, order_type="limit", price=price, reason="excluded_liquidation")
 
@@ -212,7 +212,7 @@ async def decide(
         reason = "swing_signal"
 
     # 최종 리스크 클램프 (베토가 아니라 한도 축소) — 기존과 동일
-    qty = risk.clamp_qty_to_notional(qty, price)
+    qty = risk.clamp_qty_to_notional(qty, price, symbol=symbol)
     if side == "buy":
         qty = risk.clamp_buy_qty_to_position_cap(qty, price, current_position_value, total_equity)
     else:

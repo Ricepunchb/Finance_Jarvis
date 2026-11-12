@@ -177,7 +177,17 @@ class AsyncKISClient:
         for attempt in range(1, max_attempts + 1):
             await self._throttle()
             async with session.request(method, url, headers=req_headers, json=data, params=params) as response:
-                result = await response.json()
+                status = response.status
+                try:
+                    result = await response.json(content_type=None)
+                except Exception:
+                    raw_text = await response.text()
+                    result = {
+                        "rt_cd": "1",
+                        "msg_cd": f"HTTP_{status}",
+                        "msg1": f"HTTP {status}: {raw_text[:200]}",
+                        "_http_status": status,
+                    }
                 if isinstance(result, dict):
                     result["_resp_headers"] = dict(response.headers)
                     # 토큰 만료 에러(EGW00123 등) 감지 시: 캐시 무효화 및 1회 강제 재발급 후 즉시 재시도
@@ -187,7 +197,17 @@ class AsyncKISClient:
                         req_headers["authorization"] = f"Bearer {new_token}"
                         await self._throttle()
                         async with session.request(method, url, headers=req_headers, json=data, params=params) as retry_resp:
-                            result = await retry_resp.json()
+                            retry_status = retry_resp.status
+                            try:
+                                result = await retry_resp.json(content_type=None)
+                            except Exception:
+                                raw_retry = await retry_resp.text()
+                                result = {
+                                    "rt_cd": "1",
+                                    "msg_cd": f"HTTP_{retry_status}",
+                                    "msg1": f"HTTP {retry_status}: {raw_retry[:200]}",
+                                    "_http_status": retry_status,
+                                }
                             if isinstance(result, dict):
                                 result["_resp_headers"] = dict(retry_resp.headers)
 

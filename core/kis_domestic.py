@@ -136,18 +136,22 @@ async def get_invest_opinion(
 
 
 async def get_financial_ratio(client: AsyncKISClient, symbol: str, div_cls: str = "0") -> List[Dict[str, Any]]:
-    """분기/연간 재무비율(ROE/부채비율/성장률 등) 조회. 최신 순으로 여러 기(期) 반환."""
-    response = await client.request(
-        method="GET",
-        path="/uapi/domestic-stock/v1/finance/financial-ratio",
-        tr_id=tr_ids.FINANCE_FINANCIAL_RATIO_TR_ID,
-        params={
-            "FID_DIV_CLS_CODE": div_cls,
-            "fid_cond_mrkt_div_code": "J",
-            "fid_input_iscd": symbol,
-        },
-    )
-    return _ensure_ok(response).get("output", [])
+    """분기/연간 재무비율(ROE/부채비율/성장률 등) 조회.
+    (참고: 한국투자증권 정책에 따라 2026년 11월 1일부로 OpenAPI 재무분석 서비스가 공식 종료되어 빈 목록을 반환할 수 있음)"""
+    try:
+        response = await client.request(
+            method="GET",
+            path="/uapi/domestic-stock/v1/finance/financial-ratio",
+            tr_id=tr_ids.FINANCE_FINANCIAL_RATIO_TR_ID,
+            params={
+                "FID_DIV_CLS_CODE": div_cls,
+                "fid_cond_mrkt_div_code": "J",
+                "fid_input_iscd": symbol,
+            },
+        )
+        return _ensure_ok(response).get("output", [])
+    except Exception:
+        return []
 
 
 # 제외 마스크 10자리: 투자위험/경고/주의, 관리종목, 정리매매, 불성실공시, 우선주, 거래정지, ETF, ETN, 신용주문불가, SPAC
