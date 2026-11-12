@@ -600,7 +600,23 @@ async def execute_us_rebalance_plan(
 
     # 1. 매도 주문 우선 집행 (현금 확보)
     for s in sells:
+        intent_id = None
         try:
+            try:
+                intent_id = await db.create_order_intent(
+                    conn,
+                    cycle_id=0,
+                    symbol=s.symbol,
+                    side="sell",
+                    qty=float(s.qty),
+                    order_type="limit",
+                    price=s.estimated_price,
+                    reason=f"US Rebalance ({plan.trigger_type}): {s.reason}",
+                    market="overseas",
+                )
+            except Exception as ie:
+                logger.warning(f"'{s.symbol}' 리밸런싱 매도 intent 생성 스킵: {ie}")
+
             if client is not None and not is_shadow:
                 res = await order(
                     client=client,
@@ -615,6 +631,10 @@ async def execute_us_rebalance_plan(
             else:
                 odno = f"SIM_SELL_{int(time.time())}"
 
+            if intent_id:
+                status = "FILLED" if is_shadow else "SUBMITTED"
+                await db.update_order_intent(conn, intent_id, status=status, kis_order_no=odno)
+
             executed_orders.append({
                 "symbol": s.symbol,
                 "action": "SELL",
@@ -626,10 +646,13 @@ async def execute_us_rebalance_plan(
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"'{s.symbol}' 리밸런싱 매도 실패: {e}")
+            if intent_id:
+                await db.update_order_intent(conn, intent_id, status="REJECTED")
             failed_orders.append({"symbol": s.symbol, "action": "SELL", "error": str(e)})
 
     # 2. 매수 주문 집행 (매도 체결 후 보유 달러 가드 적용)
     for b in buys:
+        intent_id = None
         try:
             avail_usd = None
             if client is not None and not is_shadow:
@@ -641,6 +664,21 @@ async def execute_us_rebalance_plan(
                 if actual_qty <= 0:
                     logger.warning(f"'{b.symbol}' 가용 달러 부족으로 매수 스킵")
                     continue
+
+                try:
+                    intent_id = await db.create_order_intent(
+                        conn,
+                        cycle_id=0,
+                        symbol=b.symbol,
+                        side="buy",
+                        qty=float(actual_qty),
+                        order_type="limit",
+                        price=b.estimated_price,
+                        reason=f"US Rebalance ({plan.trigger_type}): {b.reason}",
+                        market="overseas",
+                    )
+                except Exception as ie:
+                    logger.warning(f"'{b.symbol}' 리밸런싱 매수 intent 생성 스킵: {ie}")
 
                 res = await order(
                     client=client,
@@ -656,6 +694,24 @@ async def execute_us_rebalance_plan(
             else:
                 actual_qty = b.qty
                 odno = f"SIM_BUY_{int(time.time())}"
+                try:
+                    intent_id = await db.create_order_intent(
+                        conn,
+                        cycle_id=0,
+                        symbol=b.symbol,
+                        side="buy",
+                        qty=float(actual_qty),
+                        order_type="limit",
+                        price=b.estimated_price,
+                        reason=f"US Rebalance ({plan.trigger_type}): {b.reason}",
+                        market="overseas",
+                    )
+                except Exception as ie:
+                    logger.warning(f"'{b.symbol}' 리밸런싱 가상매수 intent 생성 스킵: {ie}")
+
+            if intent_id:
+                status = "FILLED" if is_shadow else "SUBMITTED"
+                await db.update_order_intent(conn, intent_id, status=status, kis_order_no=odno)
 
             executed_orders.append({
                 "symbol": b.symbol,
@@ -668,6 +724,8 @@ async def execute_us_rebalance_plan(
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"'{b.symbol}' 리밸런싱 매수 실패: {e}")
+            if intent_id:
+                await db.update_order_intent(conn, intent_id, status="REJECTED")
             failed_orders.append({"symbol": b.symbol, "action": "BUY", "error": str(e)})
 
     # 가용 달러 상태 갱신

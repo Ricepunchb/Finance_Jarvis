@@ -591,15 +591,49 @@ async def get_ccnl(
     end_date: str = "",
     ovrs_excg_cd: str = "%",
 ) -> List[Dict[str, Any]]:
-    """해외주식 당일 주문체결내역 조회 (`GET /trading/v1/overseas/orders/today`).
+    """해외주식 주문체결내역 조회.
 
+    start_date/end_date가 지정되면 기간별 주문내역 조회(`/trading/v1/overseas/orders/history`),
+    지정되지 않으면 당일 주문체결내역 조회(`/trading/v1/overseas/orders/today`)를 수행하며,
+    당일 조회가 비어있을 경우 history 조회로 폴백한다.
     reconciliation 모듈과 엔진 긴급정지(kill)에서 사용하는 표준 필드명으로 정규화하여 반환한다.
     """
-    response = await client.request(
-        method="GET",
-        path="/trading/v1/overseas/orders/today",
-    )
-    rows = response.get("data") or []
+    rows: List[Dict[str, Any]] = []
+    if start_date and end_date:
+        sta = start_date.replace("-", "")
+        fin = end_date.replace("-", "")
+        try:
+            res = await client.request(
+                method="GET",
+                path="/trading/v1/overseas/orders/history",
+                params={"oder_sta_date": sta, "oder_fin_date": fin, "cntg_cls_code": "0"},
+            )
+            rows = res.get("data") or []
+        except Exception as e:
+            logger.warning(f"메리츠 기간별 해외 주문내역 조회 실패({sta}~{fin}): {e}")
+
+    if not rows:
+        try:
+            response = await client.request(
+                method="GET",
+                path="/trading/v1/overseas/orders/today",
+            )
+            rows = response.get("data") or []
+        except Exception as e:
+            logger.warning(f"메리츠 당일 해외 주문체결내역 조회 실패: {e}")
+
+    if not rows and not (start_date and end_date):
+        today_str = datetime.now(tz=KST).strftime("%Y%m%d")
+        try:
+            res = await client.request(
+                method="GET",
+                path="/trading/v1/overseas/orders/history",
+                params={"oder_sta_date": today_str, "oder_fin_date": today_str, "cntg_cls_code": "0"},
+            )
+            rows = res.get("data") or []
+        except Exception:
+            pass
+
     if not isinstance(rows, list):
         return []
 
@@ -607,7 +641,8 @@ async def get_ccnl(
     for r in rows:
         if not isinstance(r, dict):
             continue
-        sym = (r.get("ovrs_stck_symb_iscd") or r.get("pdno") or "").strip()
+        raw_sym = (r.get("ovrs_stck_symb_iscd") or r.get("pdno") or r.get("iscd") or "").strip()
+        sym = raw_sym.split(".")[0].strip()
         vndr = str(r.get("ovrs_exch_vndr_idno") or "0537").strip()
         excg = VNDR_IDNO_TO_EXCG.get(vndr, r.get("ovrs_excg_cd") or "NASD")
         # 메리츠 seln_byov_clcd / deal_cls_code: "1"=매도, "2"=매수 -> reconciliation 표준 "01"(매도), "02"(매수)
@@ -633,19 +668,28 @@ async def get_ccnl(
                 "pdno": sym,
                 "ovrs_excg_cd": excg,
                 "sll_buy_dvsn_cd": sll_buy_cd,
-                "ft_ord_qty": str(r.get("odqt") if r.get("odqt") is not None else r.get("ft_ord_qty", 0)),
+                "ft_ord_qty": str(
+                    r.get("odqt") if r.get("odqt") is not None
+                    else (r.get("oder_dqty") if r.get("oder_dqty") is not None else r.get("ft_ord_qty", 0))
+                ),
                 "ft_ord_unpr3": str(
                     r.get("ovrs_stck_oder_prc")
                     if r.get("ovrs_stck_oder_prc") is not None
                     else r.get("ft_ord_unpr3", 0)
                 ),
-                "ft_ccld_qty": str(r.get("cntg_qty") if r.get("cntg_qty") is not None else r.get("ft_ccld_qty", 0)),
+                "ft_ccld_qty": str(
+                    r.get("cntg_qty") if r.get("cntg_qty") is not None
+                    else (r.get("cntg_dqty") if r.get("cntg_dqty") is not None else r.get("ft_ccld_qty", 0))
+                ),
                 "ft_ccld_unpr3": str(
                     r.get("cntg_crnc_prc")
                     if r.get("cntg_crnc_prc") is not None
                     else r.get("ft_ccld_unpr3", 0)
                 ),
-                "nccs_qty": str(r.get("ncnt_qty") if r.get("ncnt_qty") is not None else r.get("nccs_qty", 0)),
+                "nccs_qty": str(
+                    r.get("ncnt_qty") if r.get("ncnt_qty") is not None
+                    else (r.get("ncnt_odqt") if r.get("ncnt_odqt") is not None else r.get("nccs_qty", 0))
+                ),
                 "ord_tmd": ord_tmd,
                 "rjct_rson": str(r.get("ovrs_stck_rfus_reas") or r.get("rjct_rson") or ""),
             }
