@@ -439,6 +439,7 @@ def render_us_news_surprise_section(key_prefix: str = "us_news") -> None:
 
     if news_alerts:
         st.markdown(f"##### 📢 포착된 서프라이즈 뉴스 피드 (최근 {len(news_alerts)}건)")
+        st.caption("ℹ️ 일상적인 시황·칼럼 등 평범한 뉴스(15~60점대)는 AI가 노이즈로 자동 제외하며, 시장 컨센서스 괴리도가 기준선(75점) 이상인 핵심 서프라이즈 이슈만 선별하여 보관 및 알림을 제공합니다.")
         for n_item in news_alerts:
             n_sym = n_item.get("symbol", "")
             n_title = n_item.get("title", "")

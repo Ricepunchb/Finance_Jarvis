@@ -44,7 +44,35 @@ def get_telegram_config() -> Tuple[Optional[str], Optional[str]]:
         or os.getenv("TELEGRAM_CHAT_ID")
         or os.getenv("TG_CHAT_ID")
     )
-    return token, chat_id
+
+    # 프로필 파일에 누락된 경우 루트 .env 및 타 프로필 .env.*에서 탐색 (다계좌 공통 알림 보장)
+    if not token or not chat_id:
+        try:
+            root = Path(__file__).resolve().parent.parent.parent
+            candidate_files = [root / ".env"] + sorted(root.glob(".env.*"))
+            for f in candidate_files:
+                if f.name.endswith(".template") or not f.is_file():
+                    continue
+                lines = f.read_text(encoding="utf-8").splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if not token and line.startswith("TELEGRAM_BOT_TOKEN="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val:
+                            token = val
+                    if not chat_id and line.startswith("TELEGRAM_CHAT_ID="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val:
+                            chat_id = val
+                    if token and chat_id:
+                        break
+                if token and chat_id:
+                    break
+        except Exception:
+            pass
+
+    return (token or None), (chat_id or None)
+
 
 
 def send_telegram_message_with_result(
@@ -186,6 +214,7 @@ async def notify_signal_if_needed(
         effective_chat_id = effective_chat_id or env_chat_id
 
     if not effective_token or not effective_chat_id:
+        logger.warning("텔레그램 토큰 또는 Chat ID 미설정으로 시그널 알림 발송 생략 (symbol=%s)", sym)
         return False  # 텔레그램 미설정 시 조용히 스킵
 
     action = signal_data.get("combined_action", "HOLD")
@@ -245,6 +274,7 @@ async def notify_news_surprise_if_needed(
         effective_chat_id = effective_chat_id or env_chat_id
 
     if not effective_token or not effective_chat_id:
+        logger.warning("텔레그램 토큰 또는 Chat ID 미설정으로 뉴스 알림 발송 생략 (symbol=%s)", symbol)
         return False, "텔레그램 토큰 또는 Chat ID 미설정"
 
     score = getattr(analysis, "surprise_score", None)

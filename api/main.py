@@ -1592,8 +1592,9 @@ async def save_us_telegram(req: USTelegramSaveRequest):
 
         root = Path(__file__).resolve().parent.parent
         update_env_file(root / ".env")
-        if settings.PROFILE_NAME:
-            update_env_file(root / f".env.{settings.PROFILE_NAME}")
+        for p_file in root.glob(".env.*"):
+            if not p_file.name.endswith(".template"):
+                update_env_file(p_file)
 
         return {"status": "ok", "message": "텔레그램 설정이 .env에 성공적으로 저장되었습니다."}
     except Exception as e:
