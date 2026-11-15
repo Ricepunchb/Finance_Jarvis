@@ -74,7 +74,8 @@ async def _onboarding_action(
     시그널은 진입 여부가 아니라 "명백한 하락 신호일 때만 보류"하는 최소 필터로만 쓴다."""
     if not settings.ONBOARDING_ENABLED or symbol is None or target_weight <= 0:
         return None
-    if drift.required_direction != "BUY":  # 밴드 안이면 이미 충분히 채워진 것
+    # 아직 1주도 보유하지 않은 신규 편입 종목은 target_weight <= band(예: 5% vs ±5%)라도 온보딩을 시작한다.
+    if drift.required_direction != "BUY" and not (current_position_value <= 0 and target_weight > 0):
         return None
 
     # 일반 스윙 모드에서 확정적 하락 추세(SMA20 < SMA60 이고 현재가 < SMA20)일 때는
@@ -92,7 +93,8 @@ async def _onboarding_action(
 
     gap_value = (target_weight - drift.current_weight) * total_equity
     daily_budget = target_weight * total_equity / max(1, settings.ONBOARDING_DAYS)
-    remaining_today = daily_budget - await risk.onboarding_notional_today(symbol)
+    already_today = await risk.onboarding_notional_today(symbol)
+    remaining_today = daily_budget - already_today
     trade_value = min(gap_value, remaining_today)
     if trade_value <= 0:
         return None
@@ -100,10 +102,12 @@ async def _onboarding_action(
     qty = risk.clamp_qty_to_notional(trade_value / price, price, symbol=symbol)
     qty = risk.clamp_buy_qty_to_position_cap(qty, price, current_position_value, total_equity)
     qty = float(int(qty))
-    # 1주가 1회 주문 한도보다 비싼 종목도 편입은 가능해야 한다 — 한도의 2배까지는 1주를 허용.
-    if qty <= 0 and price <= 2 * settings.MAX_ORDER_NOTIONAL_KRW and trade_value >= price:
-        if risk.clamp_buy_qty_to_position_cap(1.0, price, current_position_value, total_equity) >= 1.0:
-            qty = 1.0
+    # 1주가 1회 주문 한도(최대 2배)보다 비싸거나 일일 온보딩 예산보다 비싸더라도,
+    # 목표 비중 갭(gap_value) 안에 1주 이상 들어가고 당일 첫 온보딩이면 최소 1주 매수를 허용한다.
+    if qty <= 0 and price <= 2 * settings.MAX_ORDER_NOTIONAL_KRW and gap_value >= price:
+        if trade_value >= price or (already_today <= 0 and price <= settings.MAX_ORDER_NOTIONAL_KRW):
+            if risk.clamp_buy_qty_to_position_cap(1.0, price, current_position_value, total_equity) >= 1.0:
+                qty = 1.0
     if qty <= 0:
         return None
     return Action(side="buy", qty=qty, order_type="limit", price=price, reason="onboarding_tranche")

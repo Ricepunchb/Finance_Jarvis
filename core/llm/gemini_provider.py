@@ -133,10 +133,16 @@ class _InsightDigestSchema(BaseModel):
 
 
 
-def _format_candidate(c: Dict[str, Any]) -> str:
+def _format_candidate(c: Dict[str, Any], total_equity: Optional[float] = None) -> str:
     parts = []
     if c.get("angle_label"):
         parts.append(f"관점 {c['angle_label']} (점수 {c.get('score', 0):.2f})")
+    if c.get("last_close") and float(c["last_close"]) > 0:
+        px = float(c["last_close"])
+        if total_equity and total_equity > 0:
+            parts.append(f"현재가 {px:,.0f}원 (1주 최소비중 {px / total_equity:.1%})")
+        else:
+            parts.append(f"현재가 {px:,.0f}원")
     if c.get("theme"):
         parts.append(f"테마 {c['theme']}")
     if c.get("per") is not None:
@@ -295,6 +301,7 @@ class GeminiProvider(LLMProvider):
         max_symbols_removed: int = 2,
         max_weight_delta_pct: float = 0.10,
         max_turnover_pct: float = 0.20,
+        total_equity: Optional[float] = None,
     ) -> Dict[str, Any]:
         current_weights = {p["symbol"]: p["weight"] for p in current_positions}
         candidate_symbols = {c["symbol"] for c in candidate_pool}
@@ -322,11 +329,30 @@ class GeminiProvider(LLMProvider):
             "   - 특히 고배당 인프라(맥쿼리인프라 등), 배당금융, 필수 소비/방어 자산은 배당 수익률과 현금흐름 방어력이 있으므로, 펀더멘털의 치명적 훼손이나 거시 국면의 명백한 역풍이 아니라면 잦은 손절을 지양하고 비중을 유지하라.",
             "   - 반대로 평단가 대비 유의미한 수익(+10% 이상)이 났거나 추세가 완전히 꺾인 종목, 또는 명백한 악재/리스크가 확인된 종목을 우선적 이익 실현 및 위험 관리(removes/축소) 대상으로 삼아라.",
             "",
-            "[현재 포트폴리오]",
         ]
+        if total_equity is not None and total_equity > 0:
+            lines.append(
+                f"[계좌 자금 규모] 총자산 {total_equity:,.0f}원 "
+                f"(비중 5% = {total_equity * 0.05:,.0f}원, 10% = {total_equity * 0.10:,.0f}원)"
+            )
+            lines.append("")
+        lines.append("[현재 포트폴리오]")
         for p in current_positions:
             signal = current_signals.get(p["symbol"])
             metrics_parts = []
+            cur_px = p.get("current_price")
+            if cur_px and float(cur_px) > 0:
+                px_val = float(cur_px)
+                if total_equity is not None and total_equity > 0:
+                    min_w = px_val / total_equity
+                    unaffordable_note = (
+                        " [경고: 목표액<1주가 매수불가→비중상향 또는 제외]"
+                        if float(p.get("qty") or 0) <= 0 and p["weight"] * total_equity < px_val
+                        else ""
+                    )
+                    metrics_parts.append(f"현재가 {px_val:,.0f}원 (1주 최소비중 {min_w:.1%}){unaffordable_note}")
+                else:
+                    metrics_parts.append(f"현재가 {px_val:,.0f}원")
             if "roi_pct" in p:
                 metrics_parts.append(f"내 평단가 대비 ROI {p['roi_pct']:+.1f}%")
             if "days_held" in p:
@@ -353,7 +379,7 @@ class GeminiProvider(LLMProvider):
                 metrics_parts.append(f"볼린저%B {p['bb_percent_b']:.2f}")
             name_str = f" ({p['name']})" if p.get("name") else ""
             lines.append(
-                f"- {p['symbol']}{name_str}: 비중 {p['weight']:.1%}, 평단가 {p.get('avg_price', 0):.0f}"
+                f"- {p['symbol']}{name_str}: 비중 {p['weight']:.1%}, 보유수량 {p.get('qty', 0):.0f}주, 평단가 {p.get('avg_price', 0):.0f}"
                 + (f", {', '.join(metrics_parts)}" if metrics_parts else "")
                 + (f", 현재시그널 {signal}" if signal else "")
             )
@@ -367,7 +393,7 @@ class GeminiProvider(LLMProvider):
                 "기초지수·분산 효과와 이미 보유한 종목과의 중복(같은 지수/섹터를 ETF와 개별주로 이중 보유)을 따져라."
             )
             for c in candidate_pool:
-                lines.append(_format_candidate(c))
+                lines.append(_format_candidate(c, total_equity=total_equity))
         else:
             lines.append("")
             lines.append("[신규 편입 후보] 없음 - adds는 반드시 빈 배열로 응답하라.")
@@ -388,21 +414,33 @@ class GeminiProvider(LLMProvider):
             if insight_digest.get("holdings_watch"):
                 lines.append(f"- 보유종목 관전 포인트: {', '.join(insight_digest['holdings_watch'])}")
         lines.append("")
+        from core.ai_rebalance_guard import compute_effective_add_weight_cap
+        add_weight_cap = compute_effective_add_weight_cap(max_symbols, max_weight_delta_pct, max_weight)
+        affordability_rule = ""
+        if total_equity is not None and total_equity > 0:
+            affordability_rule = (
+                f"\n7. [1주 매수 가능 종목만 편입] 총자산({total_equity:,.0f}원) 기준 목표 비중 배분액(비중 × 총자산)이 "
+                "1주 현재가보다 작으면 1주도 매수할 수 없다. 신규 편입(adds) 및 미보유(보유수량 0주) 증액 종목은 반드시 "
+                "목표비중 × 총자산 >= 현재가(1주 가격)를 만족해야 하며, 기존 미보유 종목 중 목표액이 1주가보다 작은 종목은 "
+                "비중을 1주 최소비중 이상으로 높이거나 removes로 제외하라."
+            )
         lines.append(
             "[안전 가드 제약 규정 - 아래 기준 중 하나라도 위반 시 제안 전체가 즉시 반려되므로 엄격히 준수하라]\n"
             f"1. [최종 종목 수 및 비중 합] 최종 포트폴리오 보유 종목(비중>0) 수는 최대 {max_symbols}개. "
             "weights의 키는 현재 포트폴리오 또는 후보 종목코드와 일치해야 하며, 비중의 총합은 1.0(100%)을 "
-            "초과할 수 없다 (국면별 수혜 자산과 방어/헤지 자산을 조합해 적극적으로 자산을 배분하되, "
-            "적정 수준의 예비 현금 버퍼만 남겨두어라).\n"
+            "초과할 수 없다. 이미 종목 수가 상한에 도달했거나 비중 합이 꽉 차 있더라도, 더 유망한 신규 후보가 있다면 "
+            "기존 열위 종목을 removes(비중 0%)로 제외하거나 기존 종목 비중을 낮춰 여력을 확보한 뒤 adds를 편입하라.\n"
             f"2. [개별 종목 비중 범위] 보유할 종목(비중>0)의 비중은 반드시 {min_weight:.0%} 이상 {max_weight:.0%} 이하여야 한다. "
             f"최소 비중({min_weight:.0%}) 미만으로 담을 종목은 adds에 넣지 마라. 제외하려는 종목은 removes에 넣고 비중을 0으로 둔다.\n"
             f"3. [1회 최대 제외 종목 수] 이번 제안에서 removes에 포함할 수 있는 종목은 최대 {max_symbols_removed}개다. "
             f"제외하고 싶은 종목이 {max_symbols_removed}개를 넘더라도, 가장 위험/시급한 {max_symbols_removed}개만 우선 골라 removes에 넣고 "
             "나머지 종목은 이번 회차에서는 보유를 유지하되 비중만 점진적으로 축소하라 (한 번에 과다 제외 시 제안이 통째로 반려됨).\n"
             f"4. [1회 최대 신규 편입 종목 수] 이번 제안에서 adds에 포함할 수 있는 종목은 최대 {max_symbols_added}개다.\n"
-            f"5. [종목당 1회 비중 변화폭] 기존 보유 종목의 비중은 1회 제안당 최대 ±{max_weight_delta_pct:.0%}p까지만 변경 가능하다 "
+            f"5. [종목당 1회 비중 변화폭] 기존 보유 종목의 비중은 1회 제안당 최대 ±{max_weight_delta_pct:.0%}p까지만 변경 가능하며, "
+            f"신규 편입(adds) 종목은 최대 {add_weight_cap:.0%}까지 초기 비중을 부여할 수 있다 "
             "(단, removes에 명시된 종목은 비중 0%로 전량 청산 허용).\n"
             f"6. [총 회전율 상한] 이번 제안의 총 회전율(sum|Δweight|/2)은 {max_turnover_pct:.0%} 이하여야 한다 (포트폴리오의 급격한 전면 교체 금지)."
+            + affordability_rule
         )
         prompt = "\n".join(lines)
 

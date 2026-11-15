@@ -144,6 +144,8 @@ class Settings(BaseSettings):
     AI_REBALANCE_MAX_SYMBOLS_REMOVED: int = 2
     AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT: float = 0.03
     AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS: int = 20
+    AI_REBALANCE_MIN_POSITION_VALUE_KRW: int = 250_000 # 종목당 최소 목표 배분 금액(원) — 자금 규모 대비 종목 과다 분산 방지
+    AI_REBALANCE_MIN_PORTFOLIO_SYMBOLS_FLOOR: int = 4  # 소액 계좌에서도 최소 분산이 가능한 하한 종목 수
     AI_REBALANCE_REMOVED_COOLDOWN_DAYS: int = 7        # 삭제한 종목을 신규 편입 후보에서 제외하는 기본 기간 (고득점 발굴 시 즉시 면제)
 
     # --- AI 포트폴리오 에이전트 (Phase 5.1: 종목 발굴) ---

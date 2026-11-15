@@ -45,6 +45,7 @@ class ValidationOutcome:
     ok: bool
     reason: str = ""
     kis_name: Optional[str] = None
+    price: Optional[float] = None
 
 
 async def validate_candidate_symbol(
@@ -83,10 +84,14 @@ async def validate_candidate_symbol(
                 # KIS 모의투자 해외 시세 일시 오류 시 yfinance 검증
                 yf_targets = await asyncio.to_thread(yfinance_client.fetch_analyst_targets, clean_sym)
                 if yf_targets and yf_targets.get("last_close"):
-                    return ValidationOutcome(True, kis_name=claimed_name or clean_sym)
+                    return ValidationOutcome(
+                        True,
+                        kis_name=claimed_name or clean_sym,
+                        price=float(yf_targets["last_close"]),
+                    )
                 return ValidationOutcome(False, "해외 시세조회 실패 (존재하지 않는 해외 티커일 가능성)")
 
-            return ValidationOutcome(True, kis_name=kis_name)
+            return ValidationOutcome(True, kis_name=kis_name, price=price)
         except Exception as e:
             return ValidationOutcome(False, f"해외 종목 검증 중 예외: {e}")
 
@@ -135,7 +140,7 @@ async def validate_candidate_symbol(
                 f"종목명 불일치 (제안: '{claimed}', 실제: '{kis_name}') - 환각 의심",
             )
 
-    return ValidationOutcome(True, kis_name=kis_name)
+    return ValidationOutcome(True, kis_name=kis_name, price=price)
 
 
 async def seed_candidate_universe(
@@ -234,6 +239,8 @@ async def _score_one(
         value_strength = valuation["strength"]
     cached = await db.get_cached_valuation(conn, symbol, settings.VALUATION_CACHE_TTL_HOURS)
     last_close = float(df["close"].iloc[-1]) if not df.empty else 0.0
+    if last_close > 0:
+        entry["last_close"] = round(last_close, 2)
     if cached:
         entry["per"], entry["pbr"] = cached.get("per"), cached.get("pbr")
         target = cached.get("target_price_mean")
@@ -321,6 +328,7 @@ async def screen_candidates(
     client: AsyncKISClient,
     exclude_symbols: List[str],
     benchmark_returns: Optional[pd.Series] = None,
+    max_affordable_price: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """아직 보유하지 않은 후보 중 관점별 할당(저평가/조기신호/모멘텀/증권사)을 지켜 상위
     DISCOVERY_TOP_N개를 LLM 숏리스트로 반환한다. 또한 국면별 로테이션(방산/에너지/국채/
@@ -338,6 +346,28 @@ async def screen_candidates(
 
     if domestic_only:
         entries = [e for e in entries if not symbol_mapper.is_overseas_symbol(e["symbol"])]
+
+    if max_affordable_price is not None and max_affordable_price > 0:
+        missing_price_syms = [
+            e["symbol"] for e in entries if not e.get("last_close") or float(e.get("last_close") or 0) <= 0
+        ]
+        if missing_price_syms:
+            placeholders = ",".join("?" for _ in missing_price_syms)
+            cur = await conn.execute(
+                f"SELECT d.symbol, d.close FROM daily_bars d "
+                f"INNER JOIN (SELECT symbol, MAX(date) AS max_dt FROM daily_bars "
+                f"WHERE symbol IN ({placeholders}) GROUP BY symbol) m "
+                f"ON d.symbol = m.symbol AND d.date = m.max_dt",
+                missing_price_syms,
+            )
+            price_map = {row[0]: float(row[1]) for row in await cur.fetchall() if row[1] and row[1] > 0}
+            for e in entries:
+                if e["symbol"] in price_map and not e.get("last_close"):
+                    e["last_close"] = round(price_map[e["symbol"]], 2)
+        entries = [
+            e for e in entries
+            if not e.get("last_close") or float(e["last_close"]) <= max_affordable_price
+        ]
 
     exclude_set = set(exclude_symbols)
     chosen = discovery_signals.select_with_quota(

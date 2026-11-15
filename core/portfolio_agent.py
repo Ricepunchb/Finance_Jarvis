@@ -19,7 +19,12 @@ import pandas as pd
 from core import (
     db, discovery, indicators, kis_domestic, meritz_overseas, macro, proxy_mapping, quant_metrics,
 )
-from core.ai_rebalance_guard import validate_proposal
+from core.ai_rebalance_guard import (
+    compute_effective_add_weight_cap,
+    compute_effective_max_symbols,
+    compute_effective_turnover_cap,
+    validate_proposal,
+)
 from core.config import get_effective_proxy_trading, settings
 from core.kis_client import AsyncKISClient
 from core.llm.factory import get_llm_provider
@@ -68,11 +73,14 @@ async def _build_current_positions(
                     df = indicators.chart_rows_to_dataframe(chart_rows)
                 entry.update(quant_metrics.compute_price_based_metrics(df, benchmark_returns))
                 entry.update(indicators.compute_technical_detail(df))
-                if not df.empty and avg_price > 0:
+                if not df.empty:
                     current_price = float(df["close"].iloc[-1])
-                    entry.update(
-                        quant_metrics.compute_position_return(avg_price, current_price, pos.get("entry_opened_at"))
-                    )
+                    if current_price > 0:
+                        entry["current_price"] = current_price
+                    if avg_price > 0:
+                        entry.update(
+                            quant_metrics.compute_position_return(avg_price, current_price, pos.get("entry_opened_at"))
+                        )
             except Exception:
                 logger.exception(f"'{symbol}' 성과/리스크 지표 계산 실패 - 비중/평단만으로 계속")
 
@@ -91,8 +99,51 @@ async def get_portfolio_performance(
     return await _build_current_positions(client, active_weights, positions, benchmark_returns)
 
 
+async def _resolve_total_equity(
+    conn: aiosqlite.Connection,
+    client: Optional[AsyncKISClient],
+    is_meritz: bool,
+) -> Optional[float]:
+    """계좌 총자산(KRW)을 조회한다. 실계좌 조회 실패 시 최근 decision_log의 total_equity로 폴백."""
+    if client is None:
+        return None
+    total_equity = 0.0
+    try:
+        if is_meritz:
+            present = await meritz_overseas.get_present_balance_krw(client)
+            if isinstance(present, dict):
+                total_equity = float(((present.get("totals") or {}).get("tot_asst_amt")) or 0)
+        else:
+            balance = await kis_domestic.get_balance(client)
+            if isinstance(balance, dict):
+                total_equity = float(((balance.get("summary") or {}).get("nass_amt")) or 0)
+    except Exception:
+        logger.debug("리밸런싱용 총자산 실시간 조회 실패 - decision_log 폴백 시도", exc_info=True)
+
+    if total_equity > 0:
+        return total_equity
+
+    try:
+        cur = await conn.execute(
+            "SELECT context_json FROM decision_log WHERE context_json IS NOT NULL ORDER BY id DESC LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if row and row["context_json"]:
+            ctx = json.loads(row["context_json"])
+            logged_eq = float(ctx.get("total_equity") or 0)
+            if logged_eq > 0:
+                return logged_eq
+    except Exception:
+        pass
+    return None
+
+
 async def _validate_adds(
-    client: AsyncKISClient, adds: List[Dict[str, Any]], candidate_pool: List[Dict[str, Any]]
+    client: AsyncKISClient,
+    adds: List[Dict[str, Any]],
+    candidate_pool: List[Dict[str, Any]],
+    max_add_price: Optional[float] = None,
+    add_prices: Optional[Dict[str, float]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """LLM이 제안한 adds를 다시 한 번 KIS로 검증한다 (candidate_pool에 있었어도 스크리닝과
     제안 사이에 VI가 새로 발동했을 수 있어 방어적으로 재확인). 통과분/반려분을 나눠 반환."""
@@ -113,6 +164,17 @@ async def _validate_adds(
         if not outcome.ok:
             rejected.append({**add, "reject_reason": outcome.reason})
             continue
+        resolved_price = outcome.price or candidate.get("last_close")
+        if resolved_price and float(resolved_price) > 0:
+            px = float(resolved_price)
+            if max_add_price is not None and max_add_price > 0 and px > max_add_price:
+                rejected.append({
+                    **add,
+                    "reject_reason": f"1주 가격({px:,.0f}원)이 신규 편입 가능 금액({max_add_price:,.0f}원)을 초과하여 1주 매수 불가",
+                })
+                continue
+            if add_prices is not None and symbol:
+                add_prices[symbol] = px
         valid.append(add)
     return valid, rejected
 
@@ -180,6 +242,31 @@ async def propose_rebalance(
 
     candidate_pool: List[Dict[str, Any]] = []
     is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
+    total_equity = await _resolve_total_equity(conn, client, is_meritz)
+    effective_max_symbols = compute_effective_max_symbols(
+        settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
+        total_equity,
+        settings.AI_REBALANCE_MIN_POSITION_VALUE_KRW,
+        settings.AI_REBALANCE_MIN_PORTFOLIO_SYMBOLS_FLOOR,
+    )
+    active_held_count = sum(1 for p in current_positions if (p.get("weight") or 0.0) > 0)
+    effective_max_added = settings.AI_REBALANCE_MAX_SYMBOLS_ADDED
+    if active_held_count > effective_max_symbols:
+        effective_max_removed = max(
+            settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED,
+            active_held_count - effective_max_symbols + 1,
+        )
+    else:
+        effective_max_removed = settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED
+
+    max_add_weight = compute_effective_add_weight_cap(
+        effective_max_symbols, settings.AI_REBALANCE_MAX_WEIGHT_DELTA_PCT, settings.MAX_POSITION_PCT
+    )
+    effective_max_turnover_pct = compute_effective_turnover_cap(
+        settings.AI_REBALANCE_MAX_TURNOVER_PCT, effective_max_symbols
+    )
+    max_add_price = (total_equity * max_add_weight) if (total_equity and total_equity > 0) else None
+
     if client is not None and not is_meritz:
         try:
             # 사용자가 삭제하거나 청산된 종목이 동적 발굴로 즉시 되살아나 재편입 제안되지 않도록 쿨다운 동안 제외한다.
@@ -200,7 +287,11 @@ async def propose_rebalance(
                 recently_removed -= high_score_exemptions
 
             candidate_pool = await discovery.screen_candidates(
-                conn, client, exclude_symbols=list(set(symbols) | recently_removed), benchmark_returns=benchmark_returns,
+                conn,
+                client,
+                exclude_symbols=list(set(symbols) | recently_removed),
+                benchmark_returns=benchmark_returns,
+                max_affordable_price=max_add_price,
             )
         except Exception:
             logger.exception("후보종목 스크리닝 실패 - 발굴 없이 재비중만 제안")
@@ -215,13 +306,14 @@ async def propose_rebalance(
         candidate_pool=candidate_pool,
         macro_context=macro_context,
         insight_digest=latest_digest,
-        max_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
+        max_symbols=effective_max_symbols,
         min_weight=settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
         max_weight=settings.MAX_POSITION_PCT,
-        max_symbols_added=settings.AI_REBALANCE_MAX_SYMBOLS_ADDED,
-        max_symbols_removed=settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED,
+        max_symbols_added=effective_max_added,
+        max_symbols_removed=effective_max_removed,
         max_weight_delta_pct=settings.AI_REBALANCE_MAX_WEIGHT_DELTA_PCT,
-        max_turnover_pct=settings.AI_REBALANCE_MAX_TURNOVER_PCT,
+        max_turnover_pct=effective_max_turnover_pct,
+        total_equity=total_equity,
     )
 
     if result.get("degraded"):
@@ -263,9 +355,12 @@ async def propose_rebalance(
                 new_weights[s] = w
         result["weights"] = new_weights
 
+    add_prices: Dict[str, float] = {}
     valid_adds, rejected_adds = ([], result.get("adds", []))
     if client is not None and result.get("adds"):
-        valid_adds, rejected_adds = await _validate_adds(client, result["adds"], candidate_pool)
+        valid_adds, rejected_adds = await _validate_adds(
+            client, result["adds"], candidate_pool, max_add_price=max_add_price, add_prices=add_prices,
+        )
     valid_add_symbols = [a["symbol"] for a in valid_adds]
 
 
@@ -288,6 +383,19 @@ async def propose_rebalance(
     for symbol in remove_symbols:
         proposed_weights[symbol] = 0.0  # 제외 = 목표비중 0 (기존 ceiling 로직으로 점진 청산)
 
+    symbol_prices: Dict[str, float] = {}
+    for p in current_positions:
+        if p.get("current_price") and float(p["current_price"]) > 0:
+            symbol_prices[p["symbol"]] = float(p["current_price"])
+    for c in candidate_pool:
+        if c.get("last_close") and float(c["last_close"]) > 0:
+            symbol_prices.setdefault(c["symbol"], float(c["last_close"]))
+    symbol_prices.update(add_prices)
+    held_quantities = {
+        s: float((positions.get(s) or {}).get("qty") or 0.0)
+        for s in (allowed_symbols | set(active_weights))
+    }
+
     context_json = json.dumps(
         {
             "input": {"current_positions": current_positions, "candidate_pool": candidate_pool},
@@ -302,13 +410,17 @@ async def propose_rebalance(
         active_weights,
         adds=valid_add_symbols,
         removes=remove_symbols,
-        max_turnover_pct=settings.AI_REBALANCE_MAX_TURNOVER_PCT,
+        max_turnover_pct=effective_max_turnover_pct,
         max_weight_delta_pct=settings.AI_REBALANCE_MAX_WEIGHT_DELTA_PCT,
-        max_symbols_added=settings.AI_REBALANCE_MAX_SYMBOLS_ADDED,
-        max_symbols_removed=settings.AI_REBALANCE_MAX_SYMBOLS_REMOVED,
+        max_symbols_added=effective_max_added,
+        max_symbols_removed=effective_max_removed,
         min_symbol_weight_pct=settings.AI_REBALANCE_MIN_SYMBOL_WEIGHT_PCT,
         max_symbol_weight_pct=settings.MAX_POSITION_PCT,
-        max_portfolio_symbols=settings.AI_REBALANCE_MAX_PORTFOLIO_SYMBOLS,
+        max_portfolio_symbols=effective_max_symbols,
+        total_equity=total_equity,
+        symbol_prices=symbol_prices,
+        held_quantities=held_quantities,
+        max_add_weight_pct=max_add_weight,
     )
     if not validation.ok:
         await db.finish_rebalance_event(
