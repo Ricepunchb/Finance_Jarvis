@@ -10,9 +10,12 @@ from typing import Any, Dict, List, Optional
 
 import yfinance as yf
 
-from core.utils.symbol_mapper import is_overseas_symbol
+from core.utils.symbol_mapper import is_known_etf, is_overseas_symbol
 
 logger = logging.getLogger(__name__)
+
+# yfinance 내부의 HTTP 404 및 quoteSummary 스크래핑 파싱 에러 노이즈 로그를 억제
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
 def fetch_analyst_targets(ticker: str) -> Dict[str, Any]:
@@ -62,9 +65,20 @@ def fetch_upgrades_downgrades(ticker: str, max_items: int = 5) -> List[Dict[str,
     if not is_overseas_symbol(clean_ticker):
         return []
 
+    # ETF(대표지수/배당/테마/단일주식옵션인컴)는 월가 개별 애널리스트 투자의견 변동이 없으므로 조회 생략 (404 방지)
+    if is_known_etf(clean_ticker):
+        return []
+
     try:
         t = yf.Ticker(clean_ticker)
-        df = getattr(t, "upgrades_downgrades", None)
+        yf_logger = logging.getLogger("yfinance")
+        prev_level = yf_logger.level
+        try:
+            yf_logger.setLevel(logging.CRITICAL)
+            df = getattr(t, "upgrades_downgrades", None)
+        finally:
+            yf_logger.setLevel(prev_level)
+
         if df is None or df.empty:
             return []
 

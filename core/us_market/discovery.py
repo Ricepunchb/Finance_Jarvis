@@ -29,6 +29,7 @@ from core import db
 from core.fundamentals.overseas_consensus import fetch_overseas_consensus, fetch_overseas_research
 from core.us_market.client import get_us_consensus_and_news, get_us_daily_bars, get_us_quote
 from core.us_market.signals import compute_technical_signal, extract_indicator_snapshot
+from core.utils.symbol_mapper import is_known_etf
 
 logger = logging.getLogger(__name__)
 
@@ -262,10 +263,13 @@ async def _evaluate_single_us_candidate(
 
         reports = cons.get("researches")
         if not isinstance(reports, list):
-            try:
-                reports = await asyncio.to_thread(fetch_overseas_research, sym)
-            except Exception:
+            if universe_tag == "US_CORE_ETF" or is_known_etf(sym):
                 reports = []
+            else:
+                try:
+                    reports = await asyncio.to_thread(fetch_overseas_research, sym)
+                except Exception:
+                    reports = []
         if not isinstance(reports, list):
             reports = []
 

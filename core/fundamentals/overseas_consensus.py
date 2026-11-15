@@ -14,6 +14,7 @@ import requests
 
 from core.fundamentals import yfinance_client
 from core.utils import symbol_mapper
+from core.utils.symbol_mapper import is_known_etf
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +76,16 @@ def fetch_overseas_consensus(ticker: str, exchange: Optional[str] = None) -> Dic
     pbr = _to_float(total_infos.get("pbr"))
 
     # 3. 네이버 컨센서스 데이터가 부족하면 yfinance로 폴백 보강
-    if target_mean is None or last_close is None:
+    # (단, ETF는 개별 기업 목표주가 컨센서스가 없으므로 target_mean 폴백을 건너뛰고 종가 누락 시에만 조회)
+    is_etf = is_known_etf(clean_ticker)
+    should_fallback_yf = (not is_etf and target_mean is None) or (last_close is None)
+
+    if should_fallback_yf:
         yf_data = yfinance_client.fetch_analyst_targets(clean_ticker)
         if yf_data:
-            if target_mean is None:
+            if target_mean is None and not is_etf:
                 target_mean = yf_data.get("target_price_mean")
-            if recomm_mean is None:
+            if recomm_mean is None and not is_etf:
                 recomm_mean = yf_data.get("recomm_mean")
             if last_close is None:
                 last_close = yf_data.get("last_close")
@@ -88,9 +93,9 @@ def fetch_overseas_consensus(ticker: str, exchange: Optional[str] = None) -> Dic
                 w52_high = yf_data.get("w52_high")
             if w52_low is None:
                 w52_low = yf_data.get("w52_low")
-            if per is None:
+            if per is None and not is_etf:
                 per = yf_data.get("per")
-            if pbr is None:
+            if pbr is None and not is_etf:
                 pbr = yf_data.get("pbr")
 
     researches = fetch_overseas_research(clean_ticker, exchange)
@@ -111,6 +116,34 @@ def fetch_overseas_consensus(ticker: str, exchange: Optional[str] = None) -> Dic
 def fetch_overseas_research(ticker: str, exchange: Optional[str] = None) -> List[Dict[str, Any]]:
     """해외 종목 리포트 목록(네이버 모닝스타 리포트 및 yfinance 등급변동 이력)을 수집한다."""
     clean_ticker = ticker.strip().upper()
+    if not symbol_mapper.is_overseas_symbol(clean_ticker):
+        return []
+
+    # ETF(지수/배당/테마/단일종목) 처리:
+    if is_known_etf(clean_ticker):
+        # 1. 단일 기초자산 ETF (예: TSLW -> TSLA, NVDY -> NVDA)
+        # 기초자산 원본 기업의 리서치를 대신 프록시 조회하여 제공
+        try:
+            from core.news.etf_mapper import resolve_etf_profile_sync
+            profile = resolve_etf_profile_sync(clean_ticker)
+            if profile and profile.get("type") == "SINGLE_STOCK" and profile.get("underlying"):
+                underlying = profile["underlying"].strip().upper()
+                if underlying != clean_ticker:
+                    underlying_reports = fetch_overseas_research(underlying, exchange=None)
+                    proxied_reports = []
+                    for r in underlying_reports:
+                        r_copy = dict(r)
+                        r_copy["symbol"] = clean_ticker
+                        r_copy["title"] = f"[{clean_ticker} 기초자산 {underlying}] {r.get('title', '')}"
+                        proxied_reports.append(r_copy)
+                    return proxied_reports
+        except Exception as e:
+            logger.debug(f"ETF 단일종목 프록시 리서치 조회 실패 ({clean_ticker}): {e}")
+
+        # 2. 광범위 지수/배당/테마 ETF (SCHD, VOO, QQQ, GLD, SGOV 등)
+        # ETF는 개별 기업 리서치 리포트 및 애널리스트 등급 변동(Upgrades/Downgrades)이 존재하지 않으므로 즉시 빈 목록 반환 (404 방지)
+        return []
+
     reuters_code = symbol_mapper.ticker_to_reuters_code(clean_ticker, exchange)
 
     reports: List[Dict[str, Any]] = []

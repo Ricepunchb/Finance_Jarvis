@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+from core.utils.symbol_mapper import KNOWN_INDEX_ETFS, is_known_etf
+
 logger = logging.getLogger(__name__)
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -318,17 +320,12 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
                     is_etf_proxy = True
                     is_thematic = True
 
-        KNOWN_INDEX_ETFS = {
-            "VOO", "SPY", "QQQ", "SCHD", "SGOV", "SHV", "BIL", "GLD", "IAU",
-            "TLT", "IEF", "BND", "AGG", "TSLW", "IVV", "VTI"
-        }
-
         # 단일 종목 / SINGLE_STOCK인 경우
         if not is_thematic:
             target_sym = target_symbols[0]
             t = yf.Ticker(target_sym)
             info = {}
-            if target_sym not in KNOWN_INDEX_ETFS:
+            if not is_known_etf(target_sym):
                 try:
                     info = t.info or {}
                 except Exception:
@@ -398,7 +395,7 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
             try:
                 t = yf.Ticker(anchor)
                 info = {}
-                if anchor not in KNOWN_INDEX_ETFS:
+                if not is_known_etf(anchor):
                     try:
                         info = t.info or {}
                     except Exception:
@@ -452,7 +449,7 @@ def _fetch_consensus_and_news_sync(symbol: str) -> Dict[str, Any]:
 
         # 대표 1위 앵커의 목표가
         first_info = {}
-        if target_symbols and target_symbols[0] not in KNOWN_INDEX_ETFS:
+        if target_symbols and not is_known_etf(target_symbols[0]):
             try:
                 first_t = yf.Ticker(target_symbols[0])
                 first_info = first_t.info or {}

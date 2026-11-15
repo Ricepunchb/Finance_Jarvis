@@ -55,6 +55,28 @@ _INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 
 _KRX_SHORT_CODE_RE = re.compile(r"^[0-9][A-Z0-9]{5}$", re.IGNORECASE)
 
+# 주요 대표 지수/채권/섹터/단일종목 ETF 목록 (개별 애널리스트 리서치 및 upgrades/downgrades 부재 종목)
+KNOWN_INDEX_ETFS = {
+    "VOO", "SPY", "QQQ", "SCHD", "SGOV", "SHV", "BIL", "GLD", "IAU",
+    "TLT", "IEF", "BND", "AGG", "TSLW", "IVV", "VTI", "SOXL", "SOXS",
+    "TQQQ", "SQQQ", "XLK", "XLI", "XLV", "XLF", "XLC", "XLY", "XLU", "XLP"
+}
+
+
+def is_known_etf(symbol: str) -> bool:
+    """해당 티커가 ETF(대표지수/배당/테마/단일주식옵션인컴 등)인지 판별한다."""
+    if not symbol:
+        return False
+    clean = symbol.strip().upper()
+    if clean in KNOWN_INDEX_ETFS:
+        return True
+    try:
+        from core.news.etf_mapper import load_etf_map
+        return clean in load_etf_map()
+    except Exception:
+        return False
+
+
 
 def is_overseas_symbol(symbol: str) -> bool:
     """국내 단축 종목코드(숫자로 시작하는 6자리 영숫자, 예: 005930, 0193M0, 0040X0)가 아닌 해외 티커인지 판정."""

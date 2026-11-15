@@ -45,6 +45,8 @@ if not logging.getLogger().handlers:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+# yfinance 내부의 404 HTTPError 및 quoteSummary 스크래핑 파싱 에러 노이즈 로그를 억제
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 # create_task 결과를 참조로 붙잡아 두지 않으면 실행 도중 GC될 수 있다
 _discovery_refresh_task: Optional[asyncio.Task] = None
