@@ -81,6 +81,7 @@ class BacktestEngine:
         require_uptrend_for_onboarding: bool = settings.REQUIRE_UPTREND_FOR_ONBOARDING,
         require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY,
         allow_expensive_stock_single_share: bool = True,
+        strategy_mode: str = "auto",
     ):
         self.symbols = symbols
         self.data = data_by_symbol
@@ -97,6 +98,7 @@ class BacktestEngine:
         self.require_uptrend_for_onboarding = require_uptrend_for_onboarding
         self.require_sma20_for_buy = require_sma20_for_buy
         self.allow_expensive_stock_single_share = allow_expensive_stock_single_share
+        self.strategy_mode = (strategy_mode or "auto").strip().lower()
 
         # 균등 비중 기본값
         if target_weights is None or not target_weights:
@@ -115,6 +117,23 @@ class BacktestEngine:
         self.last_sl_date: Dict[str, str] = {}
 
     def run(self, start_date: str, end_date: str) -> BacktestResult:
+        effective_mode = self.strategy_mode
+        if effective_mode == "auto":
+            from core.backtest.us_strategy import is_us_portfolio
+            effective_mode = "us_adaptive" if is_us_portfolio(self.symbols) else "kr_swing"
+
+        if effective_mode == "us_adaptive":
+            from core.backtest.us_strategy import run_us_adaptive_backtest
+            return run_us_adaptive_backtest(
+                symbols=self.symbols,
+                data_by_symbol=self.data,
+                start_date=start_date,
+                end_date=end_date,
+                initial_cash=self.initial_cash,
+                fee_rate=self.fee_rate,
+                slippage_pct=self.slippage_pct,
+            )
+
         # 거래일 집합 생성 (지표 콜드스타트 이후 구간 대상)
         all_dates = set()
         for df in self.data.values():

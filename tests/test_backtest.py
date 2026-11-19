@@ -373,3 +373,60 @@ def test_runner_overseas_symbols_and_benchmark(monkeypatch):
         await conn.close()
 
     asyncio.run(run())
+
+
+def test_us_adaptive_strategy_4x1y_and_4x6m_all_win_and_sortino_above_1_9():
+    """미국장 전용 국면 적응형 듀얼 소티노 전략이 1년 독립 윈도우 4개 및 6개월 독립 윈도우 4개
+    전 구간에서 QQQ 벤치마크를 이기고, 모든 윈도우에서 소티노 지수(Sortino) >= 1.9를 달성하는지 검증."""
+    from pathlib import Path
+    import aiosqlite
+
+    db_path = Path("data/jarvis_meritz.db")
+    if not db_path.exists():
+        pytest.skip("data/jarvis_meritz.db not present")
+
+    windows_1y = [
+        ("1Y-W1", "2022-11-20", "2023-11-19"),
+        ("1Y-W2", "2023-11-20", "2024-11-19"),
+        ("1Y-W3", "2024-11-20", "2025-11-19"),
+        ("1Y-W4", "2025-11-20", "2026-11-19"),
+    ]
+    windows_6m = [
+        ("6M-W1", "2024-11-20", "2025-05-19"),
+        ("6M-W2", "2025-05-20", "2025-11-19"),
+        ("6M-W3", "2025-11-20", "2026-05-23"),
+        ("6M-W4", "2026-05-24", "2026-11-19"),
+    ]
+    universe = ["NVDA", "TSLW", "SCHD", "VOO", "SGOV", "PLTW", "GLD", "GOOG"]
+
+    async def run():
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        try:
+            runner = BacktestRunner(conn, client=None)
+            for label, s_date, e_date in windows_1y + windows_6m:
+                cfg = BacktestConfig(
+                    symbols=universe,
+                    start_date=s_date,
+                    end_date=e_date,
+                    initial_cash=10_000_000.0,
+                    benchmark_symbol="QQQ",
+                    strategy_mode="us_adaptive",
+                )
+                out = await runner.run(cfg)
+                strat = out["metrics"]["strategy"]
+                bench = out["metrics"]["benchmark"]
+                rel = out["metrics"]["relative"]
+
+                assert strat["total_return_pct"] > bench["benchmark_return_pct"], (
+                    f"{label} failed to beat QQQ: {strat['total_return_pct']}% vs {bench['benchmark_return_pct']}%"
+                )
+                assert rel["excess_return_pct"] > 0.0, f"{label} excess return <= 0"
+                assert strat["sortino"] >= 1.9, (
+                    f"{label} Sortino below 1.9: got {strat['sortino']}"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+

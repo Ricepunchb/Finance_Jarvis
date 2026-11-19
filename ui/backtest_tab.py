@@ -31,11 +31,11 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             from core.profile_manager import get_active_profile
             active_prof = get_active_profile().lower()
             is_meritz = (active_prof == "meritz")
-            default_symbols = "NVDA,TSLW,SPCX,SCHD,VOO,SGOV,PLTW,GLD" if is_meritz else "005930,000660"
+            default_symbols = "NVDA,TSLW,SCHD,VOO,SGOV,PLTW,GLD,GOOG" if is_meritz else "005930,000660"
             symbols_input = st.text_input(
                 "테스트 대상 종목코드 (쉼표 구분)",
                 value=default_symbols,
-                help="예: NVDA,TSLW,SPCX,SCHD,VOO,SGOV,PLTW,GLD 또는 005930,000660",
+                help="예: NVDA,TSLW,SCHD,VOO,SGOV,PLTW,GLD,GOOG 또는 005930,000660",
             )
         with col_bench:
             default_bench = "QQQ" if is_meritz else "360750"
@@ -111,16 +111,27 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
                 help="신규/저비중 종목 편입 시 목표비중 분할 매수 일수 (기본 3일)",
             )
 
-        col_f1, col_f2 = st.columns(2)
+        col_f1, col_f2, col_f3 = st.columns([1.4, 1.3, 1.3])
         with col_f1:
+            strategy_choice = st.selectbox(
+                "전략 엔진 모드",
+                [
+                    "자동 감지 (미국장: Dual-Sortino / 국내장: 스윙)",
+                    "미국장 전용 (Regime-Adaptive Dual-Sortino)",
+                    "국내장 전용 (KRX 스윙 & 손절)",
+                ],
+                index=0,
+                help="미국장 종목은 하방 반편차(Downside Risk) 기반 롤링 소티노 및 시장 브레드스 국면 적응형 전략을 사용합니다.",
+            )
+        with col_f2:
             require_uptrend = st.checkbox(
-                "중기 상승 추세 필터 (SMA20 >= SMA60 시에만 온보딩)",
+                "중기 상승 추세 필터 (SMA20 >= SMA60)",
                 value=True,
                 help="하락 추세 종목의 기계적 물타기를 차단하고 상승 추세 종목에만 자본을 배분합니다.",
             )
-        with col_f2:
+        with col_f3:
             require_sma20 = st.checkbox(
-                "단기 이평선 필터 (현재가 >= SMA20 시에만 매수)",
+                "단기 이평선 필터 (현재가 >= SMA20)",
                 value=True,
                 help="단기 급락 중인 종목의 칼날잡기를 차단합니다.",
             )
@@ -132,6 +143,13 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
         if not symbols_list:
             st.error("테스트 대상 종목을 최소 1개 이상 입력해주세요.")
             return
+
+        if strategy_choice.startswith("미국장"):
+            strat_mode = "us_adaptive"
+        elif strategy_choice.startswith("국내장"):
+            strat_mode = "kr_swing"
+        else:
+            strat_mode = "auto"
 
         payload = {
             "symbols": symbols_list,
@@ -147,6 +165,7 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
             "onboarding_days": int(onboard_days),
             "require_uptrend_for_onboarding": bool(require_uptrend),
             "require_sma20_for_buy": bool(require_sma20),
+            "strategy_mode": strat_mode,
         }
 
         with st.spinner("과거 데이터 수집 및 퀀트 백테스트 시뮬레이션 중..."):
@@ -213,15 +232,21 @@ def render(names: Optional[Dict[str, str]] = None) -> None:
         delta=f"{strat_sharpe - bench_sharpe:+.2f} vs S&P 500 ({bench_sharpe:.2f})",
     )
 
-    sub_col1, sub_col2, sub_col3, sub_col4 = st.columns(4)
+    sub_col1, sub_col2, sub_col3, sub_col4, sub_col5 = st.columns(5)
+    strat_sortino = float(strat.get("sortino", 0.0))
+    sub_col1.metric(
+        "소티노 지수 (Sortino)",
+        f"{strat_sortino:.2f}",
+        delta="목표 달성 (>= 1.9)" if strat_sortino >= 1.9 else f"{strat_sortino - 1.9:+.2f} vs 1.9",
+    )
     beta_val = rel.get("beta")
-    sub_col1.metric("베타 (Beta vs S&P 500)", f"{beta_val:.2f}" if beta_val is not None else "N/A")
+    sub_col2.metric("베타 (Beta vs S&P 500)", f"{beta_val:.2f}" if beta_val is not None else "N/A")
     alpha_val = rel.get("alpha_pct")
-    sub_col2.metric("젠센의 알파 (Alpha)", f"{alpha_val:+.2f}%" if alpha_val is not None else "N/A")
+    sub_col3.metric("젠센의 알파 (Alpha)", f"{alpha_val:+.2f}%" if alpha_val is not None else "N/A")
     win_rate = trades.get("win_rate_pct", 0.0)
-    sub_col3.metric("매매 승률 (Win Rate)", f"{win_rate:.1f}%", f"{trades.get('win_count', 0)}승 / {trades.get('loss_count', 0)}패")
+    sub_col4.metric("매매 승률 (Win Rate)", f"{win_rate:.1f}%", f"{trades.get('win_count', 0)}승 / {trades.get('loss_count', 0)}패")
     profit_factor = trades.get("profit_factor", 0.0)
-    sub_col4.metric("손익비 (Profit Factor)", f"{profit_factor:.2f}")
+    sub_col5.metric("손익비 (Profit Factor)", f"{profit_factor:.2f}")
 
     # 리스크 및 안전장치 통계
     st.markdown(

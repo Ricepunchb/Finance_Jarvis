@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -212,9 +213,174 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
     else:
         st.info("현재 등록된 미국장 포트폴리오 종목이 없습니다.")
 
+    # 3. 계좌 포트폴리오 종목 수동 편입 & 제외 (모니터링 워치리스트와 독립 관리, 테이블 바로 아래 기본 펼침)
+    with st.expander("➕ 미국장 계좌 포트폴리오 종목 수동 편입 & 제외", expanded=True):
+        st.caption(
+            "실제 계좌의 자산배분 및 자동 리밸런싱 대상 포트폴리오(`portfolio_symbols` & `active_target_weights`)에 "
+            "새로운 종목을 직접 편입하거나 제외합니다. (시그널 알림용 모니터링 워치리스트와는 독립적으로 관리됩니다.)"
+        )
+        col_add_p, col_del_p = st.columns([3, 2])
+
+        with col_add_p:
+            with st.form(f"{key_prefix}_add_portfolio_sym_form", clear_on_submit=True):
+                st.markdown("###### ➕ 신규 종목 수동 편입")
+                pa1, pa2, pa3 = st.columns([1.4, 1.3, 1.3])
+                new_p_sym = pa1.text_input(
+                    "미국 티커 심볼",
+                    placeholder="예: ANT, AAPL, MSFT",
+                ).strip().upper()
+                exch_choice = pa2.selectbox(
+                    "거래소",
+                    ["자동 감지 (기본 NASD)", "NASD (나스닥)", "NYSE (뉴욕)", "AMEX (아멕스/ETF)"],
+                )
+                new_p_weight_pct = pa3.number_input(
+                    "배정할 목표 비중 (%)",
+                    min_value=0.5,
+                    max_value=100.0,
+                    value=5.0,
+                    step=0.5,
+                )
+                auto_norm_add = st.checkbox(
+                    "⚖️ 기존 편입 종목들의 비중을 자동 비례 조정하여 총합 100% 유지",
+                    value=True,
+                )
+                add_p_submitted = st.form_submit_button(
+                    "➕ 계좌 포트폴리오에 종목 편입",
+                    type="primary",
+                    width="stretch",
+                )
+                if add_p_submitted:
+                    if not new_p_sym:
+                        st.error("편입할 미국 주식 티커 심볼을 입력하세요.")
+                    else:
+                        exch_code = None
+                        if exch_choice.startswith("NASD"):
+                            exch_code = "NASD"
+                        elif exch_choice.startswith("NYSE"):
+                            exch_code = "NYSE"
+                        elif exch_choice.startswith("AMEX"):
+                            exch_code = "AMEX"
+                        res = api_post(
+                            "/us-market/rebalance/symbols",
+                            {
+                                "symbol": new_p_sym,
+                                "target_weight": round(new_p_weight_pct / 100.0, 4),
+                                "exchange": exch_code,
+                                "auto_normalize": auto_norm_add,
+                            },
+                        )
+                        if res and res.get("status") == "ok":
+                            applied_w = float(res.get("target_weight", new_p_weight_pct / 100.0)) * 100
+                            st.success(
+                                f"✅ '{new_p_sym}' ({res.get('exchange', 'NASD')}) 종목이 목표 비중 {applied_w:.1f}%로 계좌 포트폴리오에 편입되었습니다!"
+                            )
+                            time.sleep(0.8)
+                            st.rerun()
+
+        with col_del_p:
+            st.markdown("###### 🗑️ 편입 종목 수동 제외")
+            managed_syms = [
+                p["symbol"] for p in pos_list if float(p.get("target_weight") or 0.0) > 0
+            ]
+            if managed_syms:
+                sym_to_remove = st.selectbox(
+                    "포트폴리오에서 제외할 종목",
+                    managed_syms,
+                    key=f"{key_prefix}_remove_p_sym_sel",
+                )
+                auto_norm_del = st.checkbox(
+                    "⚖️ 제외 후 남은 종목들의 비중을 100%로 자동 재정규화",
+                    value=True,
+                    key=f"{key_prefix}_remove_p_auto_norm",
+                )
+                st.caption("포트폴리오 목표 비중에서 제외합니다 (즉시 시장가 강제 매도하지 않음).")
+                if st.button(
+                    "🗑️ 선택 종목 포트폴리오 제외",
+                    width="stretch",
+                    key=f"{key_prefix}_remove_p_sym_btn",
+                ):
+                    encoded_sym = urllib.parse.quote(sym_to_remove, safe="")
+                    norm_q = "true" if auto_norm_del else "false"
+                    res = api_delete(
+                        f"/us-market/rebalance/symbols/{encoded_sym}?auto_normalize={norm_q}"
+                    )
+                    if res and res.get("status") == "removed":
+                        st.success(f"✅ '{sym_to_remove}' 종목이 계좌 포트폴리오에서 제외되었습니다.")
+                        time.sleep(0.8)
+                        st.rerun()
+            else:
+                st.caption("현재 목표 비중이 설정된 포트폴리오 종목이 없습니다.")
+
+    # 4. 목표 비중 편집기
+    with st.expander("⚙️ 미국장 포트폴리오 목표 비중(Target Weights) 일괄 편집", expanded=False):
+        st.caption("각 종목의 목표 비중을 백분율(%)로 입력하세요. 총합이 100%여야 의도한 비율대로 리밸런싱 계획이 수립됩니다.")
+        cur_targets = {p["symbol"]: round(p["target_weight"] * 100, 1) for p in pos_list}
+        w_inputs = {}
+
+        c_w1, c_w2 = st.columns(2)
+        for idx, (sym, def_w) in enumerate(cur_targets.items()):
+            target_col = c_w1 if idx % 2 == 0 else c_w2
+            with target_col:
+                w_inputs[sym] = st.number_input(
+                    f"{sym} 목표 비중 (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(def_w),
+                    step=1.0,
+                    key=f"{key_prefix}_target_w_{sym}",
+                )
+
+        current_sum = sum(w_inputs.values())
+        diff = round(current_sum - 100.0, 1)
+
+        if abs(diff) < 0.05:
+            st.success(f"📊 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 정상 일치 ✅)")
+        elif diff > 0:
+            st.warning(
+                f"⚠️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **+{diff:.1f}%p 초과**)<br>"
+                f"합계가 100%를 초과하면 계획 수립 시 100%로 임시 정규화되거나 초과 매수가 추천될 수 있습니다. "
+                f"아래 **[⚖️ 100% 자동 비례 정규화]** 버튼을 눌러 100%로 맞추거나 직접 수치를 조정하세요.",
+                icon="⚠️",
+            )
+        else:
+            st.info(
+                f"ℹ️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **{-diff:.1f}%p 미달**)<br>"
+                f"잔여 {abs(diff):.1f}%는 현금(USD)으로 유지하거나 다른 종목에 배분할 수 있습니다.",
+                icon="ℹ️",
+            )
+
+        btn_w1, btn_w2 = st.columns(2)
+        with btn_w1:
+            if st.button("⚖️ 100% 자동 비례 정규화", width="stretch", key=f"{key_prefix}_auto_norm_btn"):
+                if current_sum <= 0:
+                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+                else:
+                    norm_weights = {k: round(v / current_sum, 4) for k, v in w_inputs.items()}
+                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
+                    if res and res.get("status") == "ok":
+                        st.success(f"✅ 입력 합계 {current_sum:.1f}%를 100.0%로 비례 정규화하여 저장했습니다!")
+                        time.sleep(1)
+                        st.rerun()
+
+        with btn_w2:
+            if st.button("💾 목표 비중 저장 및 적용", type="primary", width="stretch", key=f"{key_prefix}_save_weights_btn"):
+                total_w = sum(w_inputs.values())
+                if total_w <= 0:
+                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
+                else:
+                    norm_weights = {k: round(v / total_w, 4) for k, v in w_inputs.items()}
+                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
+                    if res and res.get("status") == "ok":
+                        if abs(diff) >= 0.1:
+                            st.info(f"💡 입력 합계({total_w:.1f}%)를 100.0%로 비례 정규화하여 저장했습니다.")
+                        else:
+                            st.success("✅ 미국장 목표 비중이 성공적으로 저장되었습니다!")
+                        time.sleep(1)
+                        st.rerun()
+
     st.divider()
 
-    # 3. 리밸런싱 실행 및 텔레그램 연동 제어
+    # 5. 리밸런싱 실행 및 텔레그램 연동 제어
     st.markdown("##### ⚡ 스마트 리밸런싱 진단 & 실행 제어")
     col_act1, col_act2, col_act3 = st.columns([1.5, 1.5, 2])
 
@@ -304,73 +470,6 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
         )
     else:
         st.info("현재 모든 종목이 목표 비중 허용 오차(±5%p) 이내이며, 추가 리밸런싱이 필요하지 않습니다.")
-
-    # 4. 목표 비중 편집기
-    with st.expander("⚙️ 미국장 포트폴리오 목표 비중(Target Weights) 편집", expanded=False):
-        st.caption("각 종목의 목표 비중을 백분율(%)로 입력하세요. 총합이 100%여야 의도한 비율대로 리밸런싱 계획이 수립됩니다.")
-        cur_targets = {p["symbol"]: round(p["target_weight"] * 100, 1) for p in pos_list}
-        w_inputs = {}
-
-        c_w1, c_w2 = st.columns(2)
-        for idx, (sym, def_w) in enumerate(cur_targets.items()):
-            target_col = c_w1 if idx % 2 == 0 else c_w2
-            with target_col:
-                w_inputs[sym] = st.number_input(
-                    f"{sym} 목표 비중 (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(def_w),
-                    step=1.0,
-                    key=f"{key_prefix}_target_w_{sym}",
-                )
-
-        current_sum = sum(w_inputs.values())
-        diff = round(current_sum - 100.0, 1)
-
-        if abs(diff) < 0.05:
-            st.success(f"📊 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 정상 일치 ✅)")
-        elif diff > 0:
-            st.warning(
-                f"⚠️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **+{diff:.1f}%p 초과**)<br>"
-                f"합계가 100%를 초과하면 계획 수립 시 100%로 임시 정규화되거나 초과 매수가 추천될 수 있습니다. "
-                f"아래 **[⚖️ 100% 자동 비례 정규화]** 버튼을 눌러 100%로 맞추거나 직접 수치를 조정하세요.",
-                icon="⚠️",
-            )
-        else:
-            st.info(
-                f"ℹ️ 입력된 목표 비중 합계: **{current_sum:.1f}%** (100% 대비 **{-diff:.1f}%p 미달**)<br>"
-                f"잔여 {abs(diff):.1f}%는 현금(USD)으로 유지하거나 다른 종목에 배분할 수 있습니다.",
-                icon="ℹ️",
-            )
-
-        btn_w1, btn_w2 = st.columns(2)
-        with btn_w1:
-            if st.button("⚖️ 100% 자동 비례 정규화", width="stretch", key=f"{key_prefix}_auto_norm_btn"):
-                if current_sum <= 0:
-                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
-                else:
-                    norm_weights = {k: round(v / current_sum, 4) for k, v in w_inputs.items()}
-                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
-                    if res and res.get("status") == "ok":
-                        st.success(f"✅ 입력 합계 {current_sum:.1f}%를 100.0%로 비례 정규화하여 저장했습니다!")
-                        time.sleep(1)
-                        st.rerun()
-
-        with btn_w2:
-            if st.button("💾 목표 비중 저장 및 적용", type="primary", width="stretch", key=f"{key_prefix}_save_weights_btn"):
-                total_w = sum(w_inputs.values())
-                if total_w <= 0:
-                    st.error("최소 1개 이상의 종목 비중이 0보다 커야 합니다.")
-                else:
-                    norm_weights = {k: round(v / total_w, 4) for k, v in w_inputs.items()}
-                    res = api_post("/us-market/rebalance/weights", {"weights": norm_weights})
-                    if res and res.get("status") == "ok":
-                        if abs(diff) >= 0.1:
-                            st.info(f"💡 입력 합계({total_w:.1f}%)를 100.0%로 비례 정규화하여 저장했습니다.")
-                        else:
-                            st.success("✅ 미국장 목표 비중이 성공적으로 저장되었습니다!")
-                        time.sleep(1)
-                        st.rerun()
 
 
 # =========================================================================
@@ -790,9 +889,14 @@ def render_us_signals_board_section(key_prefix: str = "us_board") -> None:
 # 4. 💼 관심 & 모니터링 종목 관리 컴포넌트
 # =========================================================================
 def render_us_watchlist_manage_section(key_prefix: str = "us_manage") -> None:
-    """미국장 모니터링 종목 추가, 원클릭 프리셋, 목표 비중 및 손절/익절 평단가 설정."""
-    st.subheader("💼 모니터링 종목 & 보유 포지션 등록")
-    st.caption("관심 종목을 등록하거나, 실제 보유 중인 평단가($)와 수량을 입력하여 손절·익절 감시를 켜세요.")
+    """미국장 모니터링 종목 추가, 원클릭 프리셋 및 손절/익절 감시 평단가 설정."""
+    st.subheader("💼 30분 시그널 모니터링 & 알림 종목 관리")
+    st.caption("텔레그램 시그널 알림을 받을 관심 종목을 등록하거나, 보유 평단가($)를 입력하여 손절·익절 감시를 켜세요.")
+    st.info(
+        "💡 **관심사 분리 안내**: 이 탭은 **텔레그램 시그널 알림을 받을 모니터링 종목(`us_watchlist`)** 전용 공간입니다. "
+        "실제 계좌의 자산배분 포트폴리오 종목 수동 편입·제외 및 목표 비중 관리는 **[⚖️ 자산배분 & 자동 리밸런싱]** 탭의 "
+        "**[➕ 미국장 계좌 포트폴리오 종목 수동 편입 & 제외]**에서 독립적으로 관리됩니다."
+    )
 
     # 원클릭 프리셋 버튼
     st.markdown("##### 🚀 원클릭 테마 프리셋 일괄 추가")
@@ -826,20 +930,19 @@ def render_us_watchlist_manage_section(key_prefix: str = "us_manage") -> None:
 
     # 개별 종목 수동 등록 / 수정 폼
     with st.form(f"{key_prefix}_add_us_symbol_form", clear_on_submit=True):
-        st.markdown("##### ➕ 개별 종목 추가 / 보유 정보 설정")
+        st.markdown("##### ➕ 시그널 모니터링 종목 추가 / 손절·익절 감시 평단가 설정")
         f1, f2 = st.columns(2)
         sym_input = f1.text_input("미국 티커 (예: AAPL, NVDA, TSLA, PLTR 등)", placeholder="티커 심볼 입력").strip().upper()
         name_input = f2.text_input("종목명 (선택, 비워두면 자동 조회)", placeholder="예: Apple Inc.")
 
-        f3, f4, f5 = st.columns(3)
+        f3, f4 = st.columns(2)
         avg_price_input = f3.number_input("내 매수 평단가 ($) (미보유 시 0)", min_value=0.0, step=0.1, value=0.0, help="입력 시 손절(-6%) 및 트레일링 익절 알림이 활성화됩니다.")
         held_qty_input = f4.number_input("보유 수량 (주) (미보유 시 0)", min_value=0.0, step=1.0, value=0.0)
-        weight_input = f5.number_input("목표 비중 (%) (선택)", min_value=0.0, max_value=100.0, step=1.0, value=0.0)
 
         notes_input = st.text_input("메모 / 투자 아이디어 (선택)", placeholder="예: 30분봉 눌림목 반등 시 분할 매수 예정")
         alert_toggle_input = st.checkbox("이 종목의 시그널 텔레그램 푸시 알림 받기", value=True)
 
-        submitted = st.form_submit_button("💾 종목 저장 / 등록", type="primary", width="stretch")
+        submitted = st.form_submit_button("💾 모니터링 종목 저장 / 등록", type="primary", width="stretch")
         if submitted:
             if not sym_input:
                 st.error("티커 심볼을 입력하세요.")
@@ -849,19 +952,18 @@ def render_us_watchlist_manage_section(key_prefix: str = "us_manage") -> None:
                     "name": name_input or None,
                     "avg_entry_price": avg_price_input if avg_price_input > 0 else None,
                     "held_qty": held_qty_input if held_qty_input > 0 else 0.0,
-                    "target_weight": (weight_input / 100.0) if weight_input > 0 else None,
                     "alert_enabled": 1 if alert_toggle_input else 0,
                     "notes": notes_input or "",
                 }
                 res = api_post("/us-market/watchlist", payload)
                 if res and res.get("status") == "ok":
-                    st.success(f"'{sym_input}' 종목이 모니터링 목록에 저장되었습니다.")
+                    st.success(f"'{sym_input}' 종목이 시그널 모니터링 목록에 저장되었습니다.")
                     st.rerun()
 
     st.divider()
 
     # 등록된 종목 목록 테이블 및 삭제 제어
-    st.markdown("##### 📋 현재 등록된 모니터링 종목 목록")
+    st.markdown("##### 📋 현재 등록된 시그널 모니터링 종목 목록")
     current_list = api_get("/us-market/watchlist", timeout=10) or []
     if current_list:
         rows_to_render = []
@@ -872,7 +974,6 @@ def render_us_watchlist_manage_section(key_prefix: str = "us_manage") -> None:
                 "섹터": it.get("sector") or "-",
                 "내 평단가": f"${it['avg_entry_price']:,.2f}" if it.get("avg_entry_price") else "-",
                 "보유 수량": f"{it.get('held_qty', 0):.1f}주" if it.get("held_qty") else "-",
-                "목표 비중": f"{it['target_weight']*100:.1f}%" if it.get("target_weight") else "-",
                 "알림": "🔔 ON" if it.get("alert_enabled", 1) else "🔕 OFF",
                 "메모": it.get("notes") or "",
             })

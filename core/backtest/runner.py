@@ -35,6 +35,7 @@ class BacktestConfig(BaseModel):
     onboarding_days: int = getattr(settings, "ONBOARDING_DAYS", 3)
     require_uptrend_for_onboarding: bool = getattr(settings, "REQUIRE_UPTREND_FOR_ONBOARDING", True)
     require_sma20_for_buy: bool = getattr(settings, "REQUIRE_SMA20_FOR_BUY", True)
+    strategy_mode: str = "auto"
 
 
 class BacktestRunner:
@@ -86,6 +87,7 @@ class BacktestRunner:
             onboarding_days=config.onboarding_days,
             require_uptrend_for_onboarding=config.require_uptrend_for_onboarding,
             require_sma20_for_buy=config.require_sma20_for_buy,
+            strategy_mode=config.strategy_mode,
         )
         result: BacktestResult = engine.run(config.start_date, config.end_date)
 

@@ -708,6 +708,7 @@ class RunBacktestRequest(BaseModel):
     onboarding_days: int = getattr(settings, "ONBOARDING_DAYS", 3)
     require_uptrend_for_onboarding: bool = getattr(settings, "REQUIRE_UPTREND_FOR_ONBOARDING", True)
     require_sma20_for_buy: bool = getattr(settings, "REQUIRE_SMA20_FOR_BUY", True)
+    strategy_mode: str = "auto"
 
 
 @app.post("/backtest/run")
@@ -733,6 +734,7 @@ async def run_backtest_endpoint(req: RunBacktestRequest):
         onboarding_days=req.onboarding_days,
         require_uptrend_for_onboarding=req.require_uptrend_for_onboarding,
         require_sma20_for_buy=req.require_sma20_for_buy,
+        strategy_mode=req.strategy_mode,
     )
     conn = await db.get_connection()
     try:
@@ -1199,6 +1201,13 @@ class USWeightsUpdateRequest(BaseModel):
     weights: Dict[str, float]
 
 
+class USPortfolioSymbolAddRequest(BaseModel):
+    symbol: str
+    target_weight: float = 0.05
+    exchange: Optional[str] = None
+    auto_normalize: bool = True
+
+
 class USDiscoveryProposalRequest(BaseModel):
     max_new_additions: int = 2
     new_pick_weight_each: float = 0.08
@@ -1456,6 +1465,46 @@ async def update_us_weights_endpoint(req: USWeightsUpdateRequest):
             "raw_sum": round(raw_sum, 4),
             "was_normalized": was_norm,
         }
+    finally:
+        await conn.close()
+
+
+@app.post("/us-market/rebalance/symbols")
+async def add_us_portfolio_symbol_endpoint(req: USPortfolioSymbolAddRequest):
+    """미국장 실제 계좌 포트폴리오(portfolio_symbols & active_target_weights)에 종목을 수동 편입."""
+    from core.us_market.rebalance import add_us_portfolio_symbol
+    conn = await db.get_connection()
+    try:
+        try:
+            result = await add_us_portfolio_symbol(
+                conn,
+                symbol=req.symbol,
+                target_weight=req.target_weight,
+                exchange=req.exchange,
+                auto_normalize=req.auto_normalize,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        return {"status": "ok", **result}
+    finally:
+        await conn.close()
+
+
+@app.delete("/us-market/rebalance/symbols/{symbol}")
+async def remove_us_portfolio_symbol_endpoint(symbol: str, auto_normalize: bool = True):
+    """미국장 실제 계좌 포트폴리오에서 특정 종목을 수동 제외 및 선택적 100% 재정규화."""
+    from core.us_market.rebalance import remove_us_portfolio_symbol
+    conn = await db.get_connection()
+    try:
+        try:
+            result = await remove_us_portfolio_symbol(
+                conn, symbol=symbol, auto_normalize=auto_normalize
+            )
+        except LookupError as le:
+            raise HTTPException(status_code=404, detail=str(le))
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        return {"status": "removed", **result}
     finally:
         await conn.close()
 

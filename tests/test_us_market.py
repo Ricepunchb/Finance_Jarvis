@@ -1269,6 +1269,76 @@ def test_notify_news_surprise_cooldown(monkeypatch):
     asyncio.run(run())
 
 
+def test_add_and_remove_us_portfolio_symbol_separation_of_concerns(tmp_path, monkeypatch):
+    """계좌 포트폴리오 종목 수동 편입/제외 API가 us_watchlist와 분리되어 동작하고 100% 정규화 불변성을 유지하는지 검증."""
+    import asyncio
+    from core.config import settings
+
+    test_db = str(tmp_path / "test_us_portfolio_manual.db")
+    monkeypatch.setattr(settings, "DB_PATH", test_db)
+    monkeypatch.setattr(settings, "DOMESTIC_ONLY", False)
+    monkeypatch.setattr(settings, "BROKER", "meritz")
+
+    async def init():
+        await db.init_db()
+        conn = await db.get_connection()
+        try:
+            # 초기 포트폴리오 2종목 (VOO 60%, NVDA 40%) 세팅
+            from core.us_market.rebalance import add_us_portfolio_symbol
+            await add_us_portfolio_symbol(conn, "VOO", 0.6, exchange="AMEX", auto_normalize=False)
+            await add_us_portfolio_symbol(conn, "NVDA", 0.4, exchange="NASD", auto_normalize=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(init())
+
+    client = TestClient(app)
+
+    # 1. 신규 종목 ANT 수동 편입 (목표 비중 10%, 거래소 NYSE, 자동 100% 정규화)
+    r_add = client.post(
+        "/us-market/rebalance/symbols",
+        json={"symbol": "ant", "target_weight": 0.10, "exchange": "NYSE", "auto_normalize": True},
+    )
+    assert r_add.status_code == 200
+    body = r_add.json()
+    assert body["status"] == "ok"
+    assert body["symbol"] == "ANT"
+    assert body["exchange"] == "NYSE"
+    assert body["target_weight"] == 0.10
+    assert abs(body["total_weight"] - 1.0) < 1e-4
+    # 기존 VOO(60%), NVDA(40%)가 남은 90%를 6:4 비율(54%, 36%)로 나누어 가졌는지 확인
+    assert body["weights"]["VOO"] == 0.54
+    assert body["weights"]["NVDA"] == 0.36
+    assert body["weights"]["ANT"] == 0.10
+
+    # 2. 관심사 분리 검증: 계좌 포트폴리오 수동 편입이 시그널 모니터링(us_watchlist) 테이블을 오염시키지 않아야 함
+    r_wl = client.get("/us-market/watchlist")
+    assert r_wl.status_code == 200
+    assert r_wl.json() == []
+
+    # 3. 잘못된 티커(한글 포함) 요청 시 400 차단 검증
+    r_bad = client.post(
+        "/us-market/rebalance/symbols",
+        json={"symbol": "엔비디아", "target_weight": 0.10},
+    )
+    assert r_bad.status_code == 400
+
+    # 4. ANT 수동 제외 및 잔여 종목 100% 자동 재정규화 검증
+    r_del = client.delete("/us-market/rebalance/symbols/ANT?auto_normalize=true")
+    assert r_del.status_code == 200
+    del_body = r_del.json()
+    assert del_body["status"] == "removed"
+    assert "ANT" not in del_body["weights"]
+    assert abs(del_body["total_weight"] - 1.0) < 1e-4
+    assert del_body["weights"]["VOO"] == 0.60
+    assert del_body["weights"]["NVDA"] == 0.40
+
+    # 5. 미등록 종목 삭제 시도 시 404 반환 검증
+    r_del_404 = client.delete("/us-market/rebalance/symbols/NOTEXIST")
+    assert r_del_404.status_code == 404
+
+
+
 
 
 

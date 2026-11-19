@@ -199,7 +199,133 @@ async def set_us_target_weights(conn, weights: Dict[str, float]) -> Dict[str, fl
             conn, sym, w, proposed_by="user", rationale="미국장 포트폴리오 목표 비중 설정"
         )
         await db.decide_target_weight(conn, prop_id, approve=True)
-    return clean
+        if w <= 0:
+            await db.finish_symbol_removal(conn, sym)
+    return {k: v for k, v in clean.items() if v > 0}
+
+
+async def add_us_portfolio_symbol(
+    conn,
+    symbol: str,
+    target_weight: float,
+    exchange: Optional[str] = None,
+    auto_normalize: bool = True,
+) -> Dict[str, Any]:
+    """미국장 실제 계좌 포트폴리오(portfolio_symbols & active_target_weights)에 종목을 수동 편입한다.
+
+    모니터링 알림 전용 테이블(us_watchlist)과 관심사를 분리하여 계좌 포트폴리오 테이블만 독립적으로 갱신하며,
+    auto_normalize=True 시 기존 편입 종목들의 비중을 (1 - target_weight)로 비례 조정해 총합 100% 불변성을 보장한다.
+    """
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        raise ValueError("국내 전용 계좌에서는 미국장 포트폴리오에 종목을 편입할 수 없습니다.")
+
+    clean_sym = (symbol or "").strip().upper()
+    if not clean_sym or " " in clean_sym or any("\uac00" <= ch <= "\ud7a3" for ch in clean_sym):
+        raise ValueError("유효한 미국 주식 티커 심볼(영문/숫자, 예: AAPL, NVDA)을 입력하세요.")
+
+    w = float(target_weight)
+    if 1.0 < w <= 100.0:
+        w = w / 100.0
+    if w <= 0.0 or w > 1.0:
+        raise ValueError("목표 비중은 0% 초과 ~ 100%(0.0 초과 ~ 1.0) 이하여야 합니다.")
+
+    clean_exch = (exchange or "").strip().upper()
+    if clean_exch not in ("NASD", "NYSE", "AMEX"):
+        clean_exch = SYMBOL_EXCHANGE_MAP.get(clean_sym, "NASD")
+    SYMBOL_EXCHANGE_MAP[clean_sym] = clean_exch
+
+    current_weights = await get_us_target_weights(conn)
+    other_weights = {k: v for k, v in current_weights.items() if k != clean_sym and v > 0}
+
+    if auto_normalize and other_weights:
+        if w >= 1.0:
+            new_weights = {clean_sym: 1.0}
+        else:
+            rem_budget = round(1.0 - w, 4)
+            other_sum = sum(other_weights.values())
+            new_weights = {k: round(v / other_sum * rem_budget, 4) for k, v in other_weights.items()}
+            new_weights[clean_sym] = round(w, 4)
+            diff = round(1.0 - sum(new_weights.values()), 4)
+            if abs(diff) > 0:
+                anchor = max(other_weights, key=lambda k: new_weights.get(k, 0.0))
+                new_weights[anchor] = round(new_weights[anchor] + diff, 4)
+    else:
+        new_weights = {k: round(v, 4) for k, v in other_weights.items()}
+        new_weights[clean_sym] = round(w, 4)
+
+    await db.add_portfolio_symbol(conn, clean_sym, market="overseas", exchange=clean_exch)
+    for sym_k, weight_v in new_weights.items():
+        prop_id = await db.propose_target_weight(
+            conn, sym_k, weight_v, proposed_by="manual", rationale=f"미국장 포트폴리오 수동 편입 ({clean_sym})"
+        )
+        await db.decide_target_weight(conn, prop_id, approve=True)
+
+    if auto_normalize and w >= 1.0:
+        for old_sym in other_weights:
+            prop_id = await db.propose_target_weight(
+                conn, old_sym, 0.0, proposed_by="manual", rationale=f"{clean_sym} 100% 단독 편입에 따른 제외"
+            )
+            await db.decide_target_weight(conn, prop_id, approve=True)
+            await db.finish_symbol_removal(conn, old_sym)
+
+    return {
+        "symbol": clean_sym,
+        "exchange": clean_exch,
+        "target_weight": new_weights[clean_sym],
+        "weights": new_weights,
+        "total_weight": round(sum(new_weights.values()), 4),
+    }
+
+
+async def remove_us_portfolio_symbol(
+    conn,
+    symbol: str,
+    auto_normalize: bool = True,
+) -> Dict[str, Any]:
+    """미국장 실제 계좌 포트폴리오에서 특정 종목을 수동 제외하고, 선택적으로 잔여 종목 비중을 100%로 재정규화한다."""
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        raise ValueError("국내 전용 계좌에서는 미국장 포트폴리오를 수정할 수 없습니다.")
+
+    clean_sym = (symbol or "").strip().upper()
+    if not clean_sym:
+        raise ValueError("제외할 종목 티커를 입력하세요.")
+
+    current_weights = await get_us_target_weights(conn)
+    cur = await conn.execute("SELECT symbol FROM portfolio_symbols WHERE market = 'overseas' AND enabled = 1")
+    enabled_overseas = {r["symbol"].upper() for r in await cur.fetchall()}
+
+    if clean_sym not in current_weights and clean_sym not in enabled_overseas:
+        raise LookupError(f"계좌 포트폴리오에 등록된 종목이 아닙니다: {clean_sym}")
+
+    remaining = {k: v for k, v in current_weights.items() if k != clean_sym and v > 0}
+    if not remaining:
+        raise ValueError("포트폴리오에 최소 1개 이상의 목표 비중 종목이 남아있어야 합니다.")
+
+    prop_id = await db.propose_target_weight(
+        conn, clean_sym, 0.0, proposed_by="manual", rationale=f"미국장 포트폴리오 수동 제외 ({clean_sym})"
+    )
+    await db.decide_target_weight(conn, prop_id, approve=True)
+    await db.finish_symbol_removal(conn, clean_sym)
+
+    if auto_normalize:
+        rem_sum = sum(remaining.values())
+        if rem_sum > 0:
+            remaining = {k: round(v / rem_sum, 4) for k, v in remaining.items()}
+            diff = round(1.0 - sum(remaining.values()), 4)
+            if abs(diff) > 0:
+                anchor = max(remaining, key=lambda k: remaining[k])
+                remaining[anchor] = round(remaining[anchor] + diff, 4)
+            for sym_k, weight_v in remaining.items():
+                p_id = await db.propose_target_weight(
+                    conn, sym_k, weight_v, proposed_by="manual", rationale=f"{clean_sym} 제외 후 100% 재정규화"
+                )
+                await db.decide_target_weight(conn, p_id, approve=True)
+
+    return {
+        "symbol": clean_sym,
+        "weights": remaining,
+        "total_weight": round(sum(remaining.values()), 4),
+    }
 
 
 async def analyze_us_portfolio_drift(
@@ -324,6 +450,17 @@ async def analyze_us_portfolio_drift(
     inflow_detected_usd = max(0.0, available_usd - last_known_cash)
 
     # 5. 종목별 비중 및 드리프트 계산
+    db_exchanges: Dict[str, str] = {}
+    try:
+        cur_ex = await conn.execute(
+            "SELECT symbol, exchange FROM portfolio_symbols WHERE market = 'overseas' AND exchange IS NOT NULL"
+        )
+        for row_ex in await cur_ex.fetchall():
+            if row_ex["exchange"]:
+                db_exchanges[row_ex["symbol"].upper()] = str(row_ex["exchange"]).upper()
+    except Exception:
+        pass
+
     statuses: List[USPositionStatus] = []
     excess_list: List[USPositionStatus] = []
     deficit_list: List[USPositionStatus] = []
@@ -360,7 +497,7 @@ async def analyze_us_portfolio_drift(
         status_obj = USPositionStatus(
             symbol=sym,
             name=names.get(sym, sym),
-            exchange=SYMBOL_EXCHANGE_MAP.get(sym, "NASD"),
+            exchange=db_exchanges.get(sym) or SYMBOL_EXCHANGE_MAP.get(sym, "NASD"),
             qty=pos_qtys.get(sym, 0.0),
             avg_price=round(avg_entry, 2),
             current_price=round(quotes.get(sym, 0.0), 2),

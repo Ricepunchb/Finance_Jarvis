@@ -3,10 +3,12 @@
 자동매매 조작은 pages/1_KIS_자동매매.py, 이 화면은 쌓인 체결·판단·리밸런싱 기록을 돌아보는 용도다.
 모든 데이터는 FastAPI(/analytics/*)에서 받는다: uvicorn api.main:app --port 8800
 """
+import importlib
 import streamlit as st
 
 from core.config import settings
 from ui import backtest_tab, calendar_tab, dividend_tab, overview, rebalance, replay
+importlib.reload(backtest_tab)
 from ui.common import API_BASE, api_get, cached_get, clear_cache, fmt_kst
 
 st.set_page_config(layout="wide", page_title="Finance Jarvis 분석", page_icon="📈")

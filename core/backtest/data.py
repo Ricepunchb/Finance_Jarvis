@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
 DOMESTIC_CHUNK_DAYS = 120  # KIS 일봉 1회 최대 ~100영업일
-LOOKBACK_PADDING_DAYS = 60  # 기술적 지표 콜드스타트(RSI 14, MACD 26 등)를 위한 사전 일봉 확보일
+LOOKBACK_PADDING_DAYS = 120  # 기술적 지표 및 롤링 소티노(30일+15일 브레드스) 콜드스타트 방지를 위한 사전 일봉 확보일
 
 
 class HistoricalDataManager:
@@ -170,7 +170,7 @@ class HistoricalDataManager:
         bars_dict: Dict[str, Dict[str, Any]] = {}
         base_date = limit_end.strftime("%Y%m%d")
 
-        for _ in range(10):  # 최대 10페이지
+        for _ in range(20):  # 최대 20페이지 (약 5년 이상의 장기 일봉 커버)
             rows = await meritz_overseas.get_daily_chart(self.client, exchange, symbol, base_date=base_date)
             df = indicators.chart_rows_to_dataframe_overseas(rows)
             if df.empty:

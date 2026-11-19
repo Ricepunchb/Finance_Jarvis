@@ -8,11 +8,14 @@ UI 컴포넌트는 ui/us_market_ui.py를 공유합니다.
 """
 from __future__ import annotations
 
+import importlib
 import time
 import streamlit as st
 
 from core.config import settings
 from ui.common import api_get, api_post, fmt_kst
+import ui.us_market_ui as _us_ui_mod
+importlib.reload(_us_ui_mod)
 from ui.us_market_ui import (
     inject_us_ui_styles,
     render_us_rebalance_section,

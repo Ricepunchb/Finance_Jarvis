@@ -223,6 +223,9 @@ with st.sidebar:
 
 # --- 메리츠 해외 자동매매 대시보드 렌더러 ---
 def render_meritz_overseas_dashboard(status: dict, config: dict) -> None:
+    import importlib
+    import ui.us_market_ui as _us_ui_mod
+    importlib.reload(_us_ui_mod)
     from ui.us_market_ui import (
         inject_us_ui_styles,
         render_us_rebalance_section,
