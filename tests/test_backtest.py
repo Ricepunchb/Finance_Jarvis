@@ -430,3 +430,23 @@ def test_us_adaptive_strategy_4x1y_and_4x6m_all_win_and_sortino_above_1_9():
 
     asyncio.run(run())
 
+
+def test_us_live_optimal_weights_mixed_tz_aware_and_naive():
+    """SQLite(tz-naive)와 yfinance 폴백(America/New_York tz-aware) 시계열이 혼재되어도
+    TypeError 없이 정상적으로 Dual-Sortino 행렬 및 최적 비중을 산출하는지 검증."""
+    from core.us_market.strategy import compute_us_live_optimal_weights
+
+    dates = [(datetime(2025, 1, 1) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(45)]
+    df_naive = _create_synthetic_ohlcv(dates, start_price=150.0, trend=0.008)
+    df_tz_aware = _create_synthetic_ohlcv(dates, start_price=200.0, trend=0.004)
+    df_tz_aware["date"] = pd.to_datetime(df_tz_aware["date"]).dt.tz_localize("America/New_York")
+
+    res = compute_us_live_optimal_weights(
+        symbols=["NVDA", "ANT"],
+        data_by_symbol={"NVDA": df_naive, "ANT": df_tz_aware},
+        top_k=2,
+    )
+    assert res["regime"] in ("MODEL_A_CORE_SORTINO", "MODEL_B_TACTICAL")
+    assert sum(res["recommended_weights"].values()) > 0.99
+
+

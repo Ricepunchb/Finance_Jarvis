@@ -111,6 +111,11 @@ def classify_us_symbol_role(symbol: str) -> str:
     return "GROWTH_MACRO_CORE"
 
 
+def _to_naive_date(series: pd.Series) -> pd.Series:
+    """tz-aware(yfinance 등)와 tz-naive(SQLite 등) 타임스탬프 혼재 시 항상 tz-naive 일자(YYYY-MM-DD)로 정규화."""
+    return pd.to_datetime(series.astype(str).str.slice(0, 10), errors="coerce")
+
+
 def compute_dual_sortino_matrices(
     symbols: List[str],
     data_by_symbol: Dict[str, pd.DataFrame],
@@ -139,9 +144,13 @@ def compute_dual_sortino_matrices(
         return None
 
     all_dates_set = set()
+    normalized_dfs: Dict[str, pd.DataFrame] = {}
     for s in active_syms:
-        df_s = data_by_symbol[s]
-        all_dates_set.update(pd.to_datetime(df_s["date"]).tolist())
+        df_s = data_by_symbol[s].copy()
+        df_s["date"] = _to_naive_date(df_s["date"])
+        df_s = df_s.dropna(subset=["date"]).drop_duplicates("date")
+        normalized_dfs[s] = df_s
+        all_dates_set.update(df_s["date"].tolist())
     full_dt = pd.DatetimeIndex(sorted(list(all_dates_set)))
     if len(full_dt) == 0:
         return None
@@ -149,9 +158,7 @@ def compute_dual_sortino_matrices(
     close_df = pd.DataFrame(
         {
             s: (
-                data_by_symbol[s]
-                .assign(date=pd.to_datetime(data_by_symbol[s]["date"]))
-                .drop_duplicates("date")
+                normalized_dfs[s]
                 .set_index("date")
                 .reindex(full_dt)["close"]
                 .pipe(pd.to_numeric, errors="coerce")
