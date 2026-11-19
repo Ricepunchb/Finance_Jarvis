@@ -200,7 +200,7 @@ def compute_us_signals(
 ) -> Dict[str, Any]:
     """미국 종목의 30분봉 및 일봉 지표, 월가 컨센서스, 보유자 손절/익절을 종합 평가한다."""
     clean_sym = symbol.strip().upper()
-    from core.backtest.us_strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
+    from core.us_market.strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
 
     # 1. 일봉 기술적 지표 계산 + 백테스트 검증 롤링 소티노(Dual-Sortino) 시그널 결합
     daily_signal = compute_technical_signal(df_daily)

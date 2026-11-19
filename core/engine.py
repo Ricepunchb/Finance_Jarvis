@@ -827,7 +827,7 @@ class TradingEngine:
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그것들과 무관하게 평가한다.
         # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
         # 체결확률을 확보한다. 메리츠 해외 계좌는 순수 USD 기준, KIS 프록시는 원화(KRW) 기준으로 일관되게 비교한다.
-        from core.backtest.us_strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
+        from core.us_market.strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
 
         is_cash_parking_etf = symbol.strip().upper() in CASH_PARKING_ETFS
         df = None

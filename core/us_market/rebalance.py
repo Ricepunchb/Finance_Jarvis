@@ -894,7 +894,7 @@ async def propose_us_sortino_optimal_weights(
     from datetime import timedelta
     import pandas as pd
     from core.backtest.data import HistoricalDataManager
-    from core.backtest.us_strategy import compute_us_live_optimal_weights
+    from core.us_market.strategy import compute_us_live_optimal_weights
     from core.us_market.client import get_us_daily_bars
 
     current_weights = await get_us_target_weights(conn)
