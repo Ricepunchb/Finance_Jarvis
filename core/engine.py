@@ -827,8 +827,12 @@ class TradingEngine:
         # --- 손절/트레일링익절: 쿨다운/일일손실한도보다 먼저, 그것들과 무관하게 평가한다.
         # 해외는 시장가 미지원(FX 리스크로 의도적 배제)이라 직전가 대비 소폭 할인된 지정가로
         # 체결확률을 확보한다. 메리츠 해외 계좌는 순수 USD 기준, KIS 프록시는 원화(KRW) 기준으로 일관되게 비교한다.
+        from core.backtest.us_strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
+
+        is_cash_parking_etf = symbol.strip().upper() in CASH_PARKING_ETFS
         df = None
         tech_signal = None
+        us_sortino_sig = None
         if qty > 0:
             await db.update_position_peak(self.conn, symbol, eval_price)
             position_row = await db.get_position(self.conn, symbol)
@@ -840,16 +844,22 @@ class TradingEngine:
                 df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
                 atr_pct = indicators.compute_atr_pct(df, settings.ATR_LENGTH)
                 tech_signal = indicators.compute_technical_signal(df)
-                is_uptrend = bool(tech_signal.get("is_uptrend", False))
+                us_sortino_sig = evaluate_us_live_symbol_signal(symbol, df)
+                is_uptrend = bool(us_sortino_sig.get("is_uptrend") or tech_signal.get("is_uptrend", False))
             except Exception:
                 logger.exception(f"'{symbol}' 일봉 조회 실패 - ATR 없이 고정값으로 청산 평가")
             is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
-            exit_decision = exit_guard.evaluate_exit(
-                eval_avg_price, peak_price, eval_price, atr_pct, is_uptrend=is_uptrend, accumulation_mode=is_accumulation
-            )
+            # 초단기 국채 파킹 ETF(SGOV 등)는 기계적 손절/트레일링 익절에서 면제
+            if is_cash_parking_etf:
+                exit_decision = None
+            else:
+                exit_decision = exit_guard.evaluate_exit(
+                    eval_avg_price, peak_price, eval_price, atr_pct, is_uptrend=is_uptrend, accumulation_mode=is_accumulation
+                )
             context["exit_check"] = {
                 "eval_avg_price": eval_avg_price, "peak_price": peak_price, "atr_pct": atr_pct,
                 "is_uptrend": is_uptrend,
+                "is_cash_parking_etf": is_cash_parking_etf,
                 "fired": exit_decision.reason if exit_decision else None,
                 "sell_ratio": exit_decision.sell_ratio if exit_decision else None,
             }
@@ -879,7 +889,36 @@ class TradingEngine:
             df = indicators.chart_rows_to_dataframe_overseas(chart_rows)
         if tech_signal is None:
             tech_signal = indicators.compute_technical_signal(df)
+        if us_sortino_sig is None:
+            us_sortino_sig = evaluate_us_live_symbol_signal(symbol, df)
+
+        # 백테스트에서 검증된 미국장 Dual-Sortino 시그널 및 자산 역할 규칙을 실시간 tech_signal에 결합
+        if is_cash_parking_etf:
+            tech_signal = {
+                **tech_signal,
+                "direction": "HOLD",
+                "strength": 0.0,
+                "is_uptrend": True,
+                "is_downtrend": False,
+            }
+        elif df is not None and len(df) >= 15:
+            if us_sortino_sig["direction"] in ("BUY", "SELL"):
+                tech_signal = {
+                    **tech_signal,
+                    "direction": us_sortino_sig["direction"],
+                    "strength": max(float(tech_signal.get("strength", 0.0)), float(us_sortino_sig["strength"])),
+                    "is_uptrend": us_sortino_sig["is_uptrend"],
+                    "is_downtrend": us_sortino_sig["is_downtrend"],
+                }
+            else:
+                tech_signal = {
+                    **tech_signal,
+                    "is_uptrend": us_sortino_sig["is_uptrend"],
+                    "is_downtrend": us_sortino_sig["is_downtrend"],
+                }
+
         context["tech_signal"] = tech_signal
+        context["us_sortino_signal"] = us_sortino_sig
 
         intraday_signal = await intraday.get_intraday_signal_overseas(
             self.client, self.conn, symbol, exchange, self._intraday_backfill_budget

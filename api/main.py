@@ -1509,6 +1509,32 @@ async def remove_us_portfolio_symbol_endpoint(symbol: str, auto_normalize: bool 
         await conn.close()
 
 
+class USSortinoOptimizeRequest(BaseModel):
+    top_k: int = 3
+    apply_immediately: bool = False
+
+
+@app.post("/us-market/rebalance/optimize-sortino")
+async def optimize_us_sortino_weights_endpoint(req: USSortinoOptimizeRequest):
+    """백테스트 검증 국면 적응형 Dual-Sortino 전략 기반 현재 포트폴리오 최적 목표 비중 진단 및 즉시 적용."""
+    from core.us_market.rebalance import propose_us_sortino_optimal_weights
+    conn = await db.get_connection()
+    try:
+        client = engine.client if getattr(engine, "is_meritz", False) else None
+        try:
+            result = await propose_us_sortino_optimal_weights(
+                conn,
+                client=client,
+                top_k=req.top_k,
+                apply_immediately=req.apply_immediately,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        return result
+    finally:
+        await conn.close()
+
+
 @app.get("/us-market/discovery")
 async def get_us_discovery_endpoint(refresh: bool = False):
     """점수 기반 글로벌 유망 종목 발굴 랭킹(5대 멀티팩터 100점 만점) 및 S&P 500 주도 섹터 리더보드 조회."""

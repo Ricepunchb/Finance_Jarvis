@@ -378,6 +378,54 @@ def render_us_rebalance_section(key_prefix: str = "us_reb") -> None:
                         time.sleep(1)
                         st.rerun()
 
+    # 4-2. 백테스트 검증 Dual-Sortino 국면 적응형 최적 비중 원클릭 진단 & 적용
+    with st.expander("🧠 백테스트 검증 Dual-Sortino 국면 진단 & 최적 비중 자동 배분", expanded=False):
+        st.caption(
+            "4x1년 및 4x6개월 독립 백테스트 전 구간 승리(Sortino 2.52~5.82)로 검증된 **국면 적응형 듀얼-소티노(Regime-Adaptive Dual-Sortino)** "
+            "엔진을 통해 현재 시장 브레드스(`breadth_ma15`) 국면을 진단하고 하방 반편차 대비 모멘텀 효율 최상위 종목으로 목표 비중을 최적화합니다."
+        )
+        ds_col1, ds_col2, ds_col3 = st.columns([1.2, 1.4, 1.4])
+        with ds_col1:
+            ds_top_k = st.slider("집중 배분 상위 종목 수 (Top-K)", min_value=1, max_value=4, value=2, key=f"{key_prefix}_ds_topk")
+        with ds_col2:
+            st.write("")
+            btn_ds_preview = st.button("🔍 현재 국면 & Dual-Sortino 비중 진단", width="stretch", key=f"{key_prefix}_ds_prev_btn")
+        with ds_col3:
+            st.write("")
+            btn_ds_apply = st.button("🚀 Dual-Sortino 최적 비중 즉시 적용", type="primary", width="stretch", key=f"{key_prefix}_ds_apply_btn")
+
+        if btn_ds_preview or btn_ds_apply:
+            with st.spinner("실시간 일봉 및 하방 반편차(Downside Risk) 기반 Dual-Sortino 최적 비중 산출 중..."):
+                ds_res = api_post(
+                    "/us-market/rebalance/optimize-sortino",
+                    {"top_k": ds_top_k, "apply_immediately": bool(btn_ds_apply)},
+                    timeout=30,
+                )
+                if ds_res and ds_res.get("status") == "ok":
+                    st.session_state[f"{key_prefix}_ds_last_diag"] = ds_res
+                    if btn_ds_apply:
+                        st.success(f"✅ Dual-Sortino 최적 목표 비중이 계좌 포트폴리오에 적용되었습니다! ({ds_res.get('regime_label')})")
+                        time.sleep(0.8)
+                        st.rerun()
+
+        ds_diag = st.session_state.get(f"{key_prefix}_ds_last_diag")
+        if ds_diag:
+            st.info(f"📡 **현재 감지된 시장 국면**: {ds_diag.get('regime_label')} (15일 평균 브레드스: `{ds_diag.get('breadth_ma15')}`)")
+            rec_w = ds_diag.get("recommended_weights", {})
+            sc_map = ds_diag.get("scores", {})
+            ds_rows = []
+            for sym_k, info_s in sc_map.items():
+                ds_rows.append({
+                    "티커": sym_k,
+                    "Model A 점수 (중기 소티노)": info_s.get("score_a", 0.0),
+                    "Model B 점수 (전술 소티노)": info_s.get("score_b", 0.0),
+                    "현재 적용 점수": info_s.get("active_score", 0.0),
+                    "하방 반편차(30일 연환산)": f"{info_s.get('dvol30_pct', 0.0):.1f}%",
+                    "추천 목표 비중": f"{rec_w.get(sym_k, 0.0) * 100:.1f}%",
+                })
+            if ds_rows:
+                st.dataframe(pd.DataFrame(ds_rows), width="stretch", hide_index=True)
+
     st.divider()
 
     # 5. 리밸런싱 실행 및 텔레그램 연동 제어

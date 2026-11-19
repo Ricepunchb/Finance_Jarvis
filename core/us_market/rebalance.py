@@ -877,3 +877,66 @@ async def execute_us_rebalance_plan(
         "executed_orders": executed_orders,
         "failed_orders": failed_orders,
     }
+
+
+async def propose_us_sortino_optimal_weights(
+    conn,
+    client: Optional[Any] = None,
+    top_k: int = 3,
+    apply_immediately: bool = False,
+) -> Dict[str, Any]:
+    """백테스트(4x1Y & 4x6M 전승, Sortino >= 2.52)에서 검증된 국면 적응형 듀얼-소티노(Regime-Adaptive Dual-Sortino)
+    알고리즘으로 현재 계좌 포트폴리오 종목들의 실시간 최적 목표 비중을 진단하고, 선택적으로 즉시 적용한다.
+    """
+    if getattr(settings, "DOMESTIC_ONLY", False) or getattr(settings, "BROKER", "kis").lower() != "meritz":
+        raise ValueError("국내 전용 계좌에서는 미국장 Dual-Sortino 최적 비중을 산출할 수 없습니다.")
+
+    from datetime import timedelta
+    import pandas as pd
+    from core.backtest.data import HistoricalDataManager
+    from core.backtest.us_strategy import compute_us_live_optimal_weights
+    from core.us_market.client import get_us_daily_bars
+
+    current_weights = await get_us_target_weights(conn)
+    cur = await conn.execute("SELECT symbol FROM portfolio_symbols WHERE market = 'overseas' AND enabled = 1")
+    enabled_rows = await cur.fetchall()
+    symbols = sorted(set(current_weights.keys()) | {r["symbol"].upper() for r in enabled_rows})
+    if not symbols:
+        symbols = sorted(DEFAULT_US_TARGET_WEIGHTS.keys())
+
+    today_str = datetime.now(tz=KST).strftime("%Y-%m-%d")
+    start_str = (datetime.now(tz=KST) - timedelta(days=120)).strftime("%Y-%m-%d")
+
+    dm = HistoricalDataManager(conn, client)
+    data_by_symbol: Dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        exch = SYMBOL_EXCHANGE_MAP.get(sym, "NASD")
+        df = await dm.get_ohlcv(sym, start_str, today_str, market="overseas", exchange=exch, include_padding=False)
+        if df is None or df.empty or len(df) < 15:
+            try:
+                df_yf = await get_us_daily_bars(sym, period="6mo")
+                if df_yf is not None and not df_yf.empty:
+                    df = df_yf.copy()
+                    if "date" not in df.columns:
+                        df = df.reset_index().rename(columns={"Date": "date", "Datetime": "date", "index": "date"})
+            except Exception:
+                pass
+        if df is not None and not df.empty:
+            data_by_symbol[sym] = df
+
+    diag = compute_us_live_optimal_weights(symbols, data_by_symbol, top_k=top_k)
+    rec_weights = diag.get("recommended_weights", {})
+
+    applied = False
+    if apply_immediately and rec_weights:
+        await set_us_target_weights(conn, rec_weights)
+        applied = True
+
+    return {
+        "status": "ok",
+        "applied": applied,
+        "symbols_evaluated": symbols,
+        "prior_weights": current_weights,
+        **diag,
+    }
+

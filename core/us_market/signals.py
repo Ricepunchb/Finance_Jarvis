@@ -200,9 +200,21 @@ def compute_us_signals(
 ) -> Dict[str, Any]:
     """미국 종목의 30분봉 및 일봉 지표, 월가 컨센서스, 보유자 손절/익절을 종합 평가한다."""
     clean_sym = symbol.strip().upper()
+    from core.backtest.us_strategy import CASH_PARKING_ETFS, evaluate_us_live_symbol_signal
 
-    # 1. 일봉 기술적 지표 계산
+    # 1. 일봉 기술적 지표 계산 + 백테스트 검증 롤링 소티노(Dual-Sortino) 시그널 결합
     daily_signal = compute_technical_signal(df_daily)
+    us_sortino_sig = evaluate_us_live_symbol_signal(clean_sym, df_daily)
+    if clean_sym in CASH_PARKING_ETFS:
+        daily_signal = {"direction": "HOLD", "strength": 0.0, "is_uptrend": True, "is_downtrend": False}
+    elif not df_daily.empty and len(df_daily) >= 15 and us_sortino_sig.get("direction") in ("BUY", "SELL"):
+        daily_signal = {
+            **daily_signal,
+            "direction": us_sortino_sig["direction"],
+            "strength": max(float(daily_signal.get("strength", 0.0)), float(us_sortino_sig["strength"])),
+            "is_uptrend": us_sortino_sig["is_uptrend"],
+            "is_downtrend": us_sortino_sig["is_downtrend"],
+        }
     daily_snap = extract_indicator_snapshot(df_daily)
 
     # 2. 30분봉 기술적 지표 계산
@@ -246,7 +258,12 @@ def compute_us_signals(
     peak_price = holding.get("peak_price") if holding else None
     atr_pct = compute_atr_pct(df_daily, settings.ATR_LENGTH) if not df_daily.empty else None
 
-    exit_info = evaluate_us_exit_guard(current_price, avg_price, peak_price, atr_pct)
+    if clean_sym in CASH_PARKING_ETFS:
+        exit_info = None
+        combined_action = "HOLD"
+        strength = 0.0
+    else:
+        exit_info = evaluate_us_exit_guard(current_price, avg_price, peak_price, atr_pct)
 
     # 6. 매수 확증 캔들 필터 검사 (4번 안: 노이즈 휩소 및 조기 매수 차단)
     is_buy_confirmed = True
@@ -335,5 +352,6 @@ def compute_us_signals(
         "pnl_pct": pnl_pct,
         "daily_snapshot": daily_snap,
         "intraday_snapshot": intraday_snap,
+        "sortino_signal": us_sortino_sig,
     }
 

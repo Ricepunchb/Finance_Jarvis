@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -299,3 +299,274 @@ def run_us_adaptive_backtest(
         start_date=start_date,
         end_date=end_date,
     )
+
+
+def evaluate_us_live_symbol_signal(
+    symbol: str,
+    df: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+    """실시간 미국장 매매 엔진(core/engine.py)에서 단일 해외 종목 평가 시 백테스트 최적 전략
+    (롤링 소티노 스코어, 자산 역할 분류, 정배열 추세 필터)을 동일하게 적용하기 위한 시그널 산출 함수.
+    """
+    clean_sym = (symbol or "").strip().upper()
+    if clean_sym in CASH_PARKING_ETFS:
+        return {
+            "direction": "HOLD",
+            "strength": 0.0,
+            "is_uptrend": True,
+            "is_downtrend": False,
+            "skip_exit_guard": True,
+            "role": "CASH_PARKING",
+            "sortino_score_a": 0.0,
+            "sortino_score_b": 0.0,
+            "rationale": "초단기 국채 파킹 ETF — 기계적 손절 및 기술적 단타 매매 면제",
+        }
+
+    is_tactical_high_beta = clean_sym in TACTICAL_HIGH_BETA_ETFS
+    role_name = "TACTICAL_HIGH_BETA" if is_tactical_high_beta else (
+        "DEFENSIVE_CORE" if clean_sym in DEFENSIVE_CORE_ETFS else "GROWTH_MACRO_CORE"
+    )
+
+    if df is None or df.empty or len(df) < 15:
+        return {
+            "direction": "HOLD",
+            "strength": 0.0,
+            "is_uptrend": False,
+            "is_downtrend": False,
+            "skip_exit_guard": False,
+            "role": role_name,
+            "sortino_score_a": 0.0,
+            "sortino_score_b": 0.0,
+            "rationale": "일봉 데이터 부족",
+        }
+
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(closes) < 15:
+        return {
+            "direction": "HOLD",
+            "strength": 0.0,
+            "is_uptrend": False,
+            "is_downtrend": False,
+            "skip_exit_guard": False,
+            "role": role_name,
+            "sortino_score_a": 0.0,
+            "sortino_score_b": 0.0,
+            "rationale": "유효 종가 데이터 부족",
+        }
+
+    ann = math.sqrt(TRADING_DAYS_PER_YEAR)
+    c = float(closes.iloc[-1])
+    rets1 = closes.pct_change(1).fillna(0.0)
+    neg_r = rets1.clip(upper=0.0)
+
+    r5 = float(closes.pct_change(5).iloc[-1]) if len(closes) > 5 else 0.0
+    r15 = float(closes.pct_change(15).iloc[-1]) if len(closes) > 15 else r5
+    r20 = float(closes.pct_change(20).iloc[-1]) if len(closes) > 20 else r15
+    r30 = float(closes.pct_change(30).iloc[-1]) if len(closes) > 30 else r20
+
+    sma7 = float(closes.rolling(7, min_periods=2).mean().iloc[-1])
+    sma10 = float(closes.rolling(10, min_periods=3).mean().iloc[-1])
+    sma15 = float(closes.rolling(15, min_periods=5).mean().iloc[-1])
+    sma20 = float(closes.rolling(20, min_periods=5).mean().iloc[-1])
+
+    dvol20 = max(0.03, float(np.sqrt((neg_r ** 2).rolling(20, min_periods=5).mean().iloc[-1]) * ann))
+    dvol30 = max(0.03, float(np.sqrt((neg_r ** 2).rolling(30, min_periods=5).mean().iloc[-1]) * ann))
+
+    raw_a = 0.4 * r15 + 0.6 * r30
+    cond_a = (c >= sma10) and (sma10 >= sma20 * 0.998) and (raw_a > 0.005)
+    score_a = (raw_a / (dvol30 ** 2.0)) if cond_a else 0.0
+
+    raw_b = 0.4 * r5 + 0.6 * r20
+    cond_b = (c >= sma7) and (sma7 >= sma15) and (raw_b > 0.005)
+    score_b = (raw_b / (dvol20 ** 1.0)) if cond_b else 0.0
+
+    is_uptrend = bool((c >= sma10 and sma10 >= sma20 * 0.998) or cond_b)
+    is_downtrend = bool(c < sma10 and sma10 < sma20)
+
+    if is_tactical_high_beta:
+        # 고감쇠 위클리 커버드콜(TSLW, PLTW 등)은 단기 정배열 돌파(cond_b) 시에만 진입 허용, SMA7 이탈 시 즉시 매도
+        if cond_b and score_b > 0.15:
+            direction = "BUY"
+            strength = min(1.0, max(0.55, score_b / 2.5))
+            rationale = f"전술 고베타 단기 정배열 소티노 돌파 (Score_B={score_b:.2f})"
+        elif c < sma7 * 0.99:
+            direction = "SELL"
+            strength = 0.80
+            rationale = "전술 고베타 단기 추세선(SMA7) 이탈 방어 매도"
+        else:
+            direction = "HOLD"
+            strength = 0.0
+            rationale = "전술 고베타 관망 구간"
+    else:
+        if cond_a or cond_b:
+            direction = "BUY"
+            strength = min(1.0, max(0.55, max(score_a / 12.0, score_b / 2.5)))
+            rationale = f"미국장 롤링 소티노 정배열 주도 (Score_A={score_a:.2f}, Score_B={score_b:.2f})"
+        elif is_downtrend and raw_a < -0.015:
+            direction = "SELL"
+            strength = min(1.0, max(0.60, abs(raw_a) * 5.0))
+            rationale = f"미국장 중기 추세 역배열 이탈 (raw_a={raw_a*100:+.1f}%)"
+        else:
+            direction = "HOLD"
+            strength = 0.0
+            rationale = "미국장 추세 중립 관망"
+
+    return {
+        "direction": direction,
+        "strength": round(float(strength), 4),
+        "is_uptrend": is_uptrend,
+        "is_downtrend": is_downtrend,
+        "skip_exit_guard": False,
+        "role": role_name,
+        "sortino_score_a": round(float(score_a), 3),
+        "sortino_score_b": round(float(score_b), 3),
+        "dvol30_pct": round(float(dvol30 * 100.0), 2),
+        "rationale": rationale,
+    }
+
+
+def compute_us_live_optimal_weights(
+    symbols: List[str],
+    data_by_symbol: Dict[str, pd.DataFrame],
+    top_k: int = 3,
+) -> Dict[str, Any]:
+    """실제 미국장 리밸런싱 엔진에서 백테스트 최적 전략(국면 적응형 듀얼 소티노)을 기반으로
+    현재 시장 브레드스 국면(Model A vs Model B)을 진단하고 최적 목표 비중을 산출한다.
+    """
+    clean_syms = [s.strip().upper() for s in symbols if s and s.strip()]
+    active_syms = [
+        s for s in clean_syms
+        if s not in CASH_PARKING_ETFS
+        and s in data_by_symbol
+        and data_by_symbol[s] is not None
+        and not data_by_symbol[s].empty
+    ]
+    cash_syms = [s for s in clean_syms if s in CASH_PARKING_ETFS]
+
+    if not active_syms:
+        eq_w = round(1.0 / max(1, len(clean_syms)), 4)
+        return {
+            "regime": "NEUTRAL",
+            "regime_label": "기본 균등 배분 (일봉 데이터 부족)",
+            "breadth_ma15": 0.5,
+            "recommended_weights": {s: eq_w for s in clean_syms},
+            "scores": {},
+        }
+
+    all_dates_set = set()
+    for s in active_syms:
+        all_dates_set.update(pd.to_datetime(data_by_symbol[s]["date"]).tolist())
+    full_dt = pd.DatetimeIndex(sorted(list(all_dates_set)))
+
+    close_df = pd.DataFrame(
+        {
+            s: (
+                data_by_symbol[s]
+                .assign(date=pd.to_datetime(data_by_symbol[s]["date"]))
+                .drop_duplicates("date")
+                .set_index("date")
+                .reindex(full_dt)["close"]
+                .ffill()
+            )
+            for s in active_syms
+        }
+    )
+    ret_df = close_df.pct_change(1).fillna(0.0)
+    ann = math.sqrt(TRADING_DAYS_PER_YEAR)
+
+    r5 = close_df.pct_change(5)
+    r15 = close_df.pct_change(15)
+    r20 = close_df.pct_change(20)
+    r30 = close_df.pct_change(30)
+
+    sma7 = close_df.rolling(7, min_periods=2).mean()
+    sma10 = close_df.rolling(10, min_periods=3).mean()
+    sma15 = close_df.rolling(15, min_periods=5).mean()
+    sma20 = close_df.rolling(20, min_periods=5).mean()
+
+    neg_r = ret_df.clip(upper=0.0)
+    dvol20 = (np.sqrt((neg_r ** 2).rolling(20, min_periods=5).mean()) * ann).clip(lower=0.03)
+    dvol30 = (np.sqrt((neg_r ** 2).rolling(30, min_periods=5).mean()) * ann).clip(lower=0.03)
+
+    core_pool = [s for s in active_syms if s not in TACTICAL_HIGH_BETA_ETFS] or list(active_syms)
+    growth_macro_pool = [s for s in core_pool if s not in DEFENSIVE_CORE_ETFS] or list(core_pool)
+
+    breadth_daily = (
+        (close_df[growth_macro_pool] >= sma20[growth_macro_pool])
+        & (r30[growth_macro_pool].fillna(0.0) > 0.02)
+    ).sum(axis=1)
+    breadth_ratio = breadth_daily / max(1, len(growth_macro_pool))
+    breadth_ma15 = float(breadth_ratio.rolling(15, min_periods=1).mean().fillna(0.67).iloc[-1])
+
+    last_dt = full_dt[-1]
+    raw_a = (0.4 * r15[core_pool].fillna(0.0) + 0.6 * r30[core_pool].fillna(0.0)).loc[last_dt]
+    cond_a = (
+        (close_df[core_pool].loc[last_dt] >= sma10[core_pool].loc[last_dt])
+        & (sma10[core_pool].loc[last_dt] >= sma20[core_pool].loc[last_dt] * 0.998)
+        & (raw_a > 0.005)
+    )
+    score_a = (raw_a / (dvol30[core_pool].loc[last_dt] ** 2.0)).where(cond_a, 0.0)
+
+    raw_b = (0.4 * r5[active_syms].fillna(0.0) + 0.6 * r20[active_syms].fillna(0.0)).loc[last_dt]
+    cond_b = (
+        (close_df[active_syms].loc[last_dt] >= sma7[active_syms].loc[last_dt])
+        & (sma7[active_syms].loc[last_dt] >= sma15[active_syms].loc[last_dt])
+        & (raw_b > 0.005)
+    )
+    score_b = (raw_b / (dvol20[active_syms].loc[last_dt] ** 1.0)).where(cond_b, 0.0)
+
+    is_defensive_regime = breadth_ma15 <= 0.205
+    active_scores = score_b if is_defensive_regime else score_a
+    regime_code = "MODEL_B_TACTICAL" if is_defensive_regime else "MODEL_A_CORE_SORTINO"
+    regime_label = (
+        f"🛡️ Model B 전술 방어·단기 돌파 국면 (Breadth={breadth_ma15:.2f} <= 0.205)"
+        if is_defensive_regime
+        else f"🚀 Model A 중기 롤링-소티노 확장 국면 (Breadth={breadth_ma15:.2f} > 0.205)"
+    )
+
+    pos_candidates = [(s, float(val)) for s, val in active_scores.items() if float(val) > 0]
+    pos_candidates.sort(key=lambda x: x[1], reverse=True)
+    selected = pos_candidates[: max(1, top_k)]
+
+    rec_weights: Dict[str, float] = {s: 0.0 for s in clean_syms}
+    if selected:
+        tot_sc = sum(sc for _, sc in selected)
+        # 현금 파킹 ETF(SGOV 등)가 포트폴리오에 있으면 10% 안전 버퍼 부여, 나머지 90%를 소티노 상위 주도주에 비례 배분
+        cash_buffer = 0.10 if cash_syms else 0.0
+        risk_budget = 1.0 - cash_buffer
+        for s, sc in selected:
+            rec_weights[s] = round((sc / tot_sc) * risk_budget, 4)
+        if cash_syms:
+            per_cash = round(cash_buffer / len(cash_syms), 4)
+            for cs in cash_syms:
+                rec_weights[cs] = per_cash
+    else:
+        # 모든 위험자산이 추세 이탈 상태이면 현금 파킹 ETF(SGOV) 또는 방어 코어(SCHD/VOO)에 배분
+        fallback_targets = cash_syms or [s for s in clean_syms if s in DEFENSIVE_CORE_ETFS] or clean_syms
+        per_fb = round(1.0 / len(fallback_targets), 4)
+        for fs in fallback_targets:
+            rec_weights[fs] = per_fb
+
+    # 합계 1.0 보정
+    w_sum = sum(rec_weights.values())
+    if w_sum > 0 and abs(w_sum - 1.0) > 0.0001:
+        anchor = max(rec_weights, key=lambda k: rec_weights[k])
+        rec_weights[anchor] = round(rec_weights[anchor] + (1.0 - w_sum), 4)
+
+    all_score_report = {}
+    for s in active_syms:
+        all_score_report[s] = {
+            "score_a": round(float(score_a.get(s, 0.0)), 3),
+            "score_b": round(float(score_b.get(s, 0.0)), 3),
+            "active_score": round(float(active_scores.get(s, 0.0)), 3),
+            "dvol30_pct": round(float(dvol30[s].loc[last_dt] * 100.0), 2),
+        }
+
+    return {
+        "regime": regime_code,
+        "regime_label": regime_label,
+        "breadth_ma15": round(breadth_ma15, 3),
+        "recommended_weights": {k: v for k, v in rec_weights.items() if v > 0},
+        "scores": all_score_report,
+    }
+
