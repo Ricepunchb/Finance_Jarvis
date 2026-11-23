@@ -847,6 +847,15 @@ async def get_symbol_insights(symbol: str, limit: int = 50):
         await conn.close()
 
 
+@app.get("/llm/usage/daily")
+async def get_llm_usage_daily(days: int = 7):
+    """최근 N일간 일일/주간 LLM 토큰 사용량·추정 비용·예산 서킷브레이커 상태를 반환한다."""
+    from core.intel.usage_tracker import UsageTracker
+
+    tracker = UsageTracker()
+    return await tracker.get_daily_summary(days=max(1, min(90, days)))
+
+
 @app.post("/insights/batches/{batch_id}/digest")
 async def regenerate_batch_digest(batch_id: int):
     """특정 인사이트 묶음의 종합 AI 다이제스트를 Gemini로 재생성한다."""

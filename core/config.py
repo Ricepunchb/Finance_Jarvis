@@ -163,14 +163,39 @@ class Settings(BaseSettings):
     DB_PATH: str = f"data/jarvis_{_ACTIVE_PROFILE}.db" if _ACTIVE_PROFILE != "default" else "data/jarvis.db"
     ENGINE_LOCK_PATH: str = f"data/engine_{_ACTIVE_PROFILE}.lock" if _ACTIVE_PROFILE != "default" else "data/engine.lock"
 
-    # --- LLM (뉴스 감성분석 / 목표비중 제안) ---
+    # --- 공유 인텔리전스 계층 (마스터 데몬 & 공유 DB) ---
+    INTEL_DB_PATH: str = "data/jarvis_intel.db"
+    INTEL_LOCK_PATH: str = "data/intel_master.lock"
+    # "master": 수집·중복제거·LLM 분석 전담 데몬 | "consumer": 공유 DB 읽기 참조 전용 계좌 엔진
+    INTEL_ROLE: str = "consumer"
+    # consumer 엔진에서 마스터 DB에 없는 종목 뉴스를 만났을 때 직접 분석 폴백 허용 여부
+    INTEL_ALLOW_ON_DEMAND_FALLBACK: bool = False
+
+    # --- LLM (뉴스 감성분석 / 목표비중 제안 / 3티어 라우팅) ---
     # provider-agnostic 설계: 이 값만 바꾸면 코드 변경 없이 다른 제공자로 교체 가능해야 한다.
     LLM_PROVIDER: str = "gemini"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.6-flash"
-    # 주 모델이 5xx(예: 503 UNAVAILABLE - 수요 폭주)를 반환하면 이 모델로 한 번 더 시도한다.
-    # 빈 문자열이면 폴백 없이 주 모델 결과만 사용.
-    GEMINI_FALLBACK_MODEL: str = "gemini-2.5-flash"
+    # 레거시 호환용 기본 모델 (명시적으로 FAST/SMART를 지정하지 않은 경우 폴백)
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
+    GEMINI_FALLBACK_MODEL: str = "gemini-3.6-flash"
+    # Tier 2 (Fast): 뉴스 요약/번역, 증권사 리포트 배치, 인사이트 다이제스트, ETF 분류
+    GEMINI_FAST_MODEL: str = "gemini-3.5-flash-lite"
+    GEMINI_FAST_FALLBACK_MODEL: str = "gemini-3.6-flash"
+    # Tier 3 (Smart): 포트폴리오 리밸런싱 등 고지능 추론 태스크 전용
+    GEMINI_SMART_MODEL: str = "gemini-4-hydrogen"
+    GEMINI_SMART_FALLBACK_MODEL: str = "gemini-3.6-flash"
+
+    # --- LLM 예산 서킷브레이커 (기본: 주간 $1.50 ≈ ₩2,000) ---
+    LLM_WEEKLY_COST_USD_LIMIT: float = 1.50
+    LLM_DAILY_COST_USD_LIMIT: Optional[float] = None
+    LLM_DAILY_TOKEN_LIMIT: Optional[int] = None
+
+    # --- Tier 1: 로컬 Open-Jev (System 1) 의사결정 모델 ---
+    # "off": 미사용 | "shadow": Gemini와 병행 로깅 | "active": News Veto / 1차 필터 실전 적용
+    OPEN_JEV_MODE: str = "off"
+    OPEN_JEV_MODEL: str = "laya-router"  # A/B 벤치마크 승자: "laya-router" (KR:multilingual + US:en) | "laya-multilingual" | "von"
+    OPEN_JEV_ENDPOINT: str = ""   # 선택적 로컬 /v1/systemone 서버 URL (비어 있으면 Laya 인프로세스 추론)
+
     NEWS_LOOKBACK_HOURS: int = 24
     NEWS_MAX_ARTICLES_PER_SYMBOL: int = 5
 

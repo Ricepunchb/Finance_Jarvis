@@ -160,39 +160,98 @@ async def get_symbol_sentiment(
 
     articles = _dedupe_articles(articles)
 
+    from core.intel import db as intel_db
+    from core.intel.event_deduper import EventDeduper, build_url_alias_key
+
+    deduper = EventDeduper()
+    intel_conn = None
+    try:
+        await intel_db.init_intel_db()
+        intel_conn = await intel_db.get_intel_connection()
+    except Exception as e:
+        logger.debug(f"공유 인텔리전스 DB 연결 생략: {e}")
+
+    is_consumer = getattr(settings, "INTEL_ROLE", "consumer").lower() == "consumer"
+    allow_on_demand = bool(getattr(settings, "INTEL_ALLOW_ON_DEMAND_FALLBACK", False))
+    market = "KR" if clean_sym.isdigit() else "US"
+
     weighted_scores: List[tuple] = []  # (score, weight)
     considered: List[Dict[str, Any]] = []  # 재현/디버깅용 원시 스냅샷 (decision_log.context_json에 저장됨)
-    for article in articles:
-        pub_at = article.get("published_at")
-        age_hours = (time.time() - pub_at) / 3600.0 if pub_at is not None else 0.0
+    try:
+        for article in articles:
+            pub_at = article.get("published_at")
+            age_hours = (time.time() - pub_at) / 3600.0 if pub_at is not None else 0.0
+            alias_key = build_url_alias_key(article["url"])
 
-        cached = await db.get_cached_news_sentiment(
-            conn, article["url"], title=article.get("title"), symbol=symbol, published_at=pub_at
-        )
-        was_cached = cached is not None
-        if cached is not None:
-            score = cached["sentiment_score"]
-        elif pub_at is not None and age_hours > MAX_NEWS_LOOKBACK_HOURS:
-            # 72시간 초과 기사는 매매 가중치가 0에 수렴하므로 Gemini API 호출 없이 중립 캐싱 (비용 절약)
-            score = 0.0
-            reasoning = f"발행일 기준 {int(age_hours)}시간 경과 (유효기간 72시간 초과로 중립 처리)"
-            await db.cache_news_sentiment(
-                conn, symbol, article["source"], article["url"], pub_at,
-                article["title"], score, reasoning,
-            )
-        else:
-            result = await provider.analyze_news(symbol, article["title"], article["summary"])
-            score = _signed_score(result)
-            await db.cache_news_sentiment(
-                conn, symbol, article["source"], article["url"], pub_at,
-                article["title"], score, result.get("reasoning", ""),
-            )
-        weight = _recency_weight(pub_at)
-        weighted_scores.append((score, weight))
-        considered.append({
-            "url": article["url"], "title": article["title"], "score": score,
-            "weight": weight, "cached": was_cached,
-        })
+            # 1. 공유 인텔리전스 DB (EventDeduper: 정확 URL + 유사 사건 노드) 최우선 조회
+            score: Optional[float] = None
+            was_cached = False
+            if intel_conn is not None:
+                match = await deduper.resolve_or_bind(
+                    intel_conn,
+                    alias_key=alias_key,
+                    symbol=clean_sym,
+                    market=market,
+                    title=article["title"],
+                    source=article.get("source"),
+                    published_at=pub_at,
+                )
+                if match.matched and match.node and match.node.get("sentiment_score") is not None:
+                    score = float(match.node["sentiment_score"])
+                    was_cached = True
+
+            # 2. 계좌 로컬 news_cache 조회 (하위호환)
+            if score is None:
+                cached = await db.get_cached_news_sentiment(
+                    conn, article["url"], title=article.get("title"), symbol=symbol, published_at=pub_at
+                )
+                if cached is not None:
+                    score = cached["sentiment_score"]
+                    was_cached = True
+
+            if score is None:
+                if pub_at is not None and age_hours > MAX_NEWS_LOOKBACK_HOURS:
+                    score = 0.0
+                    reasoning = f"발행일 기준 {int(age_hours)}시간 경과 (유효기간 72시간 초과로 중립 처리)"
+                    await db.cache_news_sentiment(
+                        conn, symbol, article["source"], article["url"], pub_at,
+                        article["title"], score, reasoning,
+                    )
+                elif is_consumer and not allow_on_demand:
+                    # consumer 엔진은 마스터 DB에 아직 없는 신규 기사에 대해 중복 LLM 호출을 하지 않고 스킵
+                    continue
+                else:
+                    result = await provider.analyze_news(symbol, article["title"], article["summary"])
+                    score = _signed_score(result)
+                    reasoning = result.get("reasoning", "")
+                    await db.cache_news_sentiment(
+                        conn, symbol, article["source"], article["url"], pub_at,
+                        article["title"], score, reasoning,
+                    )
+                    if intel_conn is not None:
+                        await deduper.register_node(
+                            intel_conn,
+                            alias_key=alias_key,
+                            symbol=clean_sym,
+                            market=market,
+                            title=article["title"],
+                            source=article.get("source"),
+                            published_at=pub_at,
+                            sentiment_direction=result.get("direction", "HOLD"),
+                            sentiment_score=score,
+                            sentiment_reasoning=reasoning,
+                            model_used=getattr(settings, "GEMINI_FAST_MODEL", "gemini"),
+                        )
+
+            weight = _recency_weight(pub_at)
+            weighted_scores.append((score, weight))
+            considered.append({
+                "url": article["url"], "title": article["title"], "score": score,
+                "weight": weight, "cached": was_cached,
+            })
+    finally:
+        if intel_conn is not None:
+            await intel_conn.close()
 
     total_weight = sum(w for _, w in weighted_scores)
     if total_weight <= 0:

@@ -249,77 +249,130 @@ async def scan_us_market_news(
             reverse=True,
         )
 
-        # 3. 클러스터별 Surprise 점수 산출 및 임계치 검사
+        # 3. 클러스터별 Surprise 점수 산출 및 임계치 검사 (공유 인텔리전스 DB 2단계 중복 제거 적용)
+        from core.intel import db as intel_db
+        from core.intel.event_deduper import (
+            EventDeduper,
+            build_cluster_alias_key,
+            build_url_alias_key,
+        )
+
+        deduper = EventDeduper()
+        await intel_db.init_intel_db()
+        intel_conn = await intel_db.get_intel_connection()
+
         processed_clusters: List[Dict[str, Any]] = []
         alerted_clusters: List[Dict[str, Any]] = []
 
-        for cl in clusters:
-            # 24시간 이내 이미 발송된 클러스터 또는 3시간 이내 동일 종목 유사 사건인지 확인
-            is_sent = await db.is_us_news_duplicate_or_recent(
-                conn, cl.cluster_id, cl.symbol, cl.anchor.title, max_age_hours=24.0, cooldown_hours=3.0
-            )
-            if is_sent:
-                logger.info(f"'{cl.symbol}' 클러스터({cl.cluster_id}) 또는 최근 유사 이슈 이미 발송됨 ➔ 알림 생략")
-                continue
-
-            current_change = price_changes.get(cl.symbol)
-            analysis = await analyze_news_surprise(
-                cluster=cl,
-                llm_provider=llm,
-                current_price_change_pct=current_change,
-            )
-            # LLM API 속도 제한(RPM) 보호용 미세 딜레이
-            if llm is not None:
-                await asyncio.sleep(0.3)
-
-            cluster_summary_data = {
-                "cluster_id": cl.cluster_id,
-                "symbol": cl.symbol,
-                "title": cl.anchor.title,
-                "surprise_score": analysis.surprise_score,
-                "impact_type": analysis.impact_type,
-                "affected_sector": analysis.affected_sector_theme,
-                "summary": "\n".join(analysis.summary_sentences),
-                "summary_sentences": analysis.summary_sentences,
-                "sources": cl.sources,
-                "cluster_count": cl.count,
-                "published_at": cl.anchor.published_at,
-                "rationale": analysis.rationale,
-            }
-            processed_clusters.append(cluster_summary_data)
-
-            # 임계값(Threshold) 이상일 때만 알림 발송 및 DB 기록
-            if analysis.surprise_score >= threshold:
-                alert_ok = False
-                if send_notifications:
-                    alert_ok, desc = await notify_news_surprise_if_needed(
-                        symbol=cl.symbol,
-                        analysis=analysis,
-                        sources=cl.sources,
-                        cluster_count=cl.count,
-                        published_ts=cl.anchor.published_at,
-                        threshold=threshold,
-                    )
-                else:
-                    alert_ok = True
-
-                # DB 기록
-                await db.record_us_news_alert(
-                    conn=conn,
-                    cluster_id=cl.cluster_id,
+        try:
+            for cl in clusters:
+                # 1·2단계 공유 인텔리전스 DB EventDeduper 확인 (75점 미만 포함 기분석 사건 재호출 방지)
+                alias_key = build_cluster_alias_key(cl.cluster_id)
+                match = await deduper.resolve_or_bind(
+                    intel_conn,
+                    alias_key=alias_key,
                     symbol=cl.symbol,
+                    market="US",
                     title=cl.anchor.title,
+                    source=", ".join(cl.sources[:3]),
+                    published_at=cl.anchor.published_at,
+                )
+                if match.matched:
+                    logger.debug(
+                        f"'{cl.symbol}' 클러스터({cl.cluster_id}) 공유 DB 캐시 히트({match.match_type}) ➔ LLM 생략"
+                    )
+                    continue
+
+                # 기존 계좌 DB 중복 알림 방어선도 유지
+                is_sent = await db.is_us_news_duplicate_or_recent(
+                    conn, cl.cluster_id, cl.symbol, cl.anchor.title, max_age_hours=24.0, cooldown_hours=3.0
+                )
+                if is_sent:
+                    logger.info(f"'{cl.symbol}' 클러스터({cl.cluster_id}) 또는 최근 유사 이슈 이미 발송됨 ➔ 알림 생략")
+                    continue
+
+                current_change = price_changes.get(cl.symbol)
+                analysis = await analyze_news_surprise(
+                    cluster=cl,
+                    llm_provider=llm,
+                    current_price_change_pct=current_change,
+                    summary_threshold=threshold,
+                )
+                # LLM API 속도 제한(RPM) 보호용 미세 딜레이
+                if llm is not None:
+                    await asyncio.sleep(0.3)
+
+                cluster_summary_data = {
+                    "cluster_id": cl.cluster_id,
+                    "symbol": cl.symbol,
+                    "title": cl.anchor.title,
+                    "surprise_score": analysis.surprise_score,
+                    "impact_type": analysis.impact_type,
+                    "affected_sector": analysis.affected_sector_theme,
+                    "summary": "\n".join(analysis.summary_sentences),
+                    "summary_sentences": analysis.summary_sentences,
+                    "sources": cl.sources,
+                    "cluster_count": cl.count,
+                    "published_at": cl.anchor.published_at,
+                    "rationale": analysis.rationale,
+                }
+                processed_clusters.append(cluster_summary_data)
+
+                alert_ok = False
+                # 임계값(Threshold) 이상일 때만 알림 발송 및 계좌 DB 알림 기록
+                if analysis.surprise_score >= threshold:
+                    if send_notifications:
+                        alert_ok, desc = await notify_news_surprise_if_needed(
+                            symbol=cl.symbol,
+                            analysis=analysis,
+                            sources=cl.sources,
+                            cluster_count=cl.count,
+                            published_ts=cl.anchor.published_at,
+                            threshold=threshold,
+                        )
+                    else:
+                        alert_ok = True
+
+                    await db.record_us_news_alert(
+                        conn=conn,
+                        cluster_id=cl.cluster_id,
+                        symbol=cl.symbol,
+                        title=cl.anchor.title,
+                        surprise_score=analysis.surprise_score,
+                        impact_type=analysis.impact_type,
+                        affected_sector=analysis.affected_sector_theme,
+                        summary="\n".join(analysis.summary_sentences),
+                        source=", ".join(cl.sources[:3]),
+                        cluster_count=cl.count,
+                        published_at=cl.anchor.published_at,
+                        sent_at=time.time(),
+                        raw_data=cluster_summary_data,
+                    )
+                    alerted_clusters.append(cluster_summary_data)
+
+                # 75점 미만 포함 모든 분석 결과를 공유 DB 사건 노드로 저장 (30분 주기 재분석 차단)
+                extra_aliases = [
+                    build_url_alias_key(a.url) for a in cl.articles if getattr(a, "url", "")
+                ]
+                await deduper.register_node(
+                    intel_conn,
+                    alias_key=alias_key,
+                    symbol=cl.symbol,
+                    market="US",
+                    title=cl.anchor.title,
+                    source=", ".join(cl.sources[:3]),
+                    published_at=cl.anchor.published_at,
                     surprise_score=analysis.surprise_score,
                     impact_type=analysis.impact_type,
                     affected_sector=analysis.affected_sector_theme,
-                    summary="\n".join(analysis.summary_sentences),
-                    source=", ".join(cl.sources[:3]),
-                    cluster_count=cl.count,
-                    published_at=cl.anchor.published_at,
-                    sent_at=time.time(),
+                    summary_ko="\n".join(analysis.summary_sentences),
+                    alerted=alert_ok,
+                    model_used=getattr(settings, "GEMINI_FAST_MODEL", "heuristic"),
                     raw_data=cluster_summary_data,
+                    extra_alias_keys=extra_aliases,
                 )
-                alerted_clusters.append(cluster_summary_data)
+        finally:
+            await intel_conn.close()
 
         scores = [c["surprise_score"] for c in processed_clusters]
         avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
@@ -400,10 +453,14 @@ class USMarketMonitorScheduler:
                     self.last_scan_count = len(results)
                     logger.info(f"🇺🇸 미국장 정기 스캔 완료: {len(results)}개 종목 처리")
 
-                    # 글로벌 뉴스 인텔리전스 스캔 연계 (Surprise 75점 이상 텔레그램 발송)
-                    logger.info("🇺🇸 글로벌 뉴스 Surprise 인텔리전스 스캔 시작")
-                    news_res = await scan_us_market_news(threshold=75, send_notifications=True)
-                    logger.info(f"🇺🇸 글로벌 뉴스 스캔 완료: {news_res.get('alerted_count', 0)}건 서프라이즈 알림 발송")
+                    # 글로벌 뉴스 인텔리전스 스캔은 독립 데몬(intel-master)이 전담한다.
+                    # INTEL_ROLE="master"일 때만 이 루프에서 직접 스캔을 수행한다.
+                    if getattr(settings, "INTEL_ROLE", "consumer").lower() == "master":
+                        logger.info("🇺🇸 글로벌 뉴스 Surprise 인텔리전스 스캔 시작")
+                        news_res = await scan_us_market_news(threshold=75, send_notifications=True)
+                        logger.info(f"🇺🇸 글로벌 뉴스 스캔 완료: {news_res.get('alerted_count', 0)}건 서프라이즈 알림 발송")
+                    else:
+                        logger.debug("🇺🇸 글로벌 뉴스 스캔은 intel-master 데몬에 위임됨 (consumer 모드)")
 
                     # 미국장 포트폴리오 리밸런싱 트리거 자동 진단 (해외 실전 계좌에서만 실행)
                     is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"

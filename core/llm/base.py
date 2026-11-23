@@ -1,14 +1,58 @@
 # core/llm/base.py
-"""LLM 제공자 인터페이스. Gemini/OpenAI/Claude 등 어떤 provider를 붙여도
-signal_engine/rebalancer는 이 두 메서드의 반환 형태만 알면 된다 (provider-agnostic).
+"""LLM 및 System-1 의사결정 제공자 인터페이스.
 
-중요: 이 인터페이스를 구현하는 provider는 반드시 "런타임에 실제 LLM API를 호출"해야
-한다 — 여기서 하드코딩된 판단을 대신 내리면 안 된다(사용자의 명시적 요구사항).
-파싱 실패/네트워크 오류 등 모든 예외 상황에서는 절대 강한 매수/매도로 오해될 수 있는
-값을 반환하지 말고 안전한 HOLD/중립으로 귀결되어야 한다.
+Gemini / Open-Jev 등 어떤 provider를 붙여도 signal_engine / rebalancer / intel 데몬은
+이 추상 인터페이스의 반환 계약만 알면 된다 (Dependency Inversion / Provider-Agnostic).
+
+중요: 파싱 실패·네트워크 오류·예산 초과 등 모든 예외 상황에서는 절대 강한 매수/매도로
+오해될 수 있는 값을 반환하지 말고 안전한 HOLD/중립(또는 무변경 폴백)으로 귀결되어야 한다.
 """
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class ModelTier(str, Enum):
+    """태스크 성격에 따른 3티어 모델 구분."""
+
+    DECISION = "decision"  # Tier 1: 로컬 Open-Jev (System 1 선택/분류/점수, $0)
+    FAST = "fast"          # Tier 2: 초경량 Gemini (요약/번역/리포트 배치)
+    SMART = "smart"        # Tier 3: 고지능 Gemini (포트폴리오 리밸런싱 등)
+
+
+@dataclass(frozen=True)
+class DecisionResult:
+    """System-1 모델의 타입-안전 선택지 결정 결과."""
+
+    label: str
+    confidence: float
+    probabilities: Dict[str, float]
+    latency_ms: float
+    model: str
+
+
+class DecisionProvider(ABC):
+    """텍스트 생성 없이 선택지/점수 확률만 반환하는 System-1 의사결정 인터페이스."""
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """모델 식별자 (예: 'laya', 'clef', 'von')."""
+
+    @abstractmethod
+    async def classify_news_veto(
+        self, symbol: str, title: str, summary: str
+    ) -> DecisionResult:
+        """뉴스의 매매 영향 방향('BUY' | 'SELL' | 'HOLD')과 보정 확률을 반환한다."""
+
+    @abstractmethod
+    async def score_news_surprise(
+        self, symbol: str, title: str, summary: str
+    ) -> Tuple[int, str, float]:
+        """미장 뉴스의 1차 Surprise 점수(0~100), 영향('호재'|'악재'|'중립'), 신뢰도(0~1)를 반환한다."""
 
 
 class LLMProvider(ABC):
@@ -23,13 +67,7 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def propose_weights(self, symbols: List[str]) -> Dict[str, Any]:
-        """포트폴리오 목표비중 초안을 제안한다 (사용자 승인 전까지는 활성화되지 않음).
-
-        Returns:
-            {"weights": {symbol: weight, ...}, "rationale": str}
-            weights의 합은 1.0에 근접해야 하지만, 승인 단계에서 사람이 다시 검토한다는
-            전제로 여기서는 엄격히 강제하지 않는다.
-        """
+        """포트폴리오 목표비중 초안을 제안한다 (사용자 승인 전까지는 활성화되지 않음)."""
 
     @abstractmethod
     async def propose_portfolio_changes(
@@ -49,93 +87,17 @@ class LLMProvider(ABC):
         max_turnover_pct: float = 0.20,
         total_equity: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """현재 포트폴리오 맥락(비중/손익/시그널)과 후보종목 숏리스트를 근거로 리밸런싱을
-        제안한다 (사용자 승인 전까지는 활성화되지 않음). candidate_pool이 비어 있으면
-        신규 종목 발굴 없이 기존 보유종목의 비중만 재검토한다.
+        """현재 포트폴리오 맥락과 후보종목 숏리스트를 근거로 리밸런싱을 제안한다.
 
-        Args:
-            current_positions: [{"symbol", "weight", "qty", "avg_price", ...}] 현재 활성 포트폴리오.
-            current_signals: symbol -> {"tech":..., "intraday":..., "sentiment":..., "valuation":...}.
-            candidate_pool: [{"symbol", "name", ...}] 신규 편입 후보 숏리스트. 이 목록에 없는
-                종목은 절대 adds에 포함시키면 안 된다는 것을 프롬프트에 명시해야 한다.
-            macro_context: 선택적 자유 텍스트(거시 이벤트 등). 없으면 None.
-            max_symbols: 최종 포트폴리오가 넘지 말아야 할 종목 수 상한.
-            min_weight/max_weight: 보유(비중>0) 종목 1개당 허용 비중 범위. 어기면 제안 전체가
-                반려되므로 프롬프트에 명시해야 한다 (비중 0 = 제외는 예외).
-
-        Returns:
-            {
-              "adds": [{"symbol", "name", "rationale"}],
-              "removes": [{"symbol", "rationale"}],
-              "weights": {symbol: weight, ...},   # add/remove 반영 후 전체 목표비중, 합은 1.0 이하
-                                                   # (전액 투자를 강제하지 않음 - 현금 보유 가능)
-              "rationale": str,
-              "degraded": bool,             # True면 LLM이 정상 판단하지 못했다는 명시적 신호
-              "error_kind": Optional[str],  # 'llm_error' | 'schema_violation' | 'invalid_weights' | None
-            }
-            실패 시: adds=[], removes=[], weights=<current_positions의 비중을 그대로 유지>,
-            degraded=True. "균등비중 폴백"이 아니라 "무변경 폴백"이어야 한다 — 살아있는
-            포트폴리오를 LLM 오류로 흩어버리는 것은 무변경보다 더 위험하다.
+        실패 시: adds=[], removes=[], weights=<current_positions 유지>, degraded=True.
         """
 
     @abstractmethod
     async def analyze_research_reports(
         self, reports: List[Dict[str, Any]]
     ) -> Dict[int, Dict[str, Any]]:
-        """증권사 리포트(제목, 본문 텍스트, 투자의견, 목표가)를 분석한다.
-
-        Args:
-            reports: [{"research_id": int, "symbol": str, "name": str, "title": str,
-                      "content_text": str, "opinion": str, ...}]
-
-        Returns:
-            {research_id: {"stance": "POSITIVE"|"NEUTRAL"|"NEGATIVE", "summary": str,
-                           "key_points": [str], "catalysts": [str], "risks": [str]}}
-        """
+        """증권사 리포트 배치를 분석한다."""
 
     @abstractmethod
     async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """발굴 갱신 1회의 종합 데이터(리포트 분석, 시장 헤드라인, 보유종목 뉴스, 발굴 숏리스트)를
-        바탕으로 AI 다이제스트를 생성한다.
-
-        Returns:
-            {
-              "headline": str,
-              "themes": [{"theme": str, "evidence": str, "symbols": [str]}],
-              "notable_symbols": [{"symbol": str, "name": str, "why": str, "stance": str}],
-              "risks": [str],
-              "holdings_watch": [str],
-            }
-        """
-
-
-    @abstractmethod
-    async def analyze_research_reports(
-        self, reports: List[Dict[str, Any]]
-    ) -> Dict[int, Dict[str, Any]]:
-        """증권사 리포트(제목, 본문 텍스트, 투자의견, 목표가)를 분석한다.
-
-        Args:
-            reports: [{"research_id": int, "symbol": str, "name": str, "title": str,
-                      "content_text": str, "opinion": str, ...}]
-
-        Returns:
-            {research_id: {"stance": "POSITIVE"|"NEUTRAL"|"NEGATIVE", "summary": str,
-                           "key_points": [str], "catalysts": [str], "risks": [str]}}
-        """
-
-    @abstractmethod
-    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """발굴 갱신 1회의 종합 데이터(리포트 분석, 시장 헤드라인, 보유종목 뉴스, 발굴 숏리스트)를
-        바탕으로 AI 다이제스트를 생성한다.
-
-        Returns:
-            {
-              "headline": str,
-              "themes": [{"theme": str, "evidence": str, "symbols": [str]}],
-              "notable_symbols": [{"symbol": str, "name": str, "why": str, "stance": str}],
-              "risks": [str],
-              "holdings_watch": [str],
-            }
-        """
-
+        """발굴 갱신 1회의 종합 데이터를 바탕으로 일일 AI 다이제스트를 생성한다."""

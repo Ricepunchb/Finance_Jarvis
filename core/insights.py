@@ -129,18 +129,60 @@ async def _enrich_and_analyze_reports(
         need_analysis = still_needed
 
     if need_analysis:
+        # 1. 공유 인텔리전스 DB(shared_research_reports) 우선 조회 (계좌 간 3중 중복 분석 제거)
+        from core.intel import db as intel_db
+
+        intel_conn = None
         try:
-            provider = get_llm_provider()
-            batch_size = settings.INSIGHT_REPORT_LLM_BATCH_SIZE
-            for i in range(0, len(need_analysis), batch_size):
-                chunk = need_analysis[i: i + batch_size]
-                analyses = await provider.analyze_research_reports(chunk)
-                for rid, analysis in analyses.items():
-                    await db.save_report_analysis(conn, rid, json.dumps(analysis, ensure_ascii=False))
+            await intel_db.init_intel_db()
+            intel_conn = await intel_db.get_intel_connection()
+            still_needed_after_intel = []
+            for item in need_analysis:
+                rid = item["research_id"]
+                shared_json = await intel_db.get_shared_report_analysis(intel_conn, rid)
+                if shared_json:
+                    await db.save_report_analysis(conn, rid, shared_json)
                     if rid in existing:
-                        existing[rid]["analysis_json"] = json.dumps(analysis, ensure_ascii=False)
-        except Exception:
-            logger.exception("인사이트 리포트 LLM 분석 중 예외 발생 - 수집된 본문만으로 계속 진행")
+                        existing[rid]["analysis_json"] = shared_json
+                else:
+                    still_needed_after_intel.append(item)
+            need_analysis = still_needed_after_intel
+        except Exception as e:
+            logger.debug(f"공유 리포트 캐시 조회 생략: {e}")
+
+        if need_analysis:
+            try:
+                provider = get_llm_provider()
+                batch_size = settings.INSIGHT_REPORT_LLM_BATCH_SIZE
+                for i in range(0, len(need_analysis), batch_size):
+                    chunk = need_analysis[i: i + batch_size]
+                    analyses = await provider.analyze_research_reports(chunk)
+                    chunk_by_id = {c["research_id"]: c for c in chunk}
+                    for rid, analysis in analyses.items():
+                        a_json = json.dumps(analysis, ensure_ascii=False)
+                        await db.save_report_analysis(conn, rid, a_json)
+                        if rid in existing:
+                            existing[rid]["analysis_json"] = a_json
+                        if intel_conn is not None:
+                            meta = chunk_by_id.get(rid) or {}
+                            await intel_db.upsert_shared_report_analysis(
+                                intel_conn,
+                                research_id=rid,
+                                symbol=meta.get("symbol", ""),
+                                name=meta.get("name", ""),
+                                broker=meta.get("broker", ""),
+                                title=meta.get("title", ""),
+                                write_date=meta.get("write_date", ""),
+                                opinion=meta.get("opinion"),
+                                target_price=meta.get("target_price"),
+                                price_at_write=meta.get("price_at_write"),
+                                content_text=meta.get("content_text"),
+                                analysis_json=a_json,
+                            )
+            except Exception:
+                logger.exception("인사이트 리포트 LLM 분석 중 예외 발생 - 수집된 본문만으로 계속 진행")
+        if intel_conn is not None:
+            await intel_conn.close()
 
     return await db.get_research_reports(conn, r_ids)
 

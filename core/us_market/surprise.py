@@ -236,6 +236,7 @@ async def analyze_news_surprise(
     cluster: NewsCluster,
     llm_provider: Optional[LLMProvider] = None,
     current_price_change_pct: Optional[float] = None,
+    summary_threshold: int = 75,
 ) -> SurpriseAnalysisResult:
     """클러스터링된 대표 뉴스를 바탕으로 기대치 괴리도 및 Surprise 점수를 산출한다."""
     anchor = cluster.anchor
@@ -263,11 +264,24 @@ async def analyze_news_surprise(
                 f"2. impact_type: 반드시 '호재', '악재', '중립' 중 하나.\n"
                 f"3. affected_sector_theme: 영향을 받는 산업 섹터 또는 테마 (예: 반도체 및 AI 하드웨어, 미국 배당성장 가치주, 단기 국채 금리)\n"
                 f"4. summary_sentences: 핵심 요약 문장 최대 3개 (각 문장은 이모지 없이 한국어 완결형 문장으로 간결 명료하게 작성).\n"
+                f"   단, surprise_score가 {summary_threshold} 미만이면 summary_sentences는 1문장 이하로 극도로 짧게 작성해 출력 토큰을 절약하라.\n"
                 f"5. 모든 출력에서 이모지(그림 문자)는 절대 사용하지 말 것."
             )
-            # GeminiProvider를 통한 구조화 출력 생성
+            # GeminiProvider를 통한 구조화 출력 생성 (Tier 2 FAST 모델 사용)
             if hasattr(llm_provider, "_generate"):
-                parsed = await llm_provider._generate(prompt, SurpriseAnalysisResult, temperature=0.2)
+                from core.llm.base import ModelTier
+
+                try:
+                    parsed = await llm_provider._generate(
+                        prompt,
+                        SurpriseAnalysisResult,
+                        temperature=0.2,
+                        tier=ModelTier.FAST,
+                        task_type="us_surprise",
+                    )
+                except TypeError:
+                    # 레거시 mock/stub 호환
+                    parsed = await llm_provider._generate(prompt, SurpriseAnalysisResult, temperature=0.2)
                 # 최대 3문장 제한 준수
                 sentences = [s.strip() for s in parsed.summary_sentences if s.strip()][:3]
                 if not sentences:

@@ -25,6 +25,15 @@ dependencies = [
     "yfinance>=1.7.0",
 ]
 
+[project.optional-dependencies]
+open-jev = [
+    "laya>=0.5.3",
+    "torch>=2.5.0",
+    "transformers>=4.48.0",
+    "accelerate>=1.0.0",
+    "sentencepiece>=0.2.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",

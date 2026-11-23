@@ -60,6 +60,7 @@ PROFILE_DEFAULTS = {
 
 MASTER_FRONT_PORT = 8500
 MASTER_SESSION_NAME = "master-page"
+INTEL_MASTER_SESSION_NAME = "intel-master"
 
 
 def get_active_profile() -> str:
@@ -488,4 +489,27 @@ def start_master_portal() -> Tuple[bool, str]:
     cmd = f"cd {ROOT} && uv run streamlit run app.py --server.port {MASTER_FRONT_PORT}"
     subprocess.run(["tmux", "new-session", "-d", "-s", MASTER_SESSION_NAME, cmd])
     return True, f"마스터 포털 기동 완료 (접속: http://localhost:{MASTER_FRONT_PORT})"
+
+
+def is_intel_master_running() -> bool:
+    """독립 마스터 인텔리전스 데몬(intel-master) tmux 세션 실행 여부."""
+    return INTEL_MASTER_SESSION_NAME in get_tmux_sessions()
+
+
+def start_intel_master() -> Tuple[bool, str]:
+    """독립 마스터 인텔리전스 데몬(intel-master) tmux 세션 기동."""
+    if is_intel_master_running():
+        return True, "마스터 인텔리전스 데몬(intel-master)이 이미 실행 중입니다."
+    cmd = f"cd {ROOT} && INTEL_ROLE=master uv run python -m core.intel.daemon"
+    subprocess.run(["tmux", "new-session", "-d", "-s", INTEL_MASTER_SESSION_NAME, cmd])
+    return True, f"마스터 인텔리전스 데몬 기동 완료 (tmux: {INTEL_MASTER_SESSION_NAME})"
+
+
+def stop_intel_master() -> Tuple[bool, str]:
+    """독립 마스터 인텔리전스 데몬(intel-master) tmux 세션 중지."""
+    if not is_intel_master_running():
+        return False, "마스터 인텔리전스 데몬(intel-master)이 실행 중이 아닙니다."
+    subprocess.run(["tmux", "kill-session", "-t", INTEL_MASTER_SESSION_NAME], stderr=subprocess.DEVNULL)
+    return True, f"마스터 인텔리전스 데몬 중지 완료 (tmux: {INTEL_MASTER_SESSION_NAME})"
+
 

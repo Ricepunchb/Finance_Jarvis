@@ -7,6 +7,7 @@
 """
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from google import genai
@@ -15,7 +16,8 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from core.config import settings
-from core.llm.base import LLMProvider
+from core.intel.usage_tracker import BudgetExceededError, UsageTracker
+from core.llm.base import LLMProvider, ModelTier
 
 logger = logging.getLogger(__name__)
 
@@ -183,22 +185,113 @@ def _format_candidate(c: Dict[str, Any], total_equity: Optional[float] = None) -
 
 
 class GeminiProvider(LLMProvider):
-    def __init__(self):
+    def __init__(self, usage_tracker: Optional[UsageTracker] = None):
         if not settings.GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다.")
         self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        self._models = [settings.GEMINI_MODEL]
-        if settings.GEMINI_FALLBACK_MODEL and settings.GEMINI_FALLBACK_MODEL != settings.GEMINI_MODEL:
-            self._models.append(settings.GEMINI_FALLBACK_MODEL)
+        self._tracker = usage_tracker or UsageTracker()
+
+        fast_primary = getattr(settings, "GEMINI_FAST_MODEL", None) or settings.GEMINI_MODEL
+        fast_fallback = getattr(settings, "GEMINI_FAST_FALLBACK_MODEL", None) or settings.GEMINI_FALLBACK_MODEL
+        smart_primary = getattr(settings, "GEMINI_SMART_MODEL", None) or settings.GEMINI_MODEL
+        smart_fallback = getattr(settings, "GEMINI_SMART_FALLBACK_MODEL", None) or settings.GEMINI_FALLBACK_MODEL
+
+        self._tier_models: Dict[ModelTier, List[str]] = {
+            ModelTier.FAST: self._dedupe_models([fast_primary, fast_fallback]),
+            ModelTier.SMART: self._dedupe_models([smart_primary, smart_fallback]),
+            ModelTier.DECISION: self._dedupe_models([fast_primary, fast_fallback]),
+        }
+        # 하위호환 속성 유지
+        self._models = list(self._tier_models[ModelTier.FAST])
+
+    @staticmethod
+    def _dedupe_models(models: List[Optional[str]]) -> List[str]:
+        seen: List[str] = []
+        for m in models:
+            if m and m not in seen:
+                seen.append(m)
+        return seen
+
+    def _models_for_tier(self, tier: ModelTier) -> List[str]:
+        return self._tier_models.get(tier) or self._models
+
+    @staticmethod
+    def _is_credit_exhausted_402(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        msg = str(exc).lower()
+        return code == 402 or "prepayment credits" in msg or "billing#prepay" in msg
+
+    @staticmethod
+    def _extract_usage_tokens(response: Any) -> tuple[int, int, int, int]:
+        meta = getattr(response, "usage_metadata", None)
+        if meta is None:
+            return 0, 0, 0, 0
+        prompt_tok = int(getattr(meta, "prompt_token_count", 0) or 0)
+        out_tok = int(getattr(meta, "candidates_token_count", 0) or 0)
+        thought_tok = int(getattr(meta, "thoughts_token_count", 0) or 0)
+        total_tok = int(getattr(meta, "total_token_count", 0) or (prompt_tok + out_tok + thought_tok))
+        return prompt_tok, out_tok, thought_tok, total_tok
+
+    async def _record_usage_safe(
+        self,
+        *,
+        task_type: str,
+        tier: ModelTier,
+        model: str,
+        prompt_tokens: int = 0,
+        output_tokens: int = 0,
+        thought_tokens: int = 0,
+        total_tokens: int = 0,
+        latency_ms: float = 0.0,
+        status: str = "ok",
+    ) -> None:
+        try:
+            await self._tracker.record(
+                task_type=task_type,
+                tier=tier.value,
+                provider="gemini",
+                model=model,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                thought_tokens=thought_tokens,
+                total_tokens=total_tokens,
+                latency_ms=latency_ms,
+                status=status,
+            )
+        except Exception as rec_err:
+            logger.debug(f"LLM 사용량 원장 기록 실패(무시): {rec_err}")
 
     async def _generate(
-        self, prompt: str, response_schema: Type[_SchemaT], temperature: float
+        self,
+        prompt: str,
+        response_schema: Type[_SchemaT],
+        temperature: float,
+        *,
+        tier: ModelTier = ModelTier.FAST,
+        task_type: str = "generic",
     ) -> _SchemaT:
-        """주 모델로 시도하고, 5xx(서버측 장애) 및 429(할당량/속도제한) 발생 시 지수 백오프 및 백업 모델로 재시도한다."""
+        """티어별 주 모델로 시도하고, 5xx 및 429(속도제한) 시에만 백오프/폴백한다.
+
+        402(크레딧 소진) 및 예산 서킷브레이커 초과는 재시도 없이 즉시 폴백 경로로 전파한다.
+        """
+        models = self._models_for_tier(tier)
+        if not models:
+            raise RuntimeError("모델 목록이 비어 있음")
+
+        # 유료 LLM 호출 전 주간/일일 예산 서킷브레이커 검사
+        try:
+            await self._tracker.assert_budget_allowed(tier=tier.value)
+        except BudgetExceededError:
+            await self._record_usage_safe(
+                task_type=task_type, tier=tier, model=models[0], status="budget_blocked"
+            )
+            raise
+
         last_exc: Exception = RuntimeError("모델 목록이 비어 있음")
-        for i, model in enumerate(self._models):
+        for i, model in enumerate(models):
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
+                t0 = time.perf_counter()
                 try:
                     response = await self._client.aio.models.generate_content(
                         model=model,
@@ -209,13 +302,33 @@ class GeminiProvider(LLMProvider):
                             temperature=temperature,
                         ),
                     )
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    p_tok, o_tok, th_tok, tot_tok = self._extract_usage_tokens(response)
                     if response.parsed is None:
+                        await self._record_usage_safe(
+                            task_type=task_type, tier=tier, model=model,
+                            prompt_tokens=p_tok, output_tokens=o_tok, thought_tokens=th_tok,
+                            total_tokens=tot_tok, latency_ms=elapsed_ms, status="error",
+                        )
                         raise ValueError("빈 응답")
+                    await self._record_usage_safe(
+                        task_type=task_type, tier=tier, model=model,
+                        prompt_tokens=p_tok, output_tokens=o_tok, thought_tokens=th_tok,
+                        total_tokens=tot_tok, latency_ms=elapsed_ms, status="ok",
+                    )
                     return response.parsed
                 except genai_errors.ClientError as e:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
                     last_exc = e
-                    # 429 RESOURCE_EXHAUSTED / RATE_LIMIT: 백오프 재시도 및 모델 폴백
-                    is_429 = getattr(e, "code", None) == 429 or "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+                    await self._record_usage_safe(
+                        task_type=task_type, tier=tier, model=model, latency_ms=elapsed_ms, status="error"
+                    )
+                    # 402 크레딧 소진은 재시도해도 해결되지 않으므로 즉시 중단/폴백
+                    if self._is_credit_exhausted_402(e):
+                        logger.error(f"Gemini 모델 '{model}' 402 크레딧 소진 감지 — 재시도 없이 즉시 폴백")
+                        raise
+                    # 429 RATE_LIMIT만 백오프 재시도 및 모델 폴백
+                    is_429 = getattr(e, "code", None) == 429 or "429" in str(e)
                     if is_429:
                         if attempt < max_attempts:
                             backoff = 2.0 * attempt
@@ -224,14 +337,18 @@ class GeminiProvider(LLMProvider):
                             )
                             await asyncio.sleep(backoff)
                             continue
-                        elif i < len(self._models) - 1:
+                        elif i < len(models) - 1:
                             logger.warning(
-                                f"Gemini 모델 '{model}' 429 재시도 소진 - 백업 모델 '{self._models[i + 1]}'로 전환"
+                                f"Gemini 모델 '{model}' 429 재시도 소진 - 백업 모델 '{models[i + 1]}'로 전환"
                             )
                             break
                     raise
                 except genai_errors.ServerError as e:
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
                     last_exc = e
+                    await self._record_usage_safe(
+                        task_type=task_type, tier=tier, model=model, latency_ms=elapsed_ms, status="error"
+                    )
                     if attempt < max_attempts:
                         backoff = 1.5 * attempt
                         logger.warning(
@@ -239,13 +356,34 @@ class GeminiProvider(LLMProvider):
                         )
                         await asyncio.sleep(backoff)
                         continue
-                    elif i < len(self._models) - 1:
+                    elif i < len(models) - 1:
                         logger.warning(
                             f"모델 '{model}' 서버 오류({getattr(e, 'code', '5xx')}) 소진 - 백업 모델 "
-                            f"'{self._models[i + 1]}'로 재시도"
+                            f"'{models[i + 1]}'로 재시도"
                         )
                         break
         raise last_exc
+
+    async def _call_generate(
+        self,
+        prompt: str,
+        response_schema: Type[_SchemaT],
+        temperature: float,
+        *,
+        tier: ModelTier = ModelTier.FAST,
+        task_type: str = "generic",
+    ) -> _SchemaT:
+        """하위 클래스/테스트 목(mock)이 3-인자 `_generate`를 오버라이드한 경우까지 호환한다."""
+        try:
+            return await self._generate(
+                prompt,
+                response_schema,
+                temperature,
+                tier=tier,
+                task_type=task_type,
+            )
+        except TypeError:
+            return await self._generate(prompt, response_schema, temperature)
 
     async def analyze_news(self, symbol: str, title: str, summary: str) -> Dict[str, Any]:
         prompt = (
@@ -254,7 +392,10 @@ class GeminiProvider(LLMProvider):
             f"(과도한 확신을 가지지 말 것).\n\n제목: {title}\n요약: {summary}"
         )
         try:
-            parsed = await self._generate(prompt, _NewsSentimentSchema, temperature=0.2)
+            parsed = await self._call_generate(
+                prompt, _NewsSentimentSchema, temperature=0.2,
+                tier=ModelTier.FAST, task_type="news_sentiment",
+            )
             direction = parsed.direction.upper()
             if direction not in ("BUY", "SELL", "HOLD"):
                 raise ValueError(f"알 수 없는 direction: {direction}")
@@ -273,7 +414,10 @@ class GeminiProvider(LLMProvider):
             "weights의 키는 반드시 위 종목코드와 정확히 일치해야 하고, 값의 합은 1.0에 가까워야 한다."
         )
         try:
-            parsed = await self._generate(prompt, _WeightProposalSchema, temperature=0.3)
+            parsed = await self._call_generate(
+                prompt, _WeightProposalSchema, temperature=0.3,
+                tier=ModelTier.FAST, task_type="propose_weights",
+            )
             weights = {item.symbol: item.weight for item in parsed.weights if item.symbol in symbols}
             if not weights:
                 raise ValueError("응답에 요청한 종목이 하나도 없음")
@@ -457,7 +601,10 @@ class GeminiProvider(LLMProvider):
             }
 
         try:
-            parsed = await self._generate(prompt, _PortfolioChangeSchema, temperature=0.3)
+            parsed = await self._call_generate(
+                prompt, _PortfolioChangeSchema, temperature=0.3,
+                tier=ModelTier.SMART, task_type="rebalance",
+            )
             weights = {
                 item.symbol.strip().upper(): item.weight
                 for item in parsed.weights
@@ -528,147 +675,10 @@ class GeminiProvider(LLMProvider):
         )
 
         try:
-            parsed = await self._generate(prompt, _ReportAnalysisBatchSchema, temperature=0.2)
-            results = {}
-            for item in parsed.items:
-                stance = item.stance.upper()
-                if stance not in ("POSITIVE", "NEUTRAL", "NEGATIVE"):
-                    stance = "NEUTRAL"
-                results[item.research_id] = {
-                    "stance": stance,
-                    "summary": item.summary,
-                    "key_points": item.key_points[:3],
-                    "catalysts": item.catalysts[:2],
-                    "risks": item.risks[:2],
-                }
-            return results
-        except Exception:
-            logger.exception("증권사 리포트 배치 LLM 분석 실패 - 빈 결과 반환")
-            return {}
-
-    async def summarize_insight_batch(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        valid_symbols = set()
-        for k in ("candidates", "holding_news", "new_reports", "holdings"):
-            for item in context.get(k) or []:
-                s = item.get("symbol")
-                if s:
-                    valid_symbols.add(s)
-
-        lines = [
-            "너는 전문 포트폴리오 매니저이자 시장 인텔리전스 분석가다. "
-            "오늘 수집·분석된 증권사 리포트, 시장 뉴스 헤드라인 표본, 보유종목 뉴스 감성, 종목 발굴 결과를 바탕으로 "
-            "투자자를 위한 일일 종합 다이제스트를 작성하라.\n",
-            "[작성 지침]",
-            "1. headline: 오늘의 시장/테마/발굴 흐름을 관통하는 명확하고 흥미로운 한 줄 요약 헤드라인을 작성하라.",
-            "2. themes: 오늘 리포트/뉴스/급등 종목들에서 강하게 포착된 핵심 테마를 최대 5개 도출하라.",
-            "3. notable_symbols: 제공된 종목들 중 오늘 특히 주목할 가치가 있는 종목을 최대 8개 엄선하라.",
-            "   (주의: 제공된 자료에 명시된 종목코드와 종목명만 사용해야 하며 절대 존재하지 않는 종목을 환각하지 마라)",
-            "4. risks: 시장 전반 또는 주요 섹터에서 포착되는 주의/경계 요인을 최대 4개 정리하라.",
-            "5. holdings_watch: 현재 보유 종목과 관련된 관전 포인트 및 주의점을 정리하라.\n",
-            "[제공 데이터]",
-        ]
-
-        if context.get("holdings"):
-            h_str = ", ".join(f"{h.get('symbol')}({h.get('name', '')})" for h in context["holdings"])
-            lines.append(f"- 현재 포트폴리오 보유종목: {h_str}")
-
-        if context.get("new_reports"):
-            lines.append("\n[오늘 신규/주요 증권사 리포트]")
-            for r in context["new_reports"][:15]:
-                lines.append(
-                    f"· [{r.get('broker')}] {r.get('symbol')}({r.get('name')}) - '{r.get('title')}' "
-                    f"(의견: {r.get('opinion') or '-'}, 목표가: {r.get('target_price') or '-'}, 판정: {r.get('stance') or '-'})"
-                )
-
-        if context.get("market_headlines"):
-            lines.append("\n[시장 전체 뉴스 다빈도 언급 종목 및 헤드라인]")
-            for h in context["market_headlines"][:12]:
-                lines.append(f"· {h.get('symbol')}({h.get('name')}): {h.get('title')} (언급 {h.get('mentions', 1)}회)")
-
-        if context.get("holding_news"):
-            lines.append("\n[보유 종목 최근 뉴스 및 감성 판정]")
-            for n in context["holding_news"][:10]:
-                lines.append(
-                    f"· {n.get('symbol')}: {n.get('title')} (점수: {n.get('score', 0):+.2f}, 사유: {n.get('reasoning', '')[:60]})"
-                )
-
-        if context.get("candidates"):
-            lines.append("\n[오늘 발굴 상위 후보 종목 (점수순)]")
-            for c in context["candidates"][:10]:
-                lines.append(
-                    f"· {c.get('symbol')}({c.get('name')}) [{c.get('angle_label')} {c.get('score', 0):.2f}점]: "
-                    + " / ".join(c.get("thesis") or [])
-                )
-
-        prompt = "\n".join(lines)
-
-        fallback = {
-            "headline": "오늘의 종목 발굴 및 리포트/뉴스 분석 요약",
-            "themes": [],
-            "notable_symbols": [],
-            "risks": [],
-            "holdings_watch": [],
-        }
-
-        try:
-            parsed = await self._generate(prompt, _InsightDigestSchema, temperature=0.3)
-            notables = []
-            for ns in parsed.notable_symbols:
-                if ns.symbol in valid_symbols or not valid_symbols:
-                    notables.append({
-                        "symbol": ns.symbol,
-                        "name": ns.name,
-                        "why": ns.why,
-                        "stance": ns.stance.upper() if ns.stance else "POSITIVE",
-                    })
-
-            return {
-                "headline": parsed.headline,
-                "themes": [t.model_dump() for t in parsed.themes[:5]],
-                "notable_symbols": notables[:8],
-                "risks": parsed.risks[:4],
-                "holdings_watch": parsed.holdings_watch[:4],
-            }
-        except Exception:
-            logger.exception("인사이트 다이제스트 LLM 생성 실패 - 기본 폴백 반환")
-            return fallback
-
-
-    async def analyze_research_reports(
-        self, reports: List[Dict[str, Any]]
-    ) -> Dict[int, Dict[str, Any]]:
-        if not reports:
-            return {}
-
-        report_blocks = []
-        for r in reports:
-            rid = r.get("research_id") or r.get("id")
-            block = (
-                f"[리포트 ID: {rid}]\n"
-                f"- 종목: {r.get('symbol')} ({r.get('name', '')})\n"
-                f"- 증권사: {r.get('broker', '')}\n"
-                f"- 제목: {r.get('title', '')}\n"
-                f"- 투자의견: {r.get('opinion') or '미제시'}\n"
-                f"- 목표주가: {f'{r.get('target_price'):,.0f}원' if r.get('target_price') else '미제시'}\n"
-                f"- 작성일주가: {f'{r.get('price_at_write'):,.0f}원' if r.get('price_at_write') else '미제시'}\n"
-                f"- 본문 요약/발췌:\n{(r.get('content_text') or '')[:1200]}"
+            parsed = await self._call_generate(
+                prompt, _ReportAnalysisBatchSchema, temperature=0.2,
+                tier=ModelTier.FAST, task_type="report_batch",
             )
-            report_blocks.append(block)
-
-        prompt = (
-            "너는 주식 분석 리서치 센터의 냉철한 퀀트/애널리스트다. "
-            "아래 제공된 국내 증권사 리포트들을 각각 분석하라.\n\n"
-            "[주의 및 판정 지침]\n"
-            "1. 국내 증권사 리포트는 구조적으로 매수 편향(Buy Bias)이 강하다. 따라서 무조건 긍정적으로 보지 말고, "
-            "목표주가 하향, 이익 추정치 감소, 업황 둔화 우려, 불확실성 언급이 있다면 stance를 반드시 NEUTRAL 또는 NEGATIVE로 엄정히 판정하라.\n"
-            "2. 확실히 호실적 또는 구조적 성장 동력이 명확할 때만 POSITIVE를 부여하라.\n"
-            "3. 본문 내용에 근거하지 않은 사실을 지어내지 말라(환각 금지).\n"
-            "4. summary는 한국어 2문장으로 핵심을 요약하라.\n\n"
-            + "\n\n---\n\n".join(report_blocks)
-        )
-
-        try:
-            parsed = await self._generate(prompt, _ReportAnalysisBatchSchema, temperature=0.2)
             results = {}
             for item in parsed.items:
                 stance = item.stance.upper()
@@ -751,7 +761,10 @@ class GeminiProvider(LLMProvider):
         }
 
         try:
-            parsed = await self._generate(prompt, _InsightDigestSchema, temperature=0.3)
+            parsed = await self._call_generate(
+                prompt, _InsightDigestSchema, temperature=0.3,
+                tier=ModelTier.FAST, task_type="insight_digest",
+            )
             notables = []
             for ns in parsed.notable_symbols:
                 if ns.symbol in valid_symbols or not valid_symbols:

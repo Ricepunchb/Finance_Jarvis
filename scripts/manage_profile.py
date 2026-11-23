@@ -23,9 +23,12 @@ sys.path.insert(0, str(ROOT))
 from core.profile_manager import (
     get_active_profile,
     get_all_profiles_info,
+    is_intel_master_running,
     restart_profile,
+    start_intel_master,
     start_master_portal,
     start_profile,
+    stop_intel_master,
     stop_profile,
     switch_profile,
 )
@@ -99,6 +102,10 @@ def do_restart(name: str):
 
 
 def do_start_all():
+    print("\n🧠 마스터 인텔리전스 데몬(intel-master) 선기동 중...")
+    ok_intel, msg_intel = start_intel_master()
+    print(f"   결과: {'성공' if ok_intel else '실패'} - {msg_intel}")
+
     profiles = get_all_profiles_info()
     print(f"\n🚀 전체 프로필({len(profiles)}개) 일괄 기동 시작...")
     for p in profiles:
@@ -115,12 +122,30 @@ def do_stop_all():
         print(f"-> [{p['name']}] 정지 중...")
         ok, msg = stop_profile(p["name"])
         print(f"   결과: {msg}")
+    ok_intel, msg_intel = stop_intel_master()
+    print(f"-> [intel-master] 정지 결과: {msg_intel}")
     print("\n✅ 전체 정지 작업 완료!")
 
 
 def do_master():
     ok, msg = start_master_portal()
     print(f"\n🏢 {msg}\n")
+
+
+def do_intel_start():
+    ok, msg = start_intel_master()
+    print(f"\n🧠 {msg}\n")
+
+
+def do_intel_stop():
+    ok, msg = stop_intel_master()
+    print(f"\n🛑 {msg}\n")
+
+
+def do_intel_status():
+    running = is_intel_master_running()
+    badge = "🟢 실행 중" if running else "⚪ 중지됨"
+    print(f"\n🧠 마스터 인텔리전스 데몬 (intel-master): {badge}\n")
 
 
 def main():
@@ -142,9 +167,12 @@ def main():
     p_restart = subparsers.add_parser("restart", help="지정 프로필 tmux 세션 재기동")
     p_restart.add_argument("name", help="프로필 이름 (예: isa, real, mock)")
 
-    subparsers.add_parser("start-all", help="모든 프로필 일괄 기동")
-    subparsers.add_parser("stop-all", help="모든 프로필 일괄 정지")
+    subparsers.add_parser("start-all", help="마스터 데몬 + 모든 프로필 일괄 기동")
+    subparsers.add_parser("stop-all", help="모든 프로필 + 마스터 데몬 일괄 정지")
     subparsers.add_parser("master", help="전용 마스터 웹 관제 포털(:8500) 기동")
+    subparsers.add_parser("intel-start", help="독립 마스터 인텔리전스 데몬(intel-master) 기동")
+    subparsers.add_parser("intel-stop", help="독립 마스터 인텔리전스 데몬(intel-master) 중지")
+    subparsers.add_parser("intel-status", help="독립 마스터 인텔리전스 데몬 상태 확인")
 
     args = parser.parse_args()
 
@@ -164,6 +192,12 @@ def main():
         do_stop_all()
     elif args.action == "master":
         do_master()
+    elif args.action == "intel-start":
+        do_intel_start()
+    elif args.action == "intel-stop":
+        do_intel_stop()
+    elif args.action == "intel-status":
+        do_intel_status()
 
 
 if __name__ == "__main__":
