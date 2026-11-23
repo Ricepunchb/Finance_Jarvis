@@ -243,6 +243,25 @@ class ShadowDecisionRouter(LLMProvider):
         """하위 provider의 구조화 생성 호출을 그대로 위임한다."""
         return await self._llm._generate(*args, **kwargs)  # type: ignore[attr-defined]
 
+    async def score_news_surprise(
+        self, symbol: str, title: str, summary: str
+    ) -> Optional[Tuple[int, str, float]]:
+        """Tier 1 로컬 Open-Jev로 미장 뉴스 1차 Surprise 점수를 산출한다 (active 모드 전용, 비용 $0)."""
+        if self._mode != "active":
+            return None
+        t0 = time.perf_counter()
+        score, impact, conf = await self._decision.score_news_surprise(symbol, title, summary)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        await self._tracker.record(
+            task_type="us_surprise_filter",
+            tier=ModelTier.DECISION.value,
+            provider="open_jev",
+            model=self._decision.model_name,
+            latency_ms=elapsed_ms,
+            status="ok",
+        )
+        return score, impact, conf
+
     async def analyze_news(self, symbol: str, title: str, summary: str) -> Dict[str, Any]:
         if self._mode == "active":
             try:

@@ -112,3 +112,67 @@ def test_tier_model_routing_and_usage_recording(tmp_path, monkeypatch):
         assert summary["daily"][0]["total_tokens"] == 560
 
     asyncio.run(_run())
+
+
+def test_429_monthly_spending_cap_fails_immediately_without_retry(tmp_path, monkeypatch):
+    """429 monthly spending cap 에러도 402와 동일하게 재시도 없이 즉시 폴백되는지 검증."""
+    async def _run():
+        monkeypatch.setattr(settings, "GEMINI_API_KEY", "test-key")
+        tracker = UsageTracker(db_path=str(tmp_path / "intel.db"), weekly_cost_usd_limit=1.50)
+        provider = GeminiProvider(usage_tracker=tracker)
+
+        call_count = 0
+
+        async def _fake_generate_content(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise genai_errors.ClientError(
+                429,
+                {
+                    "error": {
+                        "code": 429,
+                        "message": "Your project has exceeded its monthly spending cap. billing#project-spend-caps",
+                        "status": "RESOURCE_EXHAUSTED",
+                    }
+                },
+            )
+
+        provider._client = SimpleNamespace(
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate_content))
+        )
+
+        t0 = time.perf_counter()
+        res = await provider.analyze_news("GOOGL", "Test", "Summary")
+        assert res["direction"] == "HOLD"
+        assert call_count == 1
+        assert (time.perf_counter() - t0) < 1.0
+
+    asyncio.run(_run())
+
+
+def test_us_surprise_tier1_filter_skips_gemini_below_threshold():
+    """Tier 1 Open-Jev 1차 점수가 75 미만이면 Gemini _generate를 0회 호출하고 즉시 반환하는지 검증."""
+    from core.us_market.surprise import NewsArticle, NewsCluster, analyze_news_surprise
+
+    async def _run():
+        gemini_calls = 0
+
+        class _StubRouter:
+            async def score_news_surprise(self, symbol, title, summary):
+                return 25, "중립", 0.85
+
+            async def _generate(self, *args, **kwargs):
+                nonlocal gemini_calls
+                gemini_calls += 1
+                raise AssertionError("75점 미만에서 Gemini가 호출되면 안 됨")
+
+        art = NewsArticle(symbol="NVDA", title="Routine market wrap", summary="Quiet day")
+        cl = NewsCluster(cluster_id="c1", symbol="NVDA", anchor=art, articles=[art], sources=["Reuters"])
+
+        res = await analyze_news_surprise(cl, llm_provider=_StubRouter(), summary_threshold=75)
+        assert res.surprise_score == 25
+        assert res.impact_type == "중립"
+        assert gemini_calls == 0
+
+    asyncio.run(_run())
+

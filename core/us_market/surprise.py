@@ -249,6 +249,33 @@ async def analyze_news_surprise(
     other_context = f"\n(동일 이슈 추가 보도: {'; '.join(other_titles)})" if other_titles else ""
 
     if llm_provider is not None:
+        # 1단계: Tier 1 로컬 Open-Jev(laya-router, $0) 1차 서프라이즈 필터
+        # 75점 미만 뉴스는 Gemini를 전혀 호출하지 않고 즉시 반환해 토큰 90%+ 절감
+        tier1_fallback: Optional[SurpriseAnalysisResult] = None
+        if hasattr(llm_provider, "score_news_surprise"):
+            try:
+                t1 = await llm_provider.score_news_surprise(sym, title, summary)
+                if t1 is not None:
+                    t1_score, t1_impact, t1_conf = t1
+                    if current_price_change_pct is not None:
+                        abs_chg = abs(current_price_change_pct)
+                        if abs_chg >= 4.0:
+                            t1_score = min(100, max(t1_score, int(t1_score * 0.7 + 90 * 0.3)))
+                        elif abs_chg >= 2.0:
+                            t1_score = min(100, max(t1_score, int(t1_score * 0.8 + 75 * 0.2)))
+                    tier1_fallback = SurpriseAnalysisResult(
+                        surprise_score=t1_score,
+                        impact_type=t1_impact,
+                        affected_sector_theme="미국/글로벌 증시",
+                        summary_sentences=[title],
+                        rationale=f"Tier 1 로컬 Open-Jev 1차 판정 (score={t1_score}, conf={t1_conf:.2f})",
+                    )
+                    if t1_score < summary_threshold:
+                        return tier1_fallback
+            except Exception as t1_err:
+                logger.warning(f"'{sym}' Tier 1 Open-Jev 1차 필터 오류 — Tier 2로 진행: {t1_err}")
+
+        # 2단계: 1차 통과(75점 이상) 또는 Tier 1 미사용 시 Tier 2 Gemini Fast로 한국어 3줄 요약 생성
         try:
             prompt = (
                 f"다음은 미국 주식/글로벌 시장의 종목 '{sym}' 관련 뉴스다.\n"
@@ -305,7 +332,9 @@ async def analyze_news_surprise(
                     rationale=parsed.rationale or "시장 기대치 대비 괴리도 분석 완료",
                 )
         except Exception as e:
-            logger.warning(f"'{sym}' 뉴스 서프라이즈 LLM 분석 실패 - 휴리스틱 대체: {e}")
+            logger.warning(f"'{sym}' 뉴스 서프라이즈 LLM 분석 실패 - 폴백 대체: {e}")
+            if tier1_fallback is not None:
+                return tier1_fallback
 
     # Fallback 휴리스틱 분석 (LLM 미연결 또는 장애 시)
     title_lower = title.lower()

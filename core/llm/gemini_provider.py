@@ -219,7 +219,14 @@ class GeminiProvider(LLMProvider):
     def _is_credit_exhausted_402(exc: Exception) -> bool:
         code = getattr(exc, "code", None)
         msg = str(exc).lower()
-        return code == 402 or "prepayment credits" in msg or "billing#prepay" in msg
+        return (
+            code == 402
+            or "prepayment credits" in msg
+            or "billing#prepay" in msg
+            or "monthly spending cap" in msg
+            or "project-spend-caps" in msg
+            or "spending cap" in msg
+        )
 
     @staticmethod
     def _extract_usage_tokens(response: Any) -> tuple[int, int, int, int]:
