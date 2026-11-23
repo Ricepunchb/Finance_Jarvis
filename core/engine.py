@@ -19,8 +19,8 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 
 from core import (
-    db, exit_guard, indicators, intraday, kis_domestic, meritz_overseas, proxy_mapping,
-    reconciliation, signal_engine,
+    db, exit_guard, flow_signals, indicators, intraday, kis_domestic, market_regime,
+    market_stream, meritz_overseas, proxy_mapping, reconciliation, signal_engine,
 )
 from core.config import get_effective_domestic_only, get_effective_proxy_trading, settings
 from core.fundamentals import valuation as fundamental_valuation
@@ -88,6 +88,12 @@ class TradingEngine:
         # (예전엔 처리한 종목 수만큼 무조건 차감해서 뒤 순서 종목이 영원히 못 받는 버그가 있었음).
         self._intraday_backfill_budget = intraday.BackfillBudget(0)
         self._orders_submitted_in_cycle = 0
+        self._stream_aggregator = market_stream.MinuteFlowAggregator()
+        self._regime_cache = market_regime.MarketRegimeCache()
+        self._cycle_lock = asyncio.Lock()
+        self._current_domestic_regime: Optional[market_regime.MarketRegime] = None
+        self._current_domestic_bench_df = None
+        self._symbol_names_cache: dict = {}
 
     @property
     def is_running(self) -> bool:
@@ -128,8 +134,12 @@ class TradingEngine:
                     )
                 else:
                     self.ws_client = KISWebSocketClient(
-                        hts_id=settings.KIS_HTS_ID, on_fill=self._on_fill, on_any_message=self._on_any_ws_message,
+                        hts_id=settings.KIS_HTS_ID,
+                        on_fill=self._on_fill,
+                        on_any_message=self._on_any_ws_message,
                         include_overseas=False,
+                        on_tick=self._on_ws_tick if settings.ENABLE_WS_MARKET_STREAM else None,
+                        on_program=self._on_ws_program if settings.ENABLE_WS_MARKET_STREAM else None,
                     )
                 await self.ws_client.start()
             else:
@@ -217,6 +227,104 @@ class TradingEngine:
         if self.risk is not None:
             await self.risk.mark_ws_message_received()
 
+    async def _on_ws_tick(self, row: dict) -> None:
+        """KIS 실시간 체결가(H0STCNT0) 수신 -> 1분 집계 및 급등락 Fast-Path 이벤트 판정."""
+        symbol = (row.get("MKSC_SHRN_ISCD") or "").strip()
+        if not symbol:
+            return
+        try:
+            price = float(row.get("STCK_PRPR") or 0)
+            volume = float(row.get("CNTG_VOL") or 0)
+            cttr_raw = row.get("CTTR")
+            cttr = float(cttr_raw) if cttr_raw not in (None, "") else None
+        except ValueError:
+            return
+        ccld = str(row.get("CCLD_DVSN") or "")
+        side = "buy" if ccld == "1" else ("sell" if ccld == "5" else None)
+        event = self._stream_aggregator.on_tick(symbol, price, volume, cttr=cttr, side=side)
+        if event is not None:
+            asyncio.create_task(self._handle_stream_event(event))
+
+    async def _on_ws_program(self, row: dict) -> None:
+        """KIS 실시간 프로그램매매(H0UPPGM0) 수신 -> 1분 롤링 델타 반영."""
+        symbol = (row.get("MKSC_SHRN_ISCD") or "").strip()
+        if not symbol:
+            return
+        try:
+            cum_vol = float(row.get("NTBY_CNQN") or row.get("WHOL_NTBY_QTY") or 0)
+            cum_amt = float(row.get("NTBY_TR_PBMN") or 0)
+        except ValueError:
+            return
+        self._stream_aggregator.on_program(symbol, cum_vol, cum_amt)
+
+    async def _handle_stream_event(self, event: market_stream.StreamEvent) -> None:
+        """분 단위 급락/급등 이벤트 Fast-Path 핸들러."""
+        if self.conn is None or self.risk is None or self._stop_event.is_set():
+            return
+        if not _is_krx_open_now() or await self.risk.is_kill_switch_active():
+            return
+
+        logger.info(f"[WS Fast-Path] {event.symbol} {event.detail}")
+
+        if event.kind == "SURGE" and settings.WS_FASTPATH_SURGE_DRY_RUN:
+            logger.info(
+                f"[WS Fast-Path DRY-RUN] '{event.symbol}' 급등/고래 유입 관측 로그만 기록 ({event.detail})"
+            )
+            return
+
+        async with self._cycle_lock:
+            try:
+                balance = await kis_domestic.get_balance(self.client)
+                holdings_by_symbol = {h["pdno"]: h for h in balance["holdings"] if h.get("pdno")}
+                total_equity = float(balance["summary"].get("nass_amt") or 0)
+                holding = holdings_by_symbol.get(event.symbol)
+                qty = float(holding.get("hldg_qty") or 0) if holding else 0.0
+
+                if event.kind == "PLUNGE":
+                    if qty <= 0 or total_equity <= 0:
+                        return
+                    avg_price = float(holding.get("pchs_avg_pric") or 0)
+                    pos = await db.get_position(self.conn, event.symbol)
+                    peak_price = pos["peak_price_since_entry"] if pos else None
+                    is_accumulation = (
+                        settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False)
+                    )
+                    exit_decision = exit_guard.evaluate_exit(
+                        avg_price, peak_price, event.price, atr_pct=None,
+                        is_uptrend=False, accumulation_mode=is_accumulation,
+                    )
+                    if exit_decision is not None:
+                        cycle_id = await db.new_cycle(self.conn)
+                        active_weights = await db.get_active_target_weights(self.conn)
+                        target_weight = active_weights.get(event.symbol, 0.0)
+                        current_weight = (qty * event.price) / total_equity
+                        sell_qty = (
+                            qty
+                            if exit_decision.sell_ratio >= 1.0
+                            else max(1.0, float(int(qty * exit_decision.sell_ratio)))
+                        )
+                        await self._submit_exit_order(
+                            cycle_id, event.symbol, target_weight, current_weight,
+                            sell_qty, event.price, avg_price, exit_decision.reason,
+                            {"fast_path_event": event.detail, "price": event.price},
+                        )
+                elif event.kind == "SURGE":
+                    active_weights = await db.get_active_target_weights(self.conn)
+                    target_weight = active_weights.get(event.symbol, 0.0)
+                    if target_weight <= 0 or total_equity <= 0:
+                        return
+                    cycle_id = await db.new_cycle(self.conn)
+                    ws_ok = (
+                        not settings.ENABLE_WEBSOCKET
+                        or (self.ws_client is not None and self.ws_client.is_connected)
+                        or await self.risk.is_ws_healthy()
+                    )
+                    await self._process_symbol(
+                        cycle_id, event.symbol, target_weight, holding, total_equity, ws_ok,
+                    )
+            except Exception:
+                logger.exception(f"[WS Fast-Path] '{event.symbol}' 이벤트 처리 중 예외")
+
     async def _on_fill(self, row: dict) -> None:
         """체결통보 수신 -> 해당 order_intent를 찾아 상태 갱신 + fills 기록."""
         if self.conn is None:
@@ -277,6 +385,10 @@ class TradingEngine:
                 pass
 
     async def _run_one_cycle(self) -> None:
+        async with self._cycle_lock:
+            await self._run_one_cycle_locked()
+
+    async def _run_one_cycle_locked(self) -> None:
         assert self.conn is not None and self.risk is not None
         us_open = (not settings.DOMESTIC_ONLY) and _is_us_market_open_now()
         if not (_is_krx_open_now() or us_open):
@@ -356,6 +468,41 @@ class TradingEngine:
         for s in sorted(held_domestic_symbols | held_overseas_symbols):
             if s not in active_weights:
                 all_symbols.append(s)
+
+        # 국내 웹소켓 시장 스트림 구독 동기화 + 시장 레짐(RISK_OFF) 1회 평가
+        if not self.is_meritz and _is_krx_open_now():
+            domestic_subs = [
+                s for s in all_symbols
+                if (symbol_info.get(s) or {}).get("market", "domestic") != "overseas"
+            ]
+            if (
+                self.ws_client is not None
+                and hasattr(self.ws_client, "sync_market_subscriptions")
+                and settings.ENABLE_WS_MARKET_STREAM
+            ):
+                try:
+                    await self.ws_client.sync_market_subscriptions(domestic_subs)
+                except Exception:
+                    logger.debug("WS 실시간 시장 스트림 구독 동기화 실패", exc_info=True)
+
+            if settings.MARKET_REGIME_ENABLED:
+                try:
+                    today_dt = datetime.now(tz=KST)
+                    self._current_domestic_bench_df = await self._load_daily_df(
+                        settings.MARKET_REGIME_DOMESTIC_BENCHMARK, today_dt
+                    )
+                    self._current_domestic_regime = await market_regime.fetch_domestic_market_regime(
+                        self.client, self._current_domestic_bench_df, cache=self._regime_cache
+                    )
+                except Exception:
+                    logger.debug("국내 시장 레짐 평가 실패 - 중립 폴백", exc_info=True)
+                    self._current_domestic_regime = None
+
+            try:
+                rows = await self.conn.execute("SELECT symbol, name FROM stock_master")
+                self._symbol_names_cache = {r["symbol"]: r["name"] for r in await rows.fetchall()}
+            except Exception:
+                pass
 
         for symbol in all_symbols:
             info = symbol_info.get(symbol) or {}
@@ -607,6 +754,30 @@ class TradingEngine:
                 valuation_signal = await fundamental_valuation.get_valuation_signal(self.conn, self.client, symbol)
             except Exception:
                 logger.exception(f"'{symbol}' 밸류에이션 시그널 조회 오류 - 밸류에이션 없이 계속")
+
+        ws_snap = self._stream_aggregator.get_snapshot(symbol)
+        flow_signal = await flow_signals.get_domestic_flow_signal(
+            self.client,
+            symbol,
+            df,
+            benchmark_df=self._current_domestic_bench_df,
+            ws_snapshot=ws_snap,
+        )
+        context["flow_signal"] = flow_signal
+        regime_label = (
+            self._current_domestic_regime.regime
+            if self._current_domestic_regime is not None
+            else None
+        )
+        context["market_regime"] = (
+            self._current_domestic_regime.to_dict()
+            if self._current_domestic_regime is not None
+            else None
+        )
+        context["news_veto"] = signal_engine.is_bad_news_veto(sentiment_signal)
+        sym_name = self._symbol_names_cache.get(symbol, "")
+        is_defensive = market_regime.is_defensive_asset(symbol, sym_name)
+
         is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         action = await signal_engine.decide(
             symbol=symbol,
@@ -617,6 +788,9 @@ class TradingEngine:
             intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
             valuation_signal=valuation_signal,
+            flow_signal=flow_signal,
+            market_regime=regime_label,
+            is_defensive=is_defensive,
             price=price,
             current_position_qty=qty,
             current_position_value=position_value,
@@ -632,8 +806,8 @@ class TradingEngine:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
                 ("정리 대기 - 매도 신호 대기 중 " if winddown_liquidating is not None else "조건 미충족 ")
-                + f"(tech={tech_signal}, intraday={intraday_signal}, "
-                f"sentiment={sentiment_signal}, valuation={valuation_signal})",
+                + f"(tech={tech_signal}, intraday={intraday_signal}, flow={flow_signal}, "
+                f"regime={regime_label}, news_veto={context['news_veto']})",
                 context,
             )
             return False
@@ -940,6 +1114,12 @@ class TradingEngine:
             )
         except Exception:
             logger.exception(f"'{symbol}' 해외 밸류에이션 시그널 계산 오류 - 기술적 지표만 사용")
+
+        flow_signal = flow_signals.get_overseas_flow_signal(df)
+        context["flow_signal"] = flow_signal
+        context["news_veto"] = signal_engine.is_bad_news_veto(sentiment_signal)
+        is_defensive = market_regime.is_defensive_asset(symbol)
+
         is_accumulation = (settings.PROFILE_NAME == "isa" or getattr(settings, "ACCUMULATION_MODE", False))
         action = await signal_engine.decide(
             symbol=symbol,
@@ -950,6 +1130,8 @@ class TradingEngine:
             intraday_signal=intraday_signal,
             sentiment_signal=sentiment_signal,
             valuation_signal=valuation_signal,
+            flow_signal=flow_signal,
+            is_defensive=is_defensive,
             price=eval_price,  # 메리츠 해외는 USD price, KIS 프록시는 KRW price로 total_equity와 100% 일치
             current_position_qty=qty,
             current_position_value=position_value,
@@ -966,7 +1148,7 @@ class TradingEngine:
             await self._log_no_op(
                 cycle_id, symbol, target_weight,
                 ("정리 대기 - 매도 신호 대기 중 " if winddown_liquidating is not None else "조건 미충족 ")
-                + f"(tech={tech_signal}, intraday={intraday_signal}, sentiment={sentiment_signal})",
+                + f"(tech={tech_signal}, intraday={intraday_signal}, flow={flow_signal}, news_veto={context['news_veto']})",
                 context,
             )
             return

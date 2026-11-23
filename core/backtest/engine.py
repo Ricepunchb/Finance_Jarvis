@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from core import exit_guard, indicators, signal_engine
+from core import exit_guard, flow_signals, indicators, market_regime, signal_engine
 from core.config import settings
 
 
@@ -82,6 +82,12 @@ class BacktestEngine:
         require_sma20_for_buy: bool = settings.REQUIRE_SMA20_FOR_BUY,
         allow_expensive_stock_single_share: bool = True,
         strategy_mode: str = "auto",
+        use_flow_signal: bool = True,
+        flow_weight: float = settings.SIGNAL_WEIGHT_FLOW,
+        flow_confirm_boost: float = settings.FLOW_CONFIRM_BOOST,
+        flow_divergence_veto: float = settings.FLOW_DIVERGENCE_VETO_STRENGTH,
+        use_market_regime: bool = settings.MARKET_REGIME_ENABLED,
+        benchmark_df: Optional[pd.DataFrame] = None,
     ):
         self.symbols = symbols
         self.data = data_by_symbol
@@ -98,6 +104,12 @@ class BacktestEngine:
         self.require_uptrend_for_onboarding = require_uptrend_for_onboarding
         self.require_sma20_for_buy = require_sma20_for_buy
         self.allow_expensive_stock_single_share = allow_expensive_stock_single_share
+        self.use_flow_signal = use_flow_signal
+        self.flow_weight = flow_weight
+        self.flow_confirm_boost = flow_confirm_boost
+        self.flow_divergence_veto = flow_divergence_veto
+        self.use_market_regime = use_market_regime
+        self.benchmark_df = benchmark_df
         self.strategy_mode = (strategy_mode or "auto").strip().lower()
 
         # 균등 비중 기본값
@@ -332,11 +344,34 @@ class BacktestEngine:
                     self._execute_sell(symbol, trim_qty, close_p, cur_date, "band_ceiling_forced_trim")
                     continue
 
-            # 2. 기술적 지표 시그널 산출
+            # 2. 기술적 지표 + Layer A 수급(OHLCV) + 시장 레짐 결합
             tech_sig = indicators.compute_technical_signal(hist)
-            combined = signal_engine.combine_signals(tech_sig, None, None, None)
+            bench_hist = None
+            if self.benchmark_df is not None and not self.benchmark_df.empty:
+                bench_hist = self.benchmark_df[self.benchmark_df["date"] <= pd.Timestamp(cur_date)]
+
+            flow_sig = (
+                flow_signals.compute_ohlcv_flow_signal(hist, benchmark_df=bench_hist)
+                if self.use_flow_signal
+                else None
+            )
+            combined = signal_engine.combine_signals(
+                tech_sig,
+                None,
+                None,
+                None,
+                flow=flow_sig,
+                flow_weight=self.flow_weight,
+                flow_confirm_boost=self.flow_confirm_boost,
+                flow_divergence_veto=self.flow_divergence_veto,
+            )
             direction = combined.get("direction", "HOLD")
             strength = float(combined.get("strength", 0.0))
+
+            if self.use_market_regime and bench_hist is not None and len(bench_hist) >= 2:
+                regime = market_regime.evaluate_market_regime(bench_hist, benchmark_symbol="BENCH")
+                if regime.regime == "RISK_OFF" and not market_regime.is_defensive_asset(symbol):
+                    allow_buy = False
 
             # 3. 분할 온보딩 매수 (하락 추세 종목은 물타기 방지를 위해 유예)
             if settings.ONBOARDING_ENABLED and target_weight > 0 and cur_weight < (target_weight - settings.REBALANCE_BAND_PCT):

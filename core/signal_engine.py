@@ -38,41 +38,112 @@ class Action:
 
 def _score(sig: Signal) -> float:
     m = {"BUY": 1.0, "SELL": -1.0, "HOLD": 0.0}
-    return m.get(sig.get("direction", "HOLD"), 0.0) * sig.get("strength", 0.0)
+    return m.get(sig.get("direction", "HOLD"), 0.0) * float(sig.get("strength", 0.0))
+
+
+def is_bad_news_veto(
+    sentiment: Optional[Signal],
+    *,
+    enabled: Optional[bool] = None,
+    threshold: Optional[float] = None,
+) -> bool:
+    """극단적 악재 뉴스(SELL & strength >= threshold)일 때 신규 매수만 차단하는 비대칭 Veto."""
+    use_veto = settings.NEWS_VETO_ENABLED if enabled is None else enabled
+    if not use_veto or not sentiment:
+        return False
+    th = settings.NEWS_VETO_STRENGTH_THRESHOLD if threshold is None else threshold
+    return sentiment.get("direction") == "SELL" and float(sentiment.get("strength", 0.0)) >= th
 
 
 def combine_signals(
     tech: Signal,
     intraday: Optional[Signal],
-    sentiment: Optional[Signal],
+    sentiment: Optional[Signal] = None,
     valuation: Optional[Signal] = None,
+    flow: Optional[Signal] = None,
+    *,
+    tech_weight: Optional[float] = None,
+    intraday_weight: Optional[float] = None,
+    flow_weight: Optional[float] = None,
+    valuation_weight: Optional[float] = None,
+    flow_confirm_boost: Optional[float] = None,
+    flow_divergence_veto: Optional[float] = None,
 ) -> Signal:
-    """존재하는 시그널끼리만 가중치를 재정규화한다 — 분봉 데이터가 아직 부족한 종목이나
-    밸류에이션이 안 붙는 해외종목도 나머지 시그널만으로 그대로 동작한다."""
-    parts = [(tech, 0.30)]
+    """수급(flow) 선행 방향 + 기술적 지표(tech/intraday) 확인 결합 함수.
+
+    - 뉴스(sentiment)는 뒷북·희석 방지를 위해 방향성 가중합에서 제외하며(하위호환 인자만 유지),
+      decide()의 비대칭 악재 Veto 게이트로만 사용한다.
+    - 수급과 기술 지표의 방향이 일치하면 강도를 부스트(FLOW_CONFIRM_BOOST)한다.
+    - 결합 방향이 BUY인데 수급이 강한 SELL이면 매수를 억제(HOLD 강등)한다.
+    """
+    _ = sentiment  # 방향성 합산 미사용 (Veto 전용)
+    w_tech = settings.SIGNAL_WEIGHT_TECH if tech_weight is None else tech_weight
+    w_intra = settings.SIGNAL_WEIGHT_INTRADAY if intraday_weight is None else intraday_weight
+    w_flow = settings.SIGNAL_WEIGHT_FLOW if flow_weight is None else flow_weight
+    w_val = settings.SIGNAL_WEIGHT_VALUATION if valuation_weight is None else valuation_weight
+    boost = settings.FLOW_CONFIRM_BOOST if flow_confirm_boost is None else flow_confirm_boost
+    div_veto = (
+        settings.FLOW_DIVERGENCE_VETO_STRENGTH
+        if flow_divergence_veto is None
+        else flow_divergence_veto
+    )
+
+    parts = [(tech, w_tech)]
     if intraday is not None:
-        parts.append((intraday, 0.50))  # 스윙의 주 동력
-    if sentiment is not None:
-        parts.append((sentiment, 0.20))
+        parts.append((intraday, w_intra))
+    if flow is not None:
+        parts.append((flow, w_flow))
     if valuation is not None:
-        parts.append((valuation, 0.20))
+        parts.append((valuation, w_val))
 
     total_weight = sum(w for _, w in parts)
+    if total_weight <= 0:
+        return {"direction": "HOLD", "strength": 0.0}
+
     combined_score = sum(_score(sig) * w for sig, w in parts) / total_weight
+
+    # 기술적 축(일봉+30분봉)과 수급 축의 합의/역행 판정
+    tech_parts = [(tech, w_tech)] + ([(intraday, w_intra)] if intraday is not None else [])
+    tech_w_sum = sum(w for _, w in tech_parts)
+    tech_axis = sum(_score(s) * w for s, w in tech_parts) / tech_w_sum if tech_w_sum > 0 else 0.0
+
+    detail_tags = []
+    if flow is not None:
+        flow_dir = flow.get("direction", "HOLD")
+        flow_str = float(flow.get("strength", 0.0))
+        if flow_dir == "BUY" and tech_axis > 0.15:
+            combined_score = min(1.0, combined_score * boost)
+            detail_tags.append("flow_confirmed_buy")
+        elif flow_dir == "SELL" and tech_axis < -0.15:
+            combined_score = max(-1.0, combined_score * boost)
+            detail_tags.append("flow_confirmed_sell")
+        elif combined_score > 0.15 and flow_dir == "SELL" and flow_str >= div_veto:
+            return {
+                "direction": "HOLD",
+                "strength": 0.0,
+                "detail": f"flow_divergence_veto(flow_sell={flow_str:.2f})",
+            }
+
     direction = "BUY" if combined_score > 0.15 else "SELL" if combined_score < -0.15 else "HOLD"
-    return {"direction": direction, "strength": min(1.0, abs(combined_score))}
+    res: Signal = {"direction": direction, "strength": min(1.0, abs(combined_score))}
+    if detail_tags:
+        res["detail"] = ",".join(detail_tags)
+    return res
 
 
 async def _onboarding_action(
     *, symbol: Optional[str], combined: Signal, drift, target_weight: float, price: float,
     current_position_value: float, total_equity: float, risk: RiskManager,
     accumulation_mode: bool = False, is_downtrend: bool = False,
+    news_veto: bool = False, risk_off_block: bool = False,
 ) -> Optional[Action]:
     """분할 온보딩 매수. 스윙 시그널 문턱(0.5)은 "언제 비중을 키우느냐"를 정하는 용도라, 신규
     편입/저비중 종목이 목표비중까지 가는 경로가 없었다. 퀀트의 통상 방식대로 목표비중과의 갭을
     (목표금액 / ONBOARDING_DAYS)의 일일 예산만큼 여러 사이클에 나눠 메운다(TWAP 성격).
     시그널은 진입 여부가 아니라 "명백한 하락 신호일 때만 보류"하는 최소 필터로만 쓴다."""
     if not settings.ONBOARDING_ENABLED or symbol is None or target_weight <= 0:
+        return None
+    if news_veto or risk_off_block:
         return None
     # 아직 1주도 보유하지 않은 신규 편입 종목은 target_weight <= band(예: 5% vs ±5%)라도 온보딩을 시작한다.
     if drift.required_direction != "BUY" and not (current_position_value <= 0 and target_weight > 0):
@@ -123,6 +194,9 @@ async def decide(
     intraday_signal: Optional[Signal],
     sentiment_signal: Optional[Signal],
     valuation_signal: Optional[Signal] = None,
+    flow_signal: Optional[Signal] = None,
+    market_regime: Optional[str] = None,
+    is_defensive: bool = False,
     price: float,
     current_position_qty: float,
     current_position_value: float,
@@ -146,7 +220,9 @@ async def decide(
         if current_position_qty <= 0:
             return None
         if not winddown_liquidating:
-            combined = combine_signals(tech_signal, intraday_signal, sentiment_signal, valuation_signal)
+            combined = combine_signals(
+                tech_signal, intraday_signal, sentiment_signal, valuation_signal, flow=flow_signal
+            )
             if combined["direction"] != "SELL":
                 return None
         qty = risk.clamp_qty_to_notional(current_position_qty, price, symbol=symbol)
@@ -167,9 +243,16 @@ async def decide(
         qty = float(max(1, int(min(qty, current_position_qty))))
         return Action(side=side, qty=qty, order_type="limit", price=price, reason="excluded_liquidation")
 
-    combined = combine_signals(tech_signal, intraday_signal, sentiment_signal, valuation_signal)
+    combined = combine_signals(
+        tech_signal, intraday_signal, sentiment_signal, valuation_signal, flow=flow_signal
+    )
     drift = compute_drift(current_weight, target_weight, band)
     ceiling_weight = target_weight + band + BAND_CEILING_BUFFER_PCT
+    news_veto = is_bad_news_veto(sentiment_signal)
+    is_accumulation = bool(accumulation_mode)
+    risk_off_block = (
+        market_regime == "RISK_OFF" and not is_defensive and not is_accumulation
+    )
 
     if drift.required_direction == "SELL" and current_weight > ceiling_weight:
         # 밴드+버퍼를 넘어선 과대비중:
@@ -183,7 +266,6 @@ async def decide(
         qty = (current_weight - drift.edge_weight()) * total_equity / price
         reason = "band_ceiling_forced_trim"
     else:
-        is_accumulation = bool(accumulation_mode)
         is_downtrend = bool(tech_signal.get("is_downtrend", False))
         # ISA/적립식 계좌: 단기 기술적 하락 시그널에 의한 분할 매도(swing_signal sell) 차단.
         # 우량 자산을 모아가는 장기 계좌에서 바닥 털림을 방지한다.
@@ -193,6 +275,7 @@ async def decide(
                 symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
                 current_position_value=current_position_value, total_equity=total_equity, risk=risk,
                 accumulation_mode=is_accumulation, is_downtrend=is_downtrend,
+                news_veto=news_veto, risk_off_block=risk_off_block,
             )
 
         if combined["direction"] == "HOLD" or combined["strength"] < SWING_SIGNAL_THRESHOLD:
@@ -200,10 +283,14 @@ async def decide(
                 symbol=symbol, combined=combined, drift=drift, target_weight=target_weight, price=price,
                 current_position_value=current_position_value, total_equity=total_equity, risk=risk,
                 accumulation_mode=is_accumulation, is_downtrend=is_downtrend,
+                news_veto=news_veto, risk_off_block=risk_off_block,
             )
         side = combined["direction"].lower()
-        if side == "buy" and not is_accumulation and is_downtrend and settings.REQUIRE_SMA20_FOR_BUY:
-            return None
+        if side == "buy":
+            if news_veto or risk_off_block:
+                return None
+            if not is_accumulation and is_downtrend and settings.REQUIRE_SMA20_FOR_BUY:
+                return None
         trade_value = combined["strength"] * SWING_TRADE_MAX_EQUITY_FRACTION * total_equity
         if side == "buy":
             room_value = max(0.0, ceiling_weight * total_equity - current_position_value)

@@ -463,3 +463,84 @@ async def get_period_rights(
 
     return all_rows
 
+
+# --- 고래/수급 탐지용 시세분석 API (모의투자 일부 미지원 시 호출측에서 Layer A 폴백) ---
+
+async def get_recent_executions(client: AsyncKISClient, symbol: str) -> List[Dict[str, Any]]:
+    """주식현재가 체결(FHKST01010300). 최근 체결 내역 및 체결강도(tday_rltv) 조회."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/inquire-ccnl",
+        tr_id=tr_ids.INQUIRE_CCNL_TR_ID,
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol},
+    )
+    out = _ensure_ok(response).get("output", [])
+    return out if isinstance(out, list) else []
+
+
+async def get_investor_trend(client: AsyncKISClient, symbol: str) -> List[Dict[str, Any]]:
+    """종목별 투자자(외인/기관/개인) 매매동향(FHKST01010900). 최근 일별·당일 가집계 순매수."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/inquire-investor",
+        tr_id=tr_ids.INQUIRE_INVESTOR_TR_ID,
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol},
+    )
+    out = _ensure_ok(response).get("output", [])
+    return out if isinstance(out, list) else []
+
+
+async def get_program_trade_by_stock(client: AsyncKISClient, symbol: str) -> List[Dict[str, Any]]:
+    """종목별 프로그램매매 추이(체결)(FHPPG04650100). 당일 장중 프로그램 순매수 수량/금액."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
+        tr_id=tr_ids.PROGRAM_TRADE_BY_STOCK_TR_ID,
+        params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol},
+    )
+    out = _ensure_ok(response).get("output", [])
+    return out if isinstance(out, list) else []
+
+
+async def get_market_program_today(
+    client: AsyncKISClient, mrkt_cls_code: str = "1"
+) -> List[Dict[str, Any]]:
+    """프로그램매매 투자자매매동향(당일)(HHPPG046600C1). mrkt_cls_code: '1'=코스피, '4'=코스닥."""
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/investor-program-trade-today",
+        tr_id=tr_ids.INVESTOR_PROGRAM_TODAY_TR_ID,
+        params={"MRKT_DIV_CLS_CODE": mrkt_cls_code},
+    )
+    out = _ensure_ok(response).get("output", [])
+    return out if isinstance(out, list) else []
+
+
+async def get_foreign_institution_total(
+    client: AsyncKISClient,
+    market_code: str = "0001",
+    investor_code: str = "0",
+    sort_by_amount: bool = True,
+) -> List[Dict[str, Any]]:
+    """국내기관_외국인 매매종목 가집계(FHPTJ04400000).
+
+    market_code: '0000'=전체, '0001'=코스피, '1001'=코스닥
+    investor_code: '0'=전체(외인+기관), '1'=외국인, '2'=기관계
+    """
+    response = await client.request(
+        method="GET",
+        path="/uapi/domestic-stock/v1/quotations/foreign-institution-total",
+        tr_id=tr_ids.FOREIGN_INST_TOTAL_TR_ID,
+        params={
+            "FID_COND_MRKT_DIV_CODE": "V",
+            "FID_COND_SCR_DIV_CODE": "16449",
+            "FID_INPUT_ISCD": market_code,
+            "FID_DIV_CLS_CODE": "0" if sort_by_amount else "1",
+            "FID_RANK_SORT_CLS_CODE": "0",  # 0: 순매수 상위
+            "FID_ETC_CLS_CODE": investor_code,
+        },
+    )
+    out = _ensure_ok(response).get("output", [])
+    return out if isinstance(out, list) else []
+
+

@@ -25,7 +25,11 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 from core.config import settings
-from core.tr_ids import ccnl_notice_tr_id
+from core.tr_ids import (
+    WS_EXECUTION_TR_ID,
+    WS_PROGRAM_TR_ID,
+    ccnl_notice_tr_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +47,26 @@ _DOMESTIC_CCNL_COLUMNS = [
     "CRDT_LOAN_DATE", "CNTG_ISNM40", "ODER_PRC",
 ]
 
+# KIS 국내주식 실시간 체결가 (H0STCNT0) 주요 컬럼 레이아웃 (앞 22개 필드로 핵심 체결/체결강도 추출)
+_DOMESTIC_EXECUTION_COLUMNS = [
+    "MKSC_SHRN_ISCD", "STCK_CNTG_HOUR", "STCK_PRPR", "PRDY_VRSS_SIGN", "PRDY_VRSS",
+    "PRDY_CTRT", "WGHN_AVRG_STCK_PRC", "STCK_OPRC", "STCK_HGPR", "STCK_LWPR",
+    "ASKP1", "BIDP1", "CNTG_VOL", "ACML_VOL", "ACML_TR_PBMN",
+    "SELN_CNTG_CSNU", "SHNU_CNTG_CSNU", "NTBY_CNTG_CSNU", "CTTR",
+    "SELN_CNTG_SMTN", "SHNU_CNTG_SMTN", "CCLD_DVSN",
+]
+
+# KIS 국내주식 실시간 프로그램매매 (H0UPPGM0 / H0STPGM0) 컬럼 레이아웃
+_DOMESTIC_PROGRAM_COLUMNS = [
+    "MKSC_SHRN_ISCD", "STCK_CNTG_HOUR",
+    "SELN_CNQN", "SELN_TR_PBMN", "SHNU_CNQN", "SHNU_TR_PBMN",
+    "NTBY_CNQN", "NTBY_TR_PBMN",
+    "SELN_RSQN", "SHNU_RSQN", "WHOL_NTBY_QTY",
+]
+
 OnFill = Callable[[dict], Awaitable[None]]
 OnAnyMessage = Callable[[], Awaitable[None]]
+OnMarketRow = Callable[[dict], Awaitable[None]]
 
 
 async def issue_approval_key() -> str:
@@ -79,14 +101,27 @@ class KISWebSocketClient:
     _RECONNECT_MAX_DELAY_SEC = 60
     _HEARTBEAT_INTERVAL_SEC = 30  # 연결 유지 시 생존신호 갱신 주기 (데드락 방지)
 
-    def __init__(self, hts_id: str, on_fill: OnFill, on_any_message: OnAnyMessage, include_overseas: bool = False):
+    def __init__(
+        self,
+        hts_id: str,
+        on_fill: OnFill,
+        on_any_message: OnAnyMessage,
+        include_overseas: bool = False,
+        on_tick: Optional[OnMarketRow] = None,
+        on_program: Optional[OnMarketRow] = None,
+    ):
         self.hts_id = hts_id
         self.on_fill = on_fill
         self.on_any_message = on_any_message
         self.include_overseas = include_overseas
+        self.on_tick = on_tick
+        self.on_program = on_program
         self._ws: Optional[websockets.ClientConnection] = None
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._approval_key: Optional[str] = None
+        self._subscribed_symbols: List[str] = []
+        self._program_tr_id: str = getattr(settings, "WS_PROGRAM_TR_ID", WS_PROGRAM_TR_ID)
         self._columns_by_tr_id: Dict[str, List[str]] = {}
         self._enc_state: Dict[str, Tuple[str, str]] = {}  # tr_id -> (key, iv)
         self._stopping = False
@@ -129,8 +164,56 @@ class KISWebSocketClient:
             except Exception as e:
                 logger.debug(f"웹소켓 하트비트 갱신 중 예외: {e}")
 
+    async def _send_subscription(self, tr_id: str, tr_key: str, tr_type: str = "1") -> None:
+        if not self.is_connected or self._approval_key is None or self._ws is None:
+            return
+        subscribe_msg = {
+            "header": {
+                "approval_key": self._approval_key,
+                "custtype": "P",
+                "tr_type": tr_type,
+                "content-type": "utf-8",
+            },
+            "body": {"input": {"tr_id": tr_id, "tr_key": tr_key}},
+        }
+        await self._ws.send(json.dumps(subscribe_msg))
+
+    async def sync_market_subscriptions(self, symbols: List[str]) -> None:
+        """활성 국내 종목의 실시간 체결(H0STCNT0) 및 프로그램(H0UPPGM0) 구독을 동기화한다.
+
+        KIS 단일 세션 41건 구독 한도를 넘지 않도록 WS_MAX_SUBSCRIBED_SYMBOLS 이내로 자른다.
+        """
+        if not settings.ENABLE_WS_MARKET_STREAM or (self.on_tick is None and self.on_program is None):
+            return
+        max_syms = max(0, int(settings.WS_MAX_SUBSCRIBED_SYMBOLS))
+        desired = list(dict.fromkeys(s.strip() for s in symbols if s and s.strip()))[:max_syms]
+
+        prev_set = set(self._subscribed_symbols)
+        desired_set = set(desired)
+        to_remove = [s for s in self._subscribed_symbols if s not in desired_set]
+        to_add = [s for s in desired if s not in prev_set]
+        self._subscribed_symbols = desired
+
+        if not self.is_connected:
+            return
+
+        for sym in to_remove:
+            if self.on_tick is not None:
+                await self._send_subscription(WS_EXECUTION_TR_ID, sym, tr_type="2")
+            if self.on_program is not None:
+                await self._send_subscription(self._program_tr_id, sym, tr_type="2")
+
+        for sym in to_add:
+            if self.on_tick is not None:
+                self._columns_by_tr_id[WS_EXECUTION_TR_ID] = _DOMESTIC_EXECUTION_COLUMNS
+                await self._send_subscription(WS_EXECUTION_TR_ID, sym, tr_type="1")
+            if self.on_program is not None:
+                self._columns_by_tr_id[self._program_tr_id] = _DOMESTIC_PROGRAM_COLUMNS
+                await self._send_subscription(self._program_tr_id, sym, tr_type="1")
+
     async def _connect_and_subscribe(self) -> None:
         approval_key = await issue_approval_key()
+        self._approval_key = approval_key
         # KIS 웹소켓은 표준 WS 핑퐁 대신 자체 전문을 사용하므로, 클라이언트 측 주기적 ping_interval을 비활성화한다.
         self._ws = await websockets.connect(WS_URL, ping_interval=None, ping_timeout=None)
         self._enc_state = {}  # 이전 세션의 key/iv는 무효 — 구독 응답으로 새로 받는다
@@ -139,16 +222,18 @@ class KISWebSocketClient:
 
         for tr_id, columns in subscriptions:
             self._columns_by_tr_id[tr_id] = columns
-            subscribe_msg = {
-                "header": {
-                    "approval_key": approval_key,
-                    "custtype": "P",
-                    "tr_type": "1",
-                    "content-type": "utf-8",
-                },
-                "body": {"input": {"tr_id": tr_id, "tr_key": self.hts_id}},
-            }
-            await self._ws.send(json.dumps(subscribe_msg))
+            await self._send_subscription(tr_id, self.hts_id, tr_type="1")
+
+        # 재연결 시 기존 시장 스트림(실시간 체결/프로그램) 구독 복구
+        if settings.ENABLE_WS_MARKET_STREAM and self._subscribed_symbols:
+            for sym in self._subscribed_symbols:
+                if self.on_tick is not None:
+                    self._columns_by_tr_id[WS_EXECUTION_TR_ID] = _DOMESTIC_EXECUTION_COLUMNS
+                    await self._send_subscription(WS_EXECUTION_TR_ID, sym, tr_type="1")
+                if self.on_program is not None:
+                    self._columns_by_tr_id[self._program_tr_id] = _DOMESTIC_PROGRAM_COLUMNS
+                    await self._send_subscription(self._program_tr_id, sym, tr_type="1")
+
         # 구독 요청 전송 완료 즉시 생존 신호 기록
         await self.on_any_message()
 
@@ -214,10 +299,15 @@ class KISWebSocketClient:
                 return  # 구독하지 않은 tr_id — 무시
             payload = parts[3]
             enc = self._enc_state.get(tr_id)
-            if enc is not None:
+            if enc is not None and raw[0] == "1":
                 payload = _aes_cbc_base64_dec(enc[0], enc[1], payload)
             row = dict(zip(columns, payload.split("^")))
-            await self.on_fill(row)
+            if tr_id == WS_EXECUTION_TR_ID and self.on_tick is not None:
+                await self.on_tick(row)
+            elif tr_id == self._program_tr_id and self.on_program is not None:
+                await self.on_program(row)
+            else:
+                await self.on_fill(row)
             return
 
         try:

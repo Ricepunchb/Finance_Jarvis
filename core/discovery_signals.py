@@ -127,6 +127,13 @@ def early_signal(entry: Dict[str, Any]) -> Tuple[float, List[str]]:
         score += 0.5
         reasons.append(f"'{laggard['theme']}' 테마 동료({', '.join(laggard['movers'][:3])})는 급등, 이 종목은 아직 미반영")
 
+    whale = (entry.get("sources") or {}).get("whale_flow")
+    if whale:
+        whale_boost = 0.6 if whale.get("dual_buy") else 0.35
+        score += whale_boost
+        label = "외인·기관 동반 순매수" if whale.get("dual_buy") else "외인/기관 순매수 상위"
+        reasons.append(f"{label} ({whale.get('market', 'KRX')} #{whale.get('rank', '-')})")
+
     return min(1.0, score), reasons
 
 

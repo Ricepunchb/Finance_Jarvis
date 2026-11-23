@@ -117,6 +117,44 @@ class Settings(BaseSettings):
     INTRADAY_LOOKBACK_CALENDAR_DAYS: int = 20        # 30분봉 백필 기간 (약 14거래일치)
     INTRADAY_BACKFILL_SYMBOLS_PER_CYCLE: int = 3     # 모의투자 1req/sec 제약 때문에 백필을 사이클에 분산
 
+    # --- 신호 결합 가중치 (뉴스는 방향성 합산에서 제외, 악재 Veto 전용) ---
+    SIGNAL_WEIGHT_TECH: float = 0.25                 # 일봉 중기 추세 확인
+    SIGNAL_WEIGHT_INTRADAY: float = 0.45             # 30분봉 단기 타이밍 확인
+    SIGNAL_WEIGHT_FLOW: float = 0.15                 # 고래/수급 선행 시그널 (US 4.3Y + KRX 3.8Y IS/OOS 검증값)
+    SIGNAL_WEIGHT_VALUATION: float = 0.15            # 펀더멘털 밸류에이션 (활성화 시)
+
+    # --- 수급 확인/역행 및 악재 Veto 파라미터 ---
+    FLOW_CONFIRM_BOOST: float = 1.00                 # 수급과 기술 지표 방향 일치 시 강도 배수 (백테스트 MDD 검증값: 1.00)
+    FLOW_DIVERGENCE_VETO_STRENGTH: float = 0.60      # 수급이 강한 SELL(>=0.60)이면 신규 BUY 억제
+    NEWS_VETO_ENABLED: bool = True                   # 악재 뉴스 시 신규 매수만 차단하는 비대칭 필터
+    NEWS_VETO_STRENGTH_THRESHOLD: float = 0.70       # 뉴스 감성 SELL & strength >= 0.70 시 BUY 차단
+
+    # --- Layer A: 가격/거래량 수급 프록시 (국내·해외 공통, 백테스트 가능) ---
+    FLOW_RVOL_WINDOW: int = 20                       # 상대거래량 기준 이동평균 봉 수
+    FLOW_RVOL_SPIKE_THRESHOLD: float = 1.8           # RVOL >= 1.8 시 고래 거래량 스파이크 인정
+    FLOW_CMF_WINDOW: int = 20                        # Chaikin Money Flow 윈도우
+
+    # --- Layer B: 국내 KIS 수급 REST & 웹소켓 분 단위 급등락 탐지 ---
+    ENABLE_KIS_FLOW_API: bool = True                 # 국내 프로그램/외인·기관 REST 조회 활성화
+    ENABLE_WS_MARKET_STREAM: bool = True             # ENABLE_WEBSOCKET=True일 때 H0STCNT0/H0UPPGM0 구독
+    WS_PROGRAM_TR_ID: str = "H0UPPGM0"               # 실시간 프로그램매매 TR (환경에 따라 오버라이드 가능)
+    WS_MAX_SUBSCRIBED_SYMBOLS: int = 15              # H0STCNT0 + H0UPPGM0 동시 구독 시 최대 종목 수 (41건 한도 안전선)
+    WS_MINUTE_SURGE_PCT: float = 0.015               # 1~3분 내 +1.5% 이상 급등 + 거래량 급증 시 매수 평가 트리거
+    WS_MINUTE_PLUNGE_PCT: float = -0.015             # 1~3분 내 -1.5% 이상 급락 시 exit_guard 즉시 재평가
+    WS_MINUTE_RVOL_MULT: float = 3.0                 # 직전 20분 평균 대비 3배 이상 체결량 급증
+    WS_MINUTE_CTTR_BULL: float = 120.0               # 체결강도 >= 120% (매수 우위)
+    WS_MINUTE_CTTR_BEAR: float = 80.0                # 체결강도 <= 80% (매도 우위)
+    WS_FASTPATH_DEBOUNCE_SEC: int = 180              # 동일 종목 Fast-Path 재평가 최소 간격 (3분)
+    WS_FASTPATH_SURGE_DRY_RUN: bool = True           # True면 급등 Fast-Path는 관측 로그만 기록 (급락 exit_guard는 항상 활성)
+
+    # --- 시장 전체 레짐 필터 (급락장/사이드카 방어) ---
+    MARKET_REGIME_ENABLED: bool = True
+    MARKET_REGIME_CACHE_TTL_SEC: int = 300           # 5분 캐시
+    MARKET_REGIME_INTRADAY_DROP_PCT: float = -0.015  # 대표 벤치마크(KODEX200/SPY) 당일 -1.5% 이하 시 RISK_OFF (IS/OOS 검증값)
+    MARKET_REGIME_DOMESTIC_BENCHMARK: str = "069500" # KODEX 200
+    MARKET_REGIME_OVERSEAS_BENCHMARK: str = "SPY"    # SPDR S&P 500 ETF
+    MARKET_REGIME_DEFENSIVE_KEYWORDS: str = "국고채,종합채권,미국채,금현물,골드,SGOV,GLD,TLT,IEF,SHY"
+
     # --- 펀더멘털 밸류에이션 (기본 꺼짐 — 스모크테스트 후 켜는 것을 권장) ---
     ENABLE_FUNDAMENTAL_VALUATION: bool = False
     VALUATION_CACHE_TTL_HOURS: int = 24

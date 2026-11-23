@@ -76,3 +76,14 @@ FINANCE_FINANCIAL_RATIO_TR_ID = "FHKST66430300"
 RANKING_FLUCTUATION_TR_ID = "FHPST01700000"
 RANKING_VOLUME_TR_ID = "FHPST01710000"
 NEWS_TITLE_TR_ID = "FHKST01011800"
+
+# --- 국내주식 수급/프로그램/체결강도 — 고래 수급 탐지용 (모의투자 일부 미지원 시 Layer A 폴백) ---
+INQUIRE_CCNL_TR_ID = "FHKST01010300"                  # 종목별 체결/체결강도
+INQUIRE_INVESTOR_TR_ID = "FHKST01010900"              # 종목별 투자자(외인/기관) 매매동향
+PROGRAM_TRADE_BY_STOCK_TR_ID = "FHPPG04650100"        # 종목별 프로그램매매 추이(체결)
+INVESTOR_PROGRAM_TODAY_TR_ID = "HHPPG046600C1"        # 시장 전체 프로그램매매 투자자 동향(당일)
+FOREIGN_INST_TOTAL_TR_ID = "FHPTJ04400000"            # 국내기관_외국인 매매종목 가집계 (발굴용)
+
+# --- 국내주식 실시간 시세/프로그램 (웹소켓) ---
+WS_EXECUTION_TR_ID = "H0STCNT0"                       # 실시간 체결가/체결강도
+WS_PROGRAM_TR_ID = "H0UPPGM0"                         # 실시간 프로그램매매 추이

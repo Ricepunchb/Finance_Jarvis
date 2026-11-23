@@ -44,7 +44,7 @@ NEWS_MIN_NAME_LEN = 3
 VALUE_MAX_SYMBOLS = 20
 VALUE_FETCH_CONCURRENCY = 5
 # 여러 소스에 동시에 잡히면 우선. 동률이면 이 순서로 자른다 (근거가 구체적인 소스 우선).
-SOURCE_PRIORITY = ["broker", "value", "theme", "news", "momentum"]
+SOURCE_PRIORITY = ["whale_flow", "broker", "value", "theme", "momentum", "news"]
 
 STATE_REFRESHED_AT = "discovery_refreshed_at"
 STATE_REFRESH_SUMMARY = "discovery_refresh_summary_json"
@@ -80,6 +80,55 @@ def eligible_universe(master: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, 
         s: row for s, row in master.items()
         if not row["is_excluded"] and (row["market_cap_eok"] or 0) >= settings.DISCOVERY_MIN_MARKET_CAP_EOK
     }
+
+
+async def source_whale_flow(client: AsyncKISClient, limit: int = 20) -> Dict[str, Dict[str, Any]]:
+    """KIS 국내기관_외국인 매매종목 가집계(순매수 상위)로 고래 수급 집중 종목을 발굴한다.
+
+    모의투자/API 오류 시 빈 dict를 반환해 나머지 소스로 안전하게 폴백한다.
+    """
+    hits: Dict[str, Dict[str, Any]] = {}
+    if not settings.ENABLE_KIS_FLOW_API:
+        return hits
+
+    for market_code, market_label in (("0001", "KOSPI"), ("1001", "KOSDAQ")):
+        try:
+            rows = await _kis_retry(
+                kis_domestic.get_foreign_institution_total,
+                client,
+                market_code=market_code,
+                investor_code="0",
+                sort_by_amount=True,
+            )
+        except Exception as e:
+            logger.debug(f"고래 수급 발굴({market_label}) 조회 폴백: {e}")
+            continue
+        for rank_idx, row in enumerate(rows[:limit], start=1):
+            sym = (row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd") or "").strip()
+            if not sym:
+                continue
+            try:
+                frgn_net = float(row.get("frgn_ntby_qty") or 0)
+            except (TypeError, ValueError):
+                frgn_net = 0.0
+            try:
+                orgn_net = float(row.get("orgn_ntby_qty") or 0)
+            except (TypeError, ValueError):
+                orgn_net = 0.0
+            try:
+                net_amt = float(row.get("ntby_tr_pbmn") or 0)
+            except (TypeError, ValueError):
+                net_amt = 0.0
+            if sym not in hits:
+                hits[sym] = {
+                    "market": market_label,
+                    "rank": rank_idx,
+                    "frgn_ntby_qty": frgn_net,
+                    "orgn_ntby_qty": orgn_net,
+                    "ntby_tr_pbmn": net_amt,
+                    "dual_buy": frgn_net > 0 and orgn_net > 0,
+                }
+    return hits
 
 
 async def source_momentum(client: AsyncKISClient) -> Dict[str, Dict[str, Any]]:
@@ -387,6 +436,7 @@ async def _refresh(
             by_source[name] = {}
         summary["sources"][name] = len(by_source[name])
 
+    await run("whale_flow", source_whale_flow(client))
     await run("momentum", source_momentum(client))
     await run("broker", source_broker_research(collector))
     await run("news", source_news_buzz(client, {s: r["name"] for s, r in eligible.items()}, collector))
