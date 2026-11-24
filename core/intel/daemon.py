@@ -61,9 +61,9 @@ def discover_union_symbols(data_dir: Optional[Path] = None) -> Tuple[List[str], 
                     if sym:
                         us_symbols.add(str(sym).strip().upper())
 
-            if "target_weights" in tables:
+            if "portfolio_symbols" in tables:
                 for sym, market in cur.execute(
-                    "SELECT symbol, market FROM target_weights WHERE active = 1 AND target_weight > 0"
+                    "SELECT symbol, market FROM portfolio_symbols WHERE enabled = 1"
                 ).fetchall():
                     if not sym:
                         continue
@@ -72,6 +72,18 @@ def discover_union_symbols(data_dir: Optional[Path] = None) -> Tuple[List[str], 
                         us_symbols.add(clean)
                     else:
                         kr_symbols.add(clean)
+            elif "target_weights" in tables:
+                cols = {r[1] for r in cur.execute("PRAGMA table_info(target_weights)").fetchall()}
+                if "status" in cols and "weight" in cols:
+                    for (sym,) in cur.execute(
+                        "SELECT symbol FROM target_weights WHERE status = 'APPROVED' AND weight > 0"
+                    ).fetchall():
+                        if sym:
+                            clean = str(sym).strip().upper()
+                            if clean.isdigit():
+                                kr_symbols.add(clean)
+                            else:
+                                us_symbols.add(clean)
             conn.close()
         except Exception as e:
             logger.debug(f"프로필 DB '{db_file.name}' 종목 수집 생략: {e}")

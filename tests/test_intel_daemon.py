@@ -11,9 +11,10 @@ def test_discover_union_symbols_from_multiple_profile_dbs(tmp_path):
     """여러 계좌 프로필 DB에서 US/KR 종목 합집합을 중복 없이 수집하는지 검증."""
     db1 = tmp_path / "jarvis_isa.db"
     c1 = sqlite3.connect(db1)
-    c1.execute("CREATE TABLE target_weights (symbol TEXT, market TEXT, active INTEGER, target_weight REAL)")
-    c1.execute("INSERT INTO target_weights VALUES ('005930', 'domestic', 1, 0.3)")
-    c1.execute("INSERT INTO target_weights VALUES ('000660', 'domestic', 1, 0.2)")
+    c1.execute("CREATE TABLE portfolio_symbols (symbol TEXT PRIMARY KEY, market TEXT, enabled INTEGER)")
+    c1.execute("INSERT INTO portfolio_symbols VALUES ('005930', 'domestic', 1)")
+    c1.execute("INSERT INTO portfolio_symbols VALUES ('000660', 'domestic', 1)")
+    c1.execute("INSERT INTO portfolio_symbols VALUES ('035420', 'domestic', 0)")
     c1.commit()
     c1.close()
 

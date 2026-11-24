@@ -131,18 +131,32 @@ class AsyncKISClient:
                 else:
                     raise Exception(f"토큰 발급 실패: {data}")
 
-    async def get_hashkey(self, payload: Dict[str, Any]) -> str:
-        """주문(POST) 시 반드시 필요한 보안 해시키를 발급합니다."""
+    async def get_hashkey(self, payload: Dict[str, Any]) -> Optional[str]:
+        """주문(POST) 시 보안 해시키를 발급합니다. 일시적 한도 초과 시 1회 재시도한다."""
         url = f"{self.domain}/uapi/hashkey"
         headers = {
             "appkey": self.app_key,
-            "appsecret": self.app_secret
+            "appsecret": self.app_secret,
+            "content-type": "application/json; charset=utf-8",
         }
-        
+
         session = await self.get_session()
-        async with session.post(url, headers=headers, json=payload) as response:
-            data = await response.json()
-            return data.get("HASH")
+        for attempt in range(1, 3):
+            await self._throttle()
+            try:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    data = await response.json(content_type=None)
+                    hk = data.get("HASH") if isinstance(data, dict) else None
+                    if hk:
+                        return str(hk)
+                    logger.warning(
+                        f"KIS hashkey 발급 응답에 HASH 누락 (시도 {attempt}/2, status={response.status}): {str(data)[:200]}"
+                    )
+            except Exception as e:
+                logger.warning(f"KIS hashkey 발급 예외 (시도 {attempt}/2): {e}")
+            if attempt < 2:
+                await asyncio.sleep(0.6)
+        return None
 
     async def request(
         self,
@@ -165,11 +179,18 @@ class AsyncKISClient:
             "custtype": "P", # 개인
         }
         if headers:
-            req_headers.update(headers)
+            req_headers.update({k: str(v) for k, v in headers.items() if k is not None and v is not None})
 
-        # POST 요청(주문 등)일 경우 Hashkey 추가
+        # POST 요청(주문 등)일 경우 Hashkey 추가 (None이면 aiohttp 직렬화 TypeError 방지를 위해 생략)
         if method.upper() == "POST" and data is not None:
-            req_headers["hashkey"] = await self.get_hashkey(data)
+            hk = await self.get_hashkey(data)
+            if hk:
+                req_headers["hashkey"] = hk
+            else:
+                logger.warning(f"KIS POST({path}) hashkey 미발급 — hashkey 헤더 없이 요청 진행")
+
+        # 최종 방어: aiohttp 3.14+에서 non-str 헤더 키/값 직렬화 TypeError 원천 차단
+        req_headers = {str(k): str(v) for k, v in req_headers.items() if k is not None and v is not None}
 
         session = await self.get_session()
         # 한도 초과 거절은 조회(GET)만 재시도한다 - 주문(POST)은 재전송이 중복 주문이 될 수 있어 호출자에게 그대로 돌려준다.
