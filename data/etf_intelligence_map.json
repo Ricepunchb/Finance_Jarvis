@@ -321,5 +321,17 @@
     "macro_driven": true,
     "name": "TIGER 미국배당다우존스",
     "dynamic": true
+  },
+  "449450": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "PLUS K방산",
+    "dynamic": true
+  },
+  "463250": {
+    "type": "BROAD_INDEX",
+    "macro_driven": true,
+    "name": "TIGER K방산&우주",
+    "dynamic": true
   }
 }
