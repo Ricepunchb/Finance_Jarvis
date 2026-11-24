@@ -367,6 +367,7 @@ async def get_present_balance_krw(client: AsyncMeritzClient) -> Dict[str, Any]:
             "tot_asst_krw": str(round(tot_asst_krw, 2)),
             "cash_usd": str(round(usd_cash, 2)),
             "avail_usd": str(round(usd_avail, 2)),
+            "available_usd": str(round(usd_avail if usd_avail > 0 else usd_cash, 2)),
             "bass_exrt": str(usd_exrt) if usd_exrt > 0 else "",
             "currency": "USD",
         },

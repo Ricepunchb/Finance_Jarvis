@@ -363,23 +363,41 @@ async def analyze_us_portfolio_drift(
         logger.warning(target_weight_warning)
         targets = {k: v / total_target_w for k, v in targets.items()}
 
-    # 1. 메리츠 API 연동 잔고 조회 시도
+    # 1. 메리츠 API 연동 잔고 및 순수 USD 주문가능금액 실시간 조회
     holdings_dict: Dict[str, Dict[str, Any]] = {}
     available_usd = 0.0
+    live_cash_fetched = False
 
-    from core.meritz_overseas import get_present_balance_krw
+    from core.meritz_overseas import get_buyable_cash, get_present_balance_krw
     is_meritz = getattr(settings, "BROKER", "kis").lower() == "meritz"
 
     if is_meritz and client is not None:
         try:
             bal = await get_present_balance_krw(client)
-            available_usd = float(bal.get("totals", {}).get("available_usd") or 0.0)
+            totals = bal.get("totals", {}) or {}
+            # 키 이름 정합성: available_usd / avail_usd / cash_usd 순으로 추출
+            for key in ("available_usd", "avail_usd", "cash_usd"):
+                val = float(totals.get(key) or 0.0)
+                if val > 0:
+                    available_usd = val
+                    live_cash_fetched = True
+                    break
             for h in bal.get("holdings", []):
                 sym = str(h.get("symbol") or h.get("ovrs_pdno") or "").upper().strip()
                 if sym:
                     holdings_dict[sym] = h
         except Exception as e:
             logger.warning(f"메리츠 잔고 실시간 조회 실패 - DB 캐시 사용: {e}")
+
+        # 리밸런싱 직전 순수 USD 주문가능금액(intg_marg_iqry_yn="N") 실시간 정밀 조회로 우선 갱신
+        try:
+            probe = await get_buyable_cash(client, "NASD", "SGOV", 100.0)
+            ord_psbl = float(probe.get("ovrs_ord_psbl_amt") or 0.0)
+            if ord_psbl >= 0.0 and probe.get("ovrs_ord_psbl_amt") is not None:
+                available_usd = ord_psbl
+                live_cash_fetched = True
+        except Exception as e:
+            logger.debug(f"메리츠 순수 USD 주문가능금액 정밀 조회 실패(잔고 폴백 유지): {e}")
 
     # 잔고 조회가 실패하거나 클라이언트가 없으면 DB positions 및 state 사용
     if not holdings_dict:
@@ -444,10 +462,12 @@ async def analyze_us_portfolio_drift(
     if total_equity_usd <= 0:
         total_equity_usd = 1000.0  # 방어적 기본값
 
-    # 4. 이전 가용 달러 대비 입금(Inflow) 감지
+    # 4. 이전 가용 달러 대비 입금(Inflow) 감지 후 최신 가용 달러 DB 갱신
     last_known_cash_str = await db.get_state(conn, "us_last_known_available_usd")
     last_known_cash = float(last_known_cash_str) if last_known_cash_str else available_usd
     inflow_detected_usd = max(0.0, available_usd - last_known_cash)
+    if live_cash_fetched:
+        await db.set_state(conn, "us_last_known_available_usd", str(round(available_usd, 2)))
 
     # 5. 종목별 비중 및 드리프트 계산
     db_exchanges: Dict[str, str] = {}

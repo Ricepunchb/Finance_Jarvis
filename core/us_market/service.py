@@ -402,8 +402,9 @@ async def scan_us_market_news(
 class USMarketMonitorScheduler:
     """미국장 30분 주기 백그라운드 모니터링 스케줄러."""
 
-    def __init__(self, interval_sec: int = US_CYCLE_INTERVAL_SEC):
+    def __init__(self, interval_sec: int = US_CYCLE_INTERVAL_SEC, client: Optional[Any] = None):
         self.interval_sec = interval_sec
+        self.client = client
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self.is_running = False
@@ -475,7 +476,7 @@ class USMarketMonitorScheduler:
                             from core.us_market.notifier import get_telegram_config, send_telegram_message_with_result
                             reb_conn = await db.get_connection()
                             try:
-                                drift_res = await analyze_us_portfolio_drift(reb_conn)
+                                drift_res = await analyze_us_portfolio_drift(reb_conn, client=self.client)
                                 plan = build_us_rebalance_plan(drift_res)
                                 if plan.items and plan.trigger_type in ("CASH_INFLOW", "BAND_DRIFT"):
                                     last_alert_time_str = await db.get_state(reb_conn, "us_last_rebalance_alerted_at")

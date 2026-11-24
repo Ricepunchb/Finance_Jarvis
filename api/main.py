@@ -34,7 +34,7 @@ engine = TradingEngine()
 # 클라이언트를 새로 만들어 불필요한 토큰을 추가 발급받지 않기 위함).
 portfolio_scheduler = PortfolioScheduler(engine.client)
 from core.us_market.service import USMarketMonitorScheduler
-us_scheduler = USMarketMonitorScheduler()
+us_scheduler = USMarketMonitorScheduler(client=engine.client)
 
 # 국내 종목 한글명 캐시. 이름은 사실상 불변이므로 프로세스 수명 동안 재조회하지 않는다
 # (엔진의 KIS 클라이언트를 그대로 재사용 — 대시보드 표시용으로 별도 토큰을 새로 발급하지 않기 위함).

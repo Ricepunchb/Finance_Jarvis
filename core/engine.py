@@ -1270,6 +1270,8 @@ class TradingEngine:
         try:
             shadow = getattr(settings, "SHADOW_MODE", False)
             avail_usd = float(psbl.get("ovrs_ord_psbl_amt") or 0.0) if action.side == "buy" else None
+            if avail_usd is not None and self.is_meritz:
+                await db.set_state(self.conn, "us_last_known_available_usd", str(round(avail_usd, 2)))
             result = await meritz_overseas.order(
                 self.client, exchange, symbol, action.side, int(action.qty), clean_overseas_price,
                 shadow=shadow, available_usd=avail_usd,
